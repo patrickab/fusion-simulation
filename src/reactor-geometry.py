@@ -1,10 +1,16 @@
-"""Module for generation and visualization of a tokamak plasma surface"""
+"""Module for parametric expression of a tokamak plasma surfaces"""
 
 import os
+
 import numpy as np
 import pyvista as pv
 
-def tokamak_cross_section(theta, r0=2.0, a=0.5, kappa=1.7, delta=0.3):
+from src.lib.config import Filepaths
+
+
+def calculate_poloidal_boundary(
+    theta: np.ndarray, r0: float = 2.0, a: float = 0.5, kappa: float = 1.7, delta: float = 0.3
+) -> tuple[np.ndarray, np.ndarray]:
     """
     Returns R and Z coordinates for a 2D poloidal plasma boundary shape.
     Cross-section of a tokamak plasma in the poloidal plane.
@@ -26,16 +32,24 @@ def tokamak_cross_section(theta, r0=2.0, a=0.5, kappa=1.7, delta=0.3):
     Z = kappa * a * np.sin(theta)
     return R, Z
 
-def generate_toroidal_surface(n_theta: int=200, n_phi: int=100, r0: float=1.5, a: float=0.5, kappa: float=1.7, delta: float=0.3):
+
+def generate_toroidal_surface(
+    n_theta: int = 200,
+    n_phi: int = 100,
+    r0: float = 1.5,
+    a: float = 0.5,
+    kappa: float = 1.7,
+    delta: float = 0.3,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Generates a 3D toroidal surface by rotating a poloidal cross-section around the Z-axis.
-    
+
     This function creates a tokamak-like surface with elongation (kappa) and triangularity (delta).
     The process works as follows:
-    
+
     1. Generate poloidal coordinates
-    2. Create a meshgrid that extends this 2D shape into 3D space by:
-       - np.meshgrid(R_2D, phi) creates two 2D arrays:
+    2. Create a meshgrid that extends this 2D shape into 3D space:
+       - (1) np.meshgrid(R_2D, phi) creates two 2D arrays:
          * R_grid: Contains the R coordinates repeated for each toroidal angle
          * phi_grid: Contains the toroidal angles repeated for each point on the poloidal contour
        - This effectively creates a parametric surface where each toroidal section (phi=constant)
@@ -48,7 +62,7 @@ def generate_toroidal_surface(n_theta: int=200, n_phi: int=100, r0: float=1.5, a
 
     This transformation maps the toroidal surface into 3D Cartesian space, where each poloidal
     cross-section is identical but rotated around the Z-axis according to the toroidal angle φ.
-    
+
     Parameters
     ----------
     n_theta : Number of points (poloidal direction)
@@ -62,10 +76,10 @@ def generate_toroidal_surface(n_theta: int=200, n_phi: int=100, r0: float=1.5, a
     -------
     X, Y, Z : 3D Cartesian coordinates of the toroidal surface, each with shape (n_phi, n_theta)
     """
-    theta = np.linspace(0, 2*np.pi, n_theta)
-    phi = np.linspace(0, 2*np.pi, n_phi)
+    theta = np.linspace(0, 2 * np.pi, n_theta)
+    phi = np.linspace(0, 2 * np.pi, n_phi)
 
-    R_2D, Z_2D = tokamak_cross_section(theta, r0, a, kappa, delta)
+    R_2D, Z_2D = calculate_poloidal_boundary(theta, r0, a, kappa, delta)
 
     # Create 2D meshgrid for revolution
     R_grid, phi_grid = np.meshgrid(R_2D, phi)
@@ -78,7 +92,8 @@ def generate_toroidal_surface(n_theta: int=200, n_phi: int=100, r0: float=1.5, a
 
     return X, Y, Z
 
-def export_polygonal_plasmasurface(filename='plasma_surface.ply'):
+
+def export_polygonal_plasmasurface(filename: str = Filepaths.REACTOR_POLYGONIAL_MESH) -> None:
     """Converts the toroidal plasma surface to a polygonal mesh & stores it as .ply"""
     X, Y, Z = generate_toroidal_surface()
     grid = pv.StructuredGrid(X, Y, Z).extract_surface()
