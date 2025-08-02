@@ -72,28 +72,57 @@ class FusionPlasma:
 @dataclass
 class ToroidalCoil2D:
     """
-    Represents 2D toroidal field coil.
+    Represents 2D toroidal field coil in the poloidal (R-Z) plane.
     """
 
-    R_inner: np.ndarray  # Inner R coordinates (m)
-    R_outer: np.ndarray  # Outer R coordinates (m)
+    R_inner: np.ndarray
+    R_outer: np.ndarray
+    R_center: np.ndarray
 
-    Z_inner: np.ndarray  # Inner Z coordinates (m)
-    Z_outer: np.ndarray  # Outer Z coordinates (m)
+    Z_inner: np.ndarray
+    Z_outer: np.ndarray
+    Z_center: np.ndarray
 
 
 @dataclass
-class ToroidalCoil:
+class ToroidalCoil3D:
     """
-    Class representing a toroidal field coil.
-    Contains the 3D coordinates of the toroidal field coil surface.
+    Represents a full 3D toroidal field coil geometry.
+    Suitable for visualization, export, and simulation.
     """
 
-    X: np.ndarray  # X coordinates (m)
-    Y: np.ndarray  # Y coordinates (m)
-    Z: np.ndarray  # Z coordinates (m)
-    Center: np.ndarray  # Center coordinates (m)
-    ToroidalCoil2d: ToroidalCoil2D
+    X_inner: np.ndarray  # (n_phi, COIL_RESOLUTION_3D) inner wall swept
+    Y_inner: np.ndarray
+    Z_inner: np.ndarray
+
+    X_outer: np.ndarray  # (n_phi, COIL_RESOLUTION_3D) outer wall swept
+    Y_outer: np.ndarray
+    Z_outer: np.ndarray
+
+    X_cap_start: np.ndarray  # (2, n_pts) cap at start of toroidal span
+    Y_cap_start: np.ndarray
+    Z_cap_start: np.ndarray
+
+    X_cap_end: np.ndarray  # (2, n_pts) cap at end of toroidal span
+    Y_cap_end: np.ndarray
+    Z_cap_end: np.ndarray
+
+    CentralPlane: np.ndarray
+
+    ToroidalCoil2d: ToroidalCoil2D  # Original 2D definition (for regeneration/reuse)
+
+    def as_surface(self) -> pv.PolyData:
+        """
+        Combine all surfaces and caps into one closed surface mesh (watertight shell).
+        """
+        # This would use pyvista.append_surf, Triangulate, or create PolyData manually
+        raise NotImplementedError("Surface generation goes here.")
+
+    def as_volume(self) -> pv.UnstructuredGrid:
+        """
+        Optional: convert to tetrahedral volume (for FEM or field simulation).
+        """
+        return self.as_surface().delaunay_3d()
 
 
 def calculate_poloidal_boundary(plasma_config: PlasmaConfig) -> PlasmaBoundary:
@@ -135,12 +164,16 @@ def calculate_toroidal_coil_boundary(plasma_boundary: PlasmaBoundary, toroid_coi
     R_inner = R + inner_offset * N_R
     Z_inner = Z + inner_offset * N_Z
 
+    center_offset = 0.5 * toroid_coil_config.radial_thickness
+    R_center = R_inner + center_offset * N_R
+    Z_center = Z_inner + center_offset * N_Z
+
     # Offset outer boundary
     coil_thickness = toroid_coil_config.radial_thickness
     R_outer = R_inner + coil_thickness * N_R
     Z_outer = Z_inner + coil_thickness * N_Z
 
-    return ToroidalCoil2D(R_inner=R_inner, R_outer=R_outer, Z_inner=Z_inner, Z_outer=Z_outer)
+    return ToroidalCoil2D(R_inner=R_inner, R_outer=R_outer, R_center=R_center, Z_inner=Z_inner, Z_center=Z_center, Z_outer=Z_outer)
 
 
 def calculate_2d_geometry(
@@ -196,58 +229,66 @@ def generate_fusion_plasma(plasma_boundary: PlasmaBoundary) -> FusionPlasma:
 def generate_toroidal_coils_3d(
     toroidal_coil_2d: ToroidalCoil2D,
     toroid_coil_config: ToroidalCoilConfig,
-) -> list[ToroidalCoil]:
+) -> list[ToroidalCoil3D]:
     """
-    Generate full 3D geometry for toroidal coils from 2D cross-section.
+    Generate full 3D geometry for toroidal coils from 2D cross-section using efficient numpy operations.
     """
     phi_angles = np.linspace(0, 2 * np.pi, toroid_coil_config.n_field_coils, endpoint=False)
     coils = []
 
     # Prepare 2D cross-section
-    r_inner, z_inner = toroidal_coil_2d.R_inner, toroidal_coil_2d.Z_inner
-    r_outer, z_outer = toroidal_coil_2d.R_outer, toroidal_coil_2d.Z_outer
+    r_inner_2d = toroidal_coil_2d.R_inner
+    z_inner_2d = toroidal_coil_2d.Z_inner
+    r_outer_2d = toroidal_coil_2d.R_outer
+    z_outer_2d = toroidal_coil_2d.Z_outer
+
+    phi_span = np.deg2rad(toroid_coil_config.angular_span)
 
     for phi_center in phi_angles:
         # Angular span for each coil
-        phi_span = np.deg2rad(toroid_coil_config.angular_span)
         phi_start = phi_center - phi_span / 2
         phi_end = phi_center + phi_span / 2
 
         # Toroidal sweep
         phi_sweep = np.linspace(phi_start, phi_end, COIL_RESOLUTION_3D)
 
-        X_list, Y_list, Z_list = [], [], []
-        centerline_xyz = []
+        # Stack surfaces using broadcasting
+        X_inner = np.outer(np.cos(phi_sweep), r_inner_2d)
+        Y_inner = np.outer(np.sin(phi_sweep), r_inner_2d)
+        Z_inner = np.tile(z_inner_2d, (COIL_RESOLUTION_3D, 1))
 
-        for phi in phi_sweep:
-            # Stack inner and outer contour into one perimeter loop
-            r_loop = np.concatenate([r_inner, r_outer[::-1]])
-            z_loop = np.concatenate([z_inner, z_outer[::-1]])
+        X_outer = np.outer(np.cos(phi_sweep), r_outer_2d)
+        Y_outer = np.outer(np.sin(phi_sweep), r_outer_2d)
+        Z_outer = np.tile(z_outer_2d, (COIL_RESOLUTION_3D, 1))
 
-            x_loop = r_loop * np.cos(phi)
-            y_loop = r_loop * np.sin(phi)
-            z_loop = z_loop  # remains the same
+        # Caps: first and last toroidal sweep
+        X_cap_start = np.vstack([X_inner[0], X_outer[0]])
+        Y_cap_start = np.vstack([Y_inner[0], Y_outer[0]])
+        Z_cap_start = np.vstack([Z_inner[0], Z_outer[0]])
 
-            X_list.append(x_loop)
-            Y_list.append(y_loop)
-            Z_list.append(z_loop)
+        X_cap_end = np.vstack([X_inner[-1], X_outer[-1]])
+        Y_cap_end = np.vstack([Y_inner[-1], Y_outer[-1]])
+        Z_cap_end = np.vstack([Z_inner[-1], Z_outer[-1]])
 
-            # Coil center at this toroidal position
-            r_center = 0.5 * (r_inner + r_outer[::-1])
-            z_center = 0.5 * (z_inner + z_outer[::-1])
-            x_c = np.mean(r_center) * np.cos(phi)
-            y_c = np.mean(r_center) * np.sin(phi)
-            z_c = np.mean(z_center)
-            centerline_xyz.append([x_c, y_c, z_c])
+        # Center plane as X Y Z coordinates
+        CentralPlane = np.column_stack((X_inner.mean(axis=0), Y_inner.mean(axis=0), Z_inner.mean(axis=0)))
 
-        coil = ToroidalCoil(
-            X=np.array(X_list),  # Shape: (n_phi, n_points)
-            Y=np.array(Y_list),
-            Z=np.array(Z_list),
-            Center=np.array(centerline_xyz),
+        coil = ToroidalCoil3D(
+            X_inner=X_inner,
+            Y_inner=Y_inner,
+            Z_inner=Z_inner,
+            X_outer=X_outer,
+            Y_outer=Y_outer,
+            Z_outer=Z_outer,
+            X_cap_start=X_cap_start,
+            Y_cap_start=Y_cap_start,
+            Z_cap_start=Z_cap_start,
+            X_cap_end=X_cap_end,
+            Y_cap_end=Y_cap_end,
+            Z_cap_end=Z_cap_end,
+            CentralPlane=CentralPlane,
             ToroidalCoil2d=toroidal_coil_2d,
         )
-
         coils.append(coil)
 
     return coils
@@ -355,7 +396,7 @@ if __name__ == "__main__":
         radial_thickness=0.8,  # Radial thickness of the coil (m)
         vertical_thickness=0.2,  # Vertical thickness of the coil (m)
         angular_span=6,  # Angular span of the coil (degrees)
-        n_field_coils=12,  # Number of field coils
+        n_field_coils=4,  # Number of field coils
     )
 
     plasma_boundary, toroidal_coil_2d = calculate_2d_geometry(plasma_config=plasma_config, toroid_coil_config=toroid_coil_config)
@@ -390,14 +431,54 @@ if __name__ == "__main__":
 
     toroidal_coil_names = [f"Toroidal Coil {i + 1}" for i in range(toroid_coil_config.n_field_coils)]
     for coil, name in zip(toroidal_coils_3d, toroidal_coil_names, strict=False):
-        coil_mesh = pv.StructuredGrid(coil.X, coil.Y, coil.Z).extract_surface()
+        # Inner surface
+        inner_mesh = pv.StructuredGrid(coil.X_inner, coil.Y_inner, coil.Z_inner).extract_surface()
         plotter.add_mesh(
-            coil_mesh,
+            inner_mesh,
             color="silver",
             opacity=0.6,
-            name=name,
-            specular=0.8,  # Add specular reflection for a metallic-like appearance
+            name=f"{name} Inner",
+            specular=0.8,
             specular_power=20,
+        )
+
+        # Outer surface
+        outer_mesh = pv.StructuredGrid(coil.X_outer, coil.Y_outer, coil.Z_outer).extract_surface()
+        plotter.add_mesh(
+            outer_mesh,
+            color="silver",
+            opacity=0.6,
+            name=f"{name} Outer",
+            specular=0.8,
+            specular_power=20,
+        )
+
+        # Cap at start
+        cap_start_points = np.column_stack((coil.X_cap_start.flatten(), coil.Y_cap_start.flatten(), coil.Z_cap_start.flatten()))
+        cap_start_mesh = pv.PolyData(cap_start_points)
+        plotter.add_mesh(
+            cap_start_mesh,
+            color="silver",
+            opacity=0.6,
+            name=f"{name} Cap Start",
+            specular=0.8,
+            specular_power=20,
+            render_points_as_spheres=True,
+            point_size=6,
+        )
+
+        # Cap at end
+        cap_end_points = np.column_stack((coil.X_cap_end.flatten(), coil.Y_cap_end.flatten(), coil.Z_cap_end.flatten()))
+        cap_end_mesh = pv.PolyData(cap_end_points)
+        plotter.add_mesh(
+            cap_end_mesh,
+            color="silver",
+            opacity=0.6,
+            name=f"{name} Cap End",
+            specular=0.8,
+            specular_power=20,
+            render_points_as_spheres=True,
+            point_size=6,
         )
 
     # display_theta_coordinates(plotter)
