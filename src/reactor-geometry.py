@@ -9,6 +9,8 @@ import pyvista as pv
 from src.lib.config import Filepaths, RotationalAngles
 from src.lib.linalg_utils import convert_rz_to_xyz
 
+COIL_RESOLUTION_3D = 64  # Number of points in the toroidal direction for 3D coils
+
 
 @dataclass
 class PlasmaConfig:
@@ -201,31 +203,52 @@ def generate_toroidal_coils_3d(
     phi_angles = np.linspace(0, 2 * np.pi, toroid_coil_config.n_field_coils, endpoint=False)
     coils = []
 
-    # Calculate the 3D coordinates for the toroidal coil at angle phi
-    for phi in phi_angles:
-        cos_phi = np.cos(phi)
-        sin_phi = np.sin(phi)
+    # Prepare 2D cross-section
+    r_inner, z_inner = toroidal_coil_2d.R_inner, toroidal_coil_2d.Z_inner
+    r_outer, z_outer = toroidal_coil_2d.R_outer, toroidal_coil_2d.Z_outer
 
-        # Inner surface
-        X_inner = toroidal_coil_2d.R_inner * cos_phi
-        Y_inner = toroidal_coil_2d.R_inner * sin_phi
-        Z_inner = toroidal_coil_2d.Z_inner
+    for phi_center in phi_angles:
+        # Angular span for each coil
+        phi_span = np.deg2rad(toroid_coil_config.angular_span)
+        phi_start = phi_center - phi_span / 2
+        phi_end = phi_center + phi_span / 2
 
-        # Outer surface
-        X_outer = toroidal_coil_2d.R_outer * cos_phi
-        Y_outer = toroidal_coil_2d.R_outer * sin_phi
-        Z_outer = toroidal_coil_2d.Z_outer
+        # Toroidal sweep
+        phi_sweep = np.linspace(phi_start, phi_end, COIL_RESOLUTION_3D)
 
-        X = np.vstack((X_inner, X_outer))
-        Y = np.vstack((Y_inner, Y_outer))
-        Z = np.vstack((Z_inner, Z_outer))
+        X_list, Y_list, Z_list = [], [], []
+        centerline_xyz = []
 
-        center_R = 0.5 * (toroidal_coil_2d.R_inner + toroidal_coil_2d.R_outer)
-        center_Z = 0.5 * (toroidal_coil_2d.Z_inner + toroidal_coil_2d.Z_outer)
-        center_X = np.mean(center_R) * cos_phi
-        center_Y = np.mean(center_R) * sin_phi
-        center = np.array([center_X, center_Y, np.mean(center_Z)])
-        coils.append(ToroidalCoil(X=X, Y=Y, Z=Z, Center=center, ToroidalCoil2d=toroidal_coil_2d))
+        for phi in phi_sweep:
+            # Stack inner and outer contour into one perimeter loop
+            r_loop = np.concatenate([r_inner, r_outer[::-1]])
+            z_loop = np.concatenate([z_inner, z_outer[::-1]])
+
+            x_loop = r_loop * np.cos(phi)
+            y_loop = r_loop * np.sin(phi)
+            z_loop = z_loop  # remains the same
+
+            X_list.append(x_loop)
+            Y_list.append(y_loop)
+            Z_list.append(z_loop)
+
+            # Coil center at this toroidal position
+            r_center = 0.5 * (r_inner + r_outer[::-1])
+            z_center = 0.5 * (z_inner + z_outer[::-1])
+            x_c = np.mean(r_center) * np.cos(phi)
+            y_c = np.mean(r_center) * np.sin(phi)
+            z_c = np.mean(z_center)
+            centerline_xyz.append([x_c, y_c, z_c])
+
+        coil = ToroidalCoil(
+            X=np.array(X_list),  # Shape: (n_phi, n_points)
+            Y=np.array(Y_list),
+            Z=np.array(Z_list),
+            Center=np.array(centerline_xyz),
+            ToroidalCoil2d=toroidal_coil_2d,
+        )
+
+        coils.append(coil)
 
     return coils
 
@@ -331,8 +354,8 @@ if __name__ == "__main__":
         distance_from_plasma=1.5,  # Distance from plasma surface (m)
         radial_thickness=0.8,  # Radial thickness of the coil (m)
         vertical_thickness=0.2,  # Vertical thickness of the coil (m)
-        angular_span=30,  # Angular span of the coil (degrees)
-        n_field_coils=32,  # Number of field coils
+        angular_span=6,  # Angular span of the coil (degrees)
+        n_field_coils=12,  # Number of field coils
     )
 
     plasma_boundary, toroidal_coil_2d = calculate_2d_geometry(plasma_config=plasma_config, toroid_coil_config=toroid_coil_config)
