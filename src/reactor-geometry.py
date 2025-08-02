@@ -286,6 +286,40 @@ def display_phi_coordinates(
         )
 
 
+def display_2d_boundaries(plotter: pv.Plotter, plasma_boundary: PlasmaBoundary, toroidal_coil_2d: ToroidalCoil2D) -> None:
+    """Display 2D boundaries of plasma and toroidal coil in the plotter."""
+    # Rotate plasma boundary and toroidal coil 2d by 90 degrees around the x-axis
+    radians_90 = 90 * np.pi / 180
+    plasma_x, plasma_y, plasma_z = convert_rz_to_xyz(R=plasma_boundary.R_2d, Z=plasma_boundary.Z_2d, phi=radians_90)
+    coil_inner_x, coil_inner_y, coil_inner_z = convert_rz_to_xyz(
+        R=toroidal_coil_2d.R_inner, Z=toroidal_coil_2d.Z_inner, phi=radians_90
+    )
+    coil_outer_x, coil_outer_y, coil_outer_z = convert_rz_to_xyz(
+        R=toroidal_coil_2d.R_outer, Z=toroidal_coil_2d.Z_outer, phi=radians_90
+    )
+
+    # Add plasma boundary (2D poloidal cross-section)
+    plotter.add_lines(
+        np.column_stack((plasma_x, plasma_y, plasma_z)),
+        color="cyan",
+        width=2,
+    )
+
+    # Add toroidal coil 2D boundaries (inner and outer)
+    plotter.add_lines(
+        np.column_stack((coil_inner_x, coil_inner_y, coil_inner_z)),
+        color="purple",
+        width=2,
+        label="Toroidal Coil Inner Boundary",
+    )
+    plotter.add_lines(
+        np.column_stack((coil_outer_x, coil_outer_y, coil_outer_z)),
+        color="purple",
+        width=2,
+        label="Toroidal Coil Outer Boundary",
+    )
+
+
 if __name__ == "__main__":
     plasma_config = PlasmaConfig(
         R0=6.2,  # Major radius (m)
@@ -331,16 +365,6 @@ if __name__ == "__main__":
         name="plasma",
     )
 
-    # Rotate plasma boundary and toroidal coil 2d by 90 degrees around the x-axis
-    radians_90 = 90 * np.pi / 180
-    plasma_x, plasma_y, plasma_z = convert_rz_to_xyz(R=plasma_boundary.R_2d, Z=plasma_boundary.Z_2d, phi=radians_90)
-    coil_inner_x, coil_inner_y, coil_inner_z = convert_rz_to_xyz(
-        R=toroidal_coil_2d.R_inner, Z=toroidal_coil_2d.Z_inner, phi=radians_90
-    )
-    coil_outer_x, coil_outer_y, coil_outer_z = convert_rz_to_xyz(
-        R=toroidal_coil_2d.R_outer, Z=toroidal_coil_2d.Z_outer, phi=radians_90
-    )
-
     toroidal_coil_names = [f"Toroidal Coil {i + 1}" for i in range(toroid_coil_config.n_field_coils)]
     for coil, name in zip(toroidal_coils_3d, toroidal_coil_names, strict=False):
         coil_mesh = pv.StructuredGrid(coil.X, coil.Y, coil.Z).extract_surface()
@@ -353,30 +377,9 @@ if __name__ == "__main__":
             specular_power=20,
         )
 
-    # Add plasma boundary (2D poloidal cross-section)
-    plotter.add_lines(
-        np.column_stack((plasma_x, plasma_y, plasma_z)),
-        color="cyan",
-        width=2,
-        label="Plasma Boundary",
-    )
-
-    # Add toroidal coil 2D boundaries (inner and outer)
-    plotter.add_lines(
-        np.column_stack((coil_inner_x, coil_inner_y, coil_inner_z)),
-        color="yellow",
-        width=2,
-        label="Toroidal Coil Inner Boundary",
-    )
-    plotter.add_lines(
-        np.column_stack((coil_outer_x, coil_outer_y, coil_outer_z)),
-        color="orange",
-        width=2,
-        label="Toroidal Coil Outer Boundary",
-    )
-
     # display_theta_coordinates(plotter)
     # display_phi_coordinates(plotter)
+    display_2d_boundaries(plotter, plasma_boundary, toroidal_coil_2d)
 
     # Add light for dramatic effect
     light = pv.Light(position=(1, 1, 1), focal_point=(0, 0, 0), color="white", intensity=0.9)
