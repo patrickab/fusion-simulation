@@ -140,103 +140,86 @@ def visualize_3d_geometry(
     mesh_fusion_plasma = pv.StructuredGrid(fusion_plasma.X, fusion_plasma.Y, fusion_plasma.Z).extract_surface()
     mesh_fusion_plasma.compute_normals(inplace=True)  # Compute normals for smooth shading
 
+    # Create a sparser wireframe by subsampling the mesh points
+    # Subsample every Nth point along each axis (e.g., every 4th point)
+    def add_sparse_wireframe(plotter: pv.Plotter, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> None:
+        """Add a sparse wireframe mesh to the plotter."""
+
+        # Create a structured grid from the sparse points
+        N = 8
+        x = fusion_plasma.X[::N, ::N]
+        y = fusion_plasma.Y[::N, ::N]
+        z = fusion_plasma.Z[::N, ::N]
+        sparse_mesh = pv.StructuredGrid(x, y, z).extract_surface()
+        plotter.add_mesh(sparse_mesh, style="wireframe", color="cyan", line_width=2, opacity=0.7)
+
+    add_sparse_wireframe(plotter, fusion_plasma.X, fusion_plasma.Y, fusion_plasma.Z)
+
+    plasma_opacity = 0.8
     plotter.add_mesh(
         mesh_fusion_plasma,
         color=None,
         scalars=mesh_fusion_plasma.points[:, 2],  # Use Z-axis position for coloring
         cmap="plasma",
         smooth_shading=True,
-        opacity=0.4,
+        opacity=plasma_opacity,
         show_edges=False,
         lighting=True,
         specular=0.2,
         specular_power=15,
         name="plasma_surface",
     )
-    plotter.add_mesh(
-        mesh_fusion_plasma,
-        style="wireframe",
-        color="cyan",
-        line_width=2,
-        name="plasma_wireframe",
-    )
 
+    coil_opacity = 1
+    coil_color = (0.8, 0.8, 0.85)
     toroidal_coil_names = [f"Toroidal Coil {i + 1}" for i in range(len(toroidal_coils_3d))]
     for coil, name in zip(toroidal_coils_3d, toroidal_coil_names, strict=False):
         # Inner surface
         inner_mesh = pv.StructuredGrid(coil.X_inner, coil.Y_inner, coil.Z_inner).extract_surface()
         plotter.add_mesh(
             inner_mesh,
-            color="silver",
-            opacity=0.4,
+            color=coil_color,
+            opacity=coil_opacity,
             name=f"{name} Inner",
             specular=0.8,
             specular_power=128,
-        )
-        plotter.add_mesh(
-            inner_mesh,
-            style="wireframe",
-            color="cyan",
-            line_width=2,
-            name=f"{name} Inner Wireframe",
         )
 
         # Outer surface
         outer_mesh = pv.StructuredGrid(coil.X_outer, coil.Y_outer, coil.Z_outer).extract_surface()
         plotter.add_mesh(
             outer_mesh,
-            color="silver",
-            opacity=0.4,
+            color=coil_color,
+            opacity=coil_opacity,
             name=f"{name} Outer",
             specular=0.8,
             specular_power=128,
-        )
-        plotter.add_mesh(
-            outer_mesh,
-            style="wireframe",
-            color="cyan",
-            line_width=2,
-            name=f"{name} Outer Wireframe",
         )
 
         # Start cap
         cap_start_mesh = pv.StructuredGrid(coil.X_cap_start, coil.Y_cap_start, coil.Z_cap_start).extract_surface()
         plotter.add_mesh(
             cap_start_mesh,
-            color="silver",
-            opacity=0.4,
+            color=coil_color,
+            opacity=coil_opacity,
             name=f"{name} Cap Start",
             specular=0.8,
             specular_power=128,
             render_points_as_spheres=True,
             point_size=6,
         )
-        plotter.add_mesh(
-            cap_start_mesh,
-            style="wireframe",
-            color="cyan",
-            line_width=2,
-            name=f"{name} Cap Start Wireframe",
-        )
 
         # End cap
         cap_end_mesh = pv.StructuredGrid(coil.X_cap_end, coil.Y_cap_end, coil.Z_cap_end).extract_surface()
         plotter.add_mesh(
             cap_end_mesh,
-            color="silver",
-            opacity=0.4,
+            color=coil_color,
+            opacity=coil_opacity,
             name=f"{name} Cap End",
             specular=0.8,
             specular_power=128,
             render_points_as_spheres=True,
             point_size=6,
-        )
-        plotter.add_mesh(
-            cap_end_mesh,
-            style="wireframe",
-            color="cyan",
-            line_width=2,
-            name=f"{name} Cap End Wireframe",
         )
 
     plotter.add_title("3D Toroidal Geometry", font_size=16, color="white")
