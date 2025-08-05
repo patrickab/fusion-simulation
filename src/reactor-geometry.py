@@ -5,9 +5,9 @@ import os
 
 import numpy as np
 import pyvista as pv
+from scipy.spatial import Delaunay
 
 from src.lib.config import Filepaths, RotationalAngles
-from src.lib.linalg_utils import convert_rz_to_xyz
 
 COIL_RESOLUTION_3D = 64  # Number of points in the toroidal direction for 3D coils
 
@@ -60,7 +60,7 @@ class FusionPlasma:
     Z: np.ndarray  # Z coordinates (m)
     Boundary: PlasmaBoundary
 
-    def to_ply(self, filename: str = Filepaths.REACTOR_POLYGONIAL_MESH) -> None:
+    def to_ply_structuregrid(self, filename: str = Filepaths.REACTOR_POLYGONIAL_MESH) -> None:
         """
         Exports the toroidal plasma surface to a polygonal mesh in .ply format.
         """
@@ -73,6 +73,7 @@ class FusionPlasma:
 class ToroidalCoil2D:
     """
     Represents 2D toroidal field coil in the poloidal (R-Z) plane.
+    Also provides Delaunay triangulation for meshing.
     """
 
     R_inner: np.ndarray
@@ -83,12 +84,21 @@ class ToroidalCoil2D:
     Z_outer: np.ndarray
     Z_center: np.ndarray
 
+    def express_delaunay_triangles(self) -> Delaunay:
+        """
+        Returns Delaunay triangulation of the inner and outer boundaries in the R-Z plane.
+        """
+        # Stack inner and outer boundary points
+        points = np.column_stack((np.concatenate([self.R_inner, self.R_outer]), np.concatenate([self.Z_inner, self.Z_outer])))
+        return Delaunay(points)
+
 
 @dataclass
 class ToroidalCoil3D:
     """
     Represents a full 3D toroidal field coil geometry.
     Suitable for visualization, export, and simulation.
+    Also provides Delaunay triangulation for meshing.
     """
 
     X_inner: np.ndarray  # (n_phi, COIL_RESOLUTION_3D) inner wall swept
@@ -110,6 +120,20 @@ class ToroidalCoil3D:
     CentralPlane: np.ndarray
 
     ToroidalCoil2D: ToroidalCoil2D  # Original 2D definition (for regeneration/reuse)
+
+    def express_delaunay_triangles(self) -> Delaunay:
+        """
+        Returns Delaunay triangulation of the coil's inner and outer surfaces in 3D.
+        """
+        # Flatten inner and outer surface points
+        points = np.column_stack(
+            (
+                np.concatenate([self.X_inner.flatten(), self.X_outer.flatten()]),
+                np.concatenate([self.Y_inner.flatten(), self.Y_outer.flatten()]),
+                np.concatenate([self.Z_inner.flatten(), self.Z_outer.flatten()]),
+            )
+        )
+        return Delaunay(points)
 
 
 def calculate_poloidal_boundary(plasma_config: PlasmaConfig) -> PlasmaBoundary:
@@ -281,176 +305,6 @@ def generate_toroidal_coils_3d(
     return coils
 
 
-def export_polygonal_plasmasurface(
-    fusion_plasma: FusionPlasma,
-    filename: str = Filepaths.REACTOR_POLYGONIAL_MESH,
-) -> None:
-    """Converts the toroidal plasma surface to a polygonal mesh & stores it as .ply"""
-
-    grid = pv.StructuredGrid(fusion_plasma.X, fusion_plasma.Y, fusion_plasma.Z).extract_surface()
-
-    grid.save(filename)
-    print(f"✅ Exported plasma surface to: {os.path.abspath(filename)}")
-
-
-def display_theta_coordinates(
-    plotter: pv.Plotter,
-    n_angles: int = 8,
-    radius: float = 10.0,
-    color: str = "grey",
-) -> None:
-    """
-    Adds cylindrical coordinate system lines for theta angles to the plotter.
-    """
-    angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
-    for angle in angles:
-        x = np.array([0, radius * np.cos(angle)])
-        y = np.array([0, radius * np.sin(angle)])
-        z = np.array([0, 0])
-        plotter.add_lines(
-            np.column_stack((x, y, z)),
-            color=color,
-            width=1,
-            label=f"Theta {np.degrees(angle):.1f}°",
-        )
-
-
-def display_phi_coordinates(
-    plotter: pv.Plotter,
-    n_angles: int = 16,
-) -> None:
-    """
-    Adds cylindrical coordinate system lines for phi angles to the plotter.
-    """
-    # Add cylindrical coordinate system (phi)
-    n_angles = 9
-    angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
-    for angle in angles:
-        x = np.array([0, 0])
-        y = np.array([0, 10 * np.cos(angle)])
-        z = np.array([0, 10 * np.sin(angle)])
-        plotter.add_lines(
-            np.column_stack((x, y, z)),
-            color="lightgray",
-            width=1,
-            label=f"Phi {np.degrees(angle):.1f}°",
-        )
-
-
-def visualize_2d_geometry(plotter: pv.Plotter, plasma_boundary: PlasmaBoundary, toroidal_coil_2d: ToroidalCoil2D) -> None:
-    """Display 2D boundaries of plasma and toroidal coil in the plotter."""
-
-    # Rotate plasma boundary and toroidal coil 2d by 90 degrees around the x-axis
-    radians_90 = 90 * np.pi / 180
-    plasma_x, plasma_y, plasma_z = convert_rz_to_xyz(R=plasma_boundary.R_2d, Z=plasma_boundary.Z_2d, phi=radians_90)
-    coil_inner_x, coil_inner_y, coil_inner_z = convert_rz_to_xyz(
-        R=toroidal_coil_2d.R_inner, Z=toroidal_coil_2d.Z_inner, phi=radians_90
-    )
-    coil_outer_x, coil_outer_y, coil_outer_z = convert_rz_to_xyz(
-        R=toroidal_coil_2d.R_outer, Z=toroidal_coil_2d.Z_outer, phi=radians_90
-    )
-
-    # Add plasma boundary (2D poloidal cross-section)
-    plotter.add_lines(
-        np.column_stack((plasma_x, plasma_y, plasma_z)),
-        color="cyan",
-        width=2,
-    )
-
-    # Add toroidal coil 2D boundaries (inner and outer)
-    plotter.add_lines(
-        np.column_stack((coil_inner_x, coil_inner_y, coil_inner_z)),
-        color="purple",
-        width=2,
-        label="Toroidal Coil Inner Boundary",
-    )
-    plotter.add_lines(
-        np.column_stack((coil_outer_x, coil_outer_y, coil_outer_z)),
-        color="purple",
-        width=2,
-        label="Toroidal Coil Outer Boundary",
-    )
-
-
-def visualize_3d_geometry(
-    plotter: pv.Plotter,
-    fusion_plasma: FusionPlasma,
-    toroidal_coils_3d: list[ToroidalCoil3D],
-) -> None:
-    """Visualize the 3D geometry of the fusion plasma and toroidal coils."""
-
-    # Add plasma surface mesh to plotter
-    mesh_fusion_plasma = pv.StructuredGrid(fusion_plasma.X, fusion_plasma.Y, fusion_plasma.Z).extract_surface()
-    mesh_fusion_plasma.compute_normals(inplace=True)  # Compute normals for smooth shading
-
-    plotter.add_mesh(
-        mesh_fusion_plasma,
-        color=None,
-        scalars=mesh_fusion_plasma.points[:, 2],  # Use Z-axis position for coloring
-        cmap="plasma",
-        smooth_shading=True,
-        opacity=0.6,
-        show_edges=False,
-        lighting=True,
-        specular=0.2,
-        specular_power=15,
-        name="plasma",
-    )
-
-    toroidal_coil_names = [f"Toroidal Coil {i + 1}" for i in range(toroid_coil_config.n_field_coils)]
-    for coil, name in zip(toroidal_coils_3d, toroidal_coil_names, strict=False):
-        # Inner surface
-        inner_mesh = pv.StructuredGrid(coil.X_inner, coil.Y_inner, coil.Z_inner).extract_surface()
-        plotter.add_mesh(
-            inner_mesh,
-            color="silver",
-            opacity=0.9,
-            name=f"{name} Inner",
-            specular=0.8,
-            specular_power=128,
-        )
-
-        # Outer surface
-        outer_mesh = pv.StructuredGrid(coil.X_outer, coil.Y_outer, coil.Z_outer).extract_surface()
-        plotter.add_mesh(
-            outer_mesh,
-            color="silver",
-            opacity=0.9,
-            name=f"{name} Outer",
-            specular=0.8,
-            specular_power=128,
-        )
-
-        # Start cap
-        cap_start_mesh = pv.StructuredGrid(coil.X_cap_start, coil.Y_cap_start, coil.Z_cap_start).extract_surface()
-        plotter.add_mesh(
-            cap_start_mesh,
-            color="silver",
-            opacity=0.9,
-            name=f"{name} Cap Start",
-            specular=0.8,
-            specular_power=128,
-            render_points_as_spheres=True,
-            point_size=6,
-        )
-
-        # End cap
-        cap_end_mesh = pv.StructuredGrid(coil.X_cap_end, coil.Y_cap_end, coil.Z_cap_end).extract_surface()
-        plotter.add_mesh(
-            cap_end_mesh,
-            color="silver",
-            opacity=0.9,
-            name=f"{name} Cap End",
-            specular=0.8,
-            specular_power=128,
-            render_points_as_spheres=True,
-            point_size=6,
-        )
-
-    # display_theta_coordinates(plotter)
-    # display_phi_coordinates(plotter)
-
-
 if __name__ == "__main__":
     plasma_config = PlasmaConfig(
         R0=6.2,  # Major radius (m)
@@ -471,14 +325,11 @@ if __name__ == "__main__":
     fusion_plasma = generate_fusion_plasma(plasma_boundary=plasma_boundary)
     toroidal_coils_3d = generate_toroidal_coils_3d(toroidal_coil_2d=toroidal_coil_2d, toroid_coil_config=toroid_coil_config)
 
-    # Visualization setup
-    plotter = pv.Plotter(window_size=(1024, 768))
-    plotter.set_background("black")  # Subtle gradient
+    plotter = initialize_plotter(shape=(1, 2))
 
-    title = "Nuclear Fusion Reactor with Toroidal Magnetic Confinement Coils"
-    plotter.add_title(title, font_size=16, color="white")
-
-    # visualize_2d_geometry(plotter=plotter, toroidal_coil_2d=toroidal_coil_2d)
+    plotter.subplot(0, 0)
+    visualize_2d_geometry(plotter=plotter, plasma_boundary=plasma_boundary, toroidal_coil_2d=toroidal_coil_2d)
+    plotter.subplot(0, 1)
     visualize_3d_geometry(
         plotter=plotter,
         fusion_plasma=fusion_plasma,
@@ -489,11 +340,13 @@ if __name__ == "__main__":
     plotter.add_light(light)
 
     # Set camera view
-    plotter.camera_position = "iso"
+    # plotter.camera_position = "iso"
 
     # Add axes and bounds
-    plotter.add_axes(line_width=2)
-    plotter.show_bounds(color="white")
+    # plotter.add_axes = True
+
+    # plotter.show_bounds(grid="front", location="outer", color="grey")
 
     # Render the visualization
-    plotter.show(title=title)
+    title_bar = "Fusion Reactor Visualization"
+    plotter.show(title=title_bar, interactive=True)
