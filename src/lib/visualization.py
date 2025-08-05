@@ -146,12 +146,19 @@ def visualize_3d_geometry(
         scalars=mesh_fusion_plasma.points[:, 2],  # Use Z-axis position for coloring
         cmap="plasma",
         smooth_shading=True,
-        opacity=0.6,
+        opacity=0.4,
         show_edges=False,
         lighting=True,
         specular=0.2,
         specular_power=15,
-        name="plasma",
+        name="plasma_surface",
+    )
+    plotter.add_mesh(
+        mesh_fusion_plasma,
+        style="wireframe",
+        color="cyan",
+        line_width=2,
+        name="plasma_wireframe",
     )
 
     toroidal_coil_names = [f"Toroidal Coil {i + 1}" for i in range(len(toroidal_coils_3d))]
@@ -161,10 +168,17 @@ def visualize_3d_geometry(
         plotter.add_mesh(
             inner_mesh,
             color="silver",
-            opacity=0.9,
+            opacity=0.4,
             name=f"{name} Inner",
             specular=0.8,
             specular_power=128,
+        )
+        plotter.add_mesh(
+            inner_mesh,
+            style="wireframe",
+            color="cyan",
+            line_width=2,
+            name=f"{name} Inner Wireframe",
         )
 
         # Outer surface
@@ -172,10 +186,17 @@ def visualize_3d_geometry(
         plotter.add_mesh(
             outer_mesh,
             color="silver",
-            opacity=0.9,
+            opacity=0.4,
             name=f"{name} Outer",
             specular=0.8,
             specular_power=128,
+        )
+        plotter.add_mesh(
+            outer_mesh,
+            style="wireframe",
+            color="cyan",
+            line_width=2,
+            name=f"{name} Outer Wireframe",
         )
 
         # Start cap
@@ -183,12 +204,19 @@ def visualize_3d_geometry(
         plotter.add_mesh(
             cap_start_mesh,
             color="silver",
-            opacity=0.9,
+            opacity=0.4,
             name=f"{name} Cap Start",
             specular=0.8,
             specular_power=128,
             render_points_as_spheres=True,
             point_size=6,
+        )
+        plotter.add_mesh(
+            cap_start_mesh,
+            style="wireframe",
+            color="cyan",
+            line_width=2,
+            name=f"{name} Cap Start Wireframe",
         )
 
         # End cap
@@ -196,12 +224,19 @@ def visualize_3d_geometry(
         plotter.add_mesh(
             cap_end_mesh,
             color="silver",
-            opacity=0.9,
+            opacity=0.4,
             name=f"{name} Cap End",
             specular=0.8,
             specular_power=128,
             render_points_as_spheres=True,
             point_size=6,
+        )
+        plotter.add_mesh(
+            cap_end_mesh,
+            style="wireframe",
+            color="cyan",
+            line_width=2,
+            name=f"{name} Cap End Wireframe",
         )
 
     plotter.add_title("3D Toroidal Geometry", font_size=16, color="white")
@@ -248,19 +283,27 @@ def render_fusion_plasma(
     # Choose an appealing color map
     cmap = "plasma"
 
-    # Add mesh to plotter
+    # Add mesh to plotter (surface)
     plotter.add_mesh(
         mesh,
         color=None,
         scalars=mesh.points[:, 2],
         cmap=cmap,
         smooth_shading=True,
-        opacity=0.9,
+        opacity=0.4,
         show_edges=False,
         lighting=True,
         specular=0.4,
         specular_power=15,
-        name="plasma",
+        name="plasma_surface",
+    )
+    # Overlay wireframe for emphasis
+    plotter.add_mesh(
+        mesh,
+        style="wireframe",
+        color="cyan",
+        line_width=2,
+        name="plasma_wireframe",
     )
 
     # Add light for dramatic effect
