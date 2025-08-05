@@ -134,7 +134,17 @@ def visualize_3d_geometry(
     fusion_plasma: FusionPlasma,
     toroidal_coils_3d: list[ToroidalCoil3D],
 ) -> None:
-    """Visualize the 3D geometry of the fusion plasma and toroidal coils."""
+    """Visualize the 3D geometry of the fusion plasma and toroidal coils.
+
+    Parameters
+    ----------
+    plotter:
+        PyVista plotter used for rendering.
+    fusion_plasma:
+        Plasma surface geometry.
+    toroidal_coils_3d:
+        List of coils generated from :func:`generate_toroidal_coils_3d`.
+    """
 
     # Add plasma surface mesh to plotter
     mesh_fusion_plasma = pv.StructuredGrid(fusion_plasma.X, fusion_plasma.Y, fusion_plasma.Z).extract_surface()
@@ -154,56 +164,94 @@ def visualize_3d_geometry(
         name="plasma",
     )
 
-    toroidal_coil_names = [f"Toroidal Coil {i + 1}" for i in range(len(toroidal_coils_3d))]
-    for coil, name in zip(toroidal_coils_3d, toroidal_coil_names, strict=False):
-        # Inner surface
-        inner_mesh = pv.StructuredGrid(coil.X_inner, coil.Y_inner, coil.Z_inner).extract_surface()
-        plotter.add_mesh(
-            inner_mesh,
-            color="silver",
-            opacity=0.9,
-            name=f"{name} Inner",
-            specular=0.8,
-            specular_power=128,
+    colors = ["silver", "gold"]
+    for coil_idx, coil in enumerate(toroidal_coils_3d, start=1):
+        radial_thickness = float(
+            np.mean(coil.ToroidalCoil2D.R_outer - coil.ToroidalCoil2D.R_inner)
         )
+        segment_length = 2 * radial_thickness
 
-        # Outer surface
-        outer_mesh = pv.StructuredGrid(coil.X_outer, coil.Y_outer, coil.Z_outer).extract_surface()
-        plotter.add_mesh(
-            outer_mesh,
-            color="silver",
-            opacity=0.9,
-            name=f"{name} Outer",
-            specular=0.8,
-            specular_power=128,
-        )
+        # Approximate centerline of coil to measure arc length
+        x_c = (coil.X_inner + coil.X_outer).mean(axis=1)
+        y_c = (coil.Y_inner + coil.Y_outer).mean(axis=1)
+        z_c = (coil.Z_inner + coil.Z_outer).mean(axis=1)
+        ds = np.sqrt(np.diff(x_c) ** 2 + np.diff(y_c) ** 2 + np.diff(z_c) ** 2)
+        s = np.insert(np.cumsum(ds), 0, 0)
 
-        # Start cap
-        cap_start_mesh = pv.StructuredGrid(coil.X_cap_start, coil.Y_cap_start, coil.Z_cap_start).extract_surface()
-        plotter.add_mesh(
-            cap_start_mesh,
-            color="silver",
-            opacity=0.9,
-            name=f"{name} Cap Start",
-            specular=0.8,
-            specular_power=128,
-            render_points_as_spheres=True,
-            point_size=6,
-        )
+        edges = [*np.arange(0, s[-1], segment_length), s[-1]]
+        idx_edges = np.searchsorted(s, edges)
+        idx_edges = np.unique(idx_edges)
+        if idx_edges[-1] != len(s) - 1:
+            idx_edges = np.append(idx_edges, len(s) - 1)
 
-        # End cap
-        cap_end_mesh = pv.StructuredGrid(coil.X_cap_end, coil.Y_cap_end, coil.Z_cap_end).extract_surface()
-        plotter.add_mesh(
-            cap_end_mesh,
-            color="silver",
-            opacity=0.9,
-            name=f"{name} Cap End",
-            specular=0.8,
-            specular_power=128,
-            render_points_as_spheres=True,
-            point_size=6,
-        )
+        for seg_idx in range(len(idx_edges) - 1):
+            start = idx_edges[seg_idx]
+            end = idx_edges[seg_idx + 1]
+            if end <= start:
+                continue
 
+            name = f"Coil {coil_idx} Block {seg_idx + 1}"
+            color = colors[seg_idx % len(colors)]
+
+            # Slice inner/outer surfaces for this block
+            X_inner = coil.X_inner[start : end + 1, :]
+            Y_inner = coil.Y_inner[start : end + 1, :]
+            Z_inner = coil.Z_inner[start : end + 1, :]
+            X_outer = coil.X_outer[start : end + 1, :]
+            Y_outer = coil.Y_outer[start : end + 1, :]
+            Z_outer = coil.Z_outer[start : end + 1, :]
+
+            inner_mesh = pv.StructuredGrid(X_inner, Y_inner, Z_inner).extract_surface()
+            plotter.add_mesh(
+                inner_mesh,
+                color=color,
+                opacity=0.9,
+                name=f"{name} Inner",
+                specular=0.8,
+                specular_power=128,
+            )
+
+            outer_mesh = pv.StructuredGrid(X_outer, Y_outer, Z_outer).extract_surface()
+            plotter.add_mesh(
+                outer_mesh,
+                color=color,
+                opacity=0.9,
+                name=f"{name} Outer",
+                label=name,
+                specular=0.8,
+                specular_power=128,
+            )
+
+            # Start and end caps for block
+            cap_start_mesh = pv.StructuredGrid(
+                np.vstack([coil.X_inner[start], coil.X_outer[start]]),
+                np.vstack([coil.Y_inner[start], coil.Y_outer[start]]),
+                np.vstack([coil.Z_inner[start], coil.Z_outer[start]]),
+            ).extract_surface()
+            plotter.add_mesh(
+                cap_start_mesh,
+                color=color,
+                opacity=0.9,
+                name=f"{name} Start",
+                specular=0.8,
+                specular_power=128,
+            )
+
+            cap_end_mesh = pv.StructuredGrid(
+                np.vstack([coil.X_inner[end], coil.X_outer[end]]),
+                np.vstack([coil.Y_inner[end], coil.Y_outer[end]]),
+                np.vstack([coil.Z_inner[end], coil.Z_outer[end]]),
+            ).extract_surface()
+            plotter.add_mesh(
+                cap_end_mesh,
+                color=color,
+                opacity=0.9,
+                name=f"{name} End",
+                specular=0.8,
+                specular_power=128,
+            )
+
+    plotter.add_legend()
     plotter.add_title("3D Toroidal Geometry", font_size=16, color="white")
     set_camera_relative_to_body(plotter, distance_factor=3)
     display_theta_coordinates(plotter)
@@ -234,6 +282,9 @@ def render_fusion_plasma(
     show_cylindrical_angles:
         If ``True`` display angle guides for cylindrical coordinates.
     """
+
+    # Mark unused arguments
+    _ = show_cylindrical_angles
 
     # Load the plasma mesh
     mesh = pv.read(ply_file_path)
@@ -273,10 +324,6 @@ def render_fusion_plasma(
     # Add axes and bounds
     plotter.add_axes(line_width=2)
     plotter.show_bounds(color="white")
-
-    if show_cylindrical_angles:
-        radius = np.max(np.linalg.norm(mesh.points[:, :2], axis=1))
-        add_cylindrical_angle_guides(plotter, radius)
 
     # Render the visualization
     plotter.show(title="Fusion Plasma Surface")

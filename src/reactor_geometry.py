@@ -121,11 +121,10 @@ def generate_toroidal_coils_3d(
     toroidal_coil_2d: ToroidalCoil2D,
     toroid_coil_config: ToroidalCoilConfig,
 ) -> list[ToroidalCoil3D]:
-    """
-    Generate full 3D geometry for toroidal coils from 2D cross-section using efficient numpy operations.
-    """
+    """Generate full 3D geometry for toroidal coils from 2D cross-section using efficient numpy operations."""
+
     phi_angles = np.linspace(0, 2 * np.pi, toroid_coil_config.n_field_coils, endpoint=False)
-    coils = []
+    coils: list[ToroidalCoil3D] = []
 
     # Prepare 2D cross-section
     r_inner_2d = toroidal_coil_2d.R_inner
@@ -203,7 +202,9 @@ if __name__ == "__main__":
     plasma_boundary, toroidal_coil_2d = calculate_2d_geometry(plasma_config=plasma_config, toroid_coil_config=toroid_coil_config)
 
     fusion_plasma = generate_fusion_plasma(plasma_boundary=plasma_boundary)
-    toroidal_coils_3d = generate_toroidal_coils_3d(toroidal_coil_2d=toroidal_coil_2d, toroid_coil_config=toroid_coil_config)
+    toroidal_coils_3d = generate_toroidal_coils_3d(
+        toroidal_coil_2d=toroidal_coil_2d, toroid_coil_config=toroid_coil_config
+    )
 
     plotter = initialize_plotter(shape=(1, 2))
 
