@@ -5,7 +5,6 @@
 - [Toroidal Coil Cross-Section Construction](#toroidal-coil-cross-section-construction)
 - [3D Plasma Surface Generation](#3d-plasma-surface-generation)
 - [3D Toroidal Coil Generation](#3d-toroidal-coil-generation)
-- [Summary and Visualization](#summary-and-visualization)
 
 ---
 
@@ -32,22 +31,6 @@ $$
 
 This equation captures the characteristic D-shaped plasma cross-section in modern tokamaks by introducing shaping effects beyond an ideal circular boundary. <image here> illustrating plasma cross-section shapes with varying $\kappa$ and $\delta$.
 
----
-
-## Toroidal Coil Cross-Section Construction
-
-Toroidal coils are represented as 2D cross-sections offset from the plasma boundary by a set distance and have a defined radial thickness.
-
-1. Compute the tangent vector at each poloidal boundary point using the gradient:
-   - $dR/d\theta$, $dZ/d\theta$
-2. Calculate outward poloidal normal vectors by rotating tangents by 90 degrees:
-   $$
-   \mathbf{N} = \frac{1}{\|\cdot\|} \begin{bmatrix} dZ/d\theta \\ -dR/d\theta \end{bmatrix}
-   $$
-3. Offset the plasma boundary by desired distance ($d$) along the normal to find the coil inner boundary.
-4. Add radial thickness along normals to define coil outer boundary and center.
-
-The coil cross-section thus frames the plasma boundary with a controllable spatial clearance and thickness, essential for realistic coil placement and magnetic field modeling. <image here> showing coil offset geometries around plasma boundary.
 
 ---
 
@@ -67,6 +50,22 @@ This produces a symmetric surface representing a tokamak plasma volume warped ac
 
 ---
 
+## Toroidal Coil Cross-Section Construction
+
+Toroidal coils are represented as 2D cross-sections offset from the plasma boundary by a set distance and have a defined radial thickness.
+Essentially, points on the poloidal plasma plane are projected outwards to form the toroidal field coils.
+
+1. Compute the tangent vector at each poloidal boundary point using the gradient:
+   - $dR/d\theta$, $dZ/d\theta$
+2. Calculate outward poloidal normal vectors by rotating tangents by 90 degrees
+3. Offset the plasma boundary by desired distance ($d$) along the normal to find the coil inner boundary.
+4. Add radial thickness along normals to define coil outer boundary and center.
+
+- Coil cross-section frames the plasma boundary with a controllable spatial clearance and thickness
+- In future the shape of the field coil shall be a matter of optimization, therefore geometric constrains may change
+
+---
+
 ## 3D Toroidal Coil Generation
 
 Toroidal coils are extruded into 3D by sweeping the 2D cross-section around the toroidal angle with specified coil count and angular spans.
@@ -83,3 +82,4 @@ Toroidal coils are extruded into 3D by sweeping the 2D cross-section around the 
 This parametric approach allows flexible coil configurations matched precisely to the plasma shape. <image here> showing 3D coils wrapping around plasma surface.
 
 The implementation reflects domain expertise by combining classical fusion plasma geometry theory with clean numerical methods and clear 2D-to-3D transformations. Visualization functions support immediate validation and interactive exploration.
+
