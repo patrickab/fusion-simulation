@@ -42,9 +42,10 @@ The 2D poloidal plasma contour is revolved around the vertical (Z) axis to form 
 - Create toroidal angles $\phi$ spanning $0$ to $2\pi$.
 - Generate 2D grids $(R, \phi)$ for a parametric surface.
 - Convert cylindrical coordinates $(R, \phi, Z)$ to Cartesian:
-  $$
-  X = R \cos \phi, \quad Y = R \sin \phi, \quad Z = Z
-  $$
+
+$$
+X = R \cos \phi, \quad Y = R \sin \phi, \quad Z = Z
+$$
 
 This produces a symmetric surface representing a tokamak plasma volume warped according to shaping parameters. The procedure efficiently uses numpy broadcasting for mesh generation. <image here> of resulting 3D plasma surface.
 
@@ -72,14 +73,7 @@ Toroidal coils are extruded into 3D by sweeping the 2D cross-section around the 
 
 - The coil circumference is divided into $n$ field coils spaced evenly.
 - For each coil, an angular segment centered at $\phi_i$ is generated.
-- The 2D coil cross-sections are rotated using:
-  $$
-  X = r \cos \phi, \quad Y = r \sin \phi, \quad Z = z
-  $$
+- The 2D coil cross-sections are rotated using $X = r \cos \phi, \quad Y = r \sin \phi, \quad Z = z$
 - Surfaces for inner and outer coil boundaries are calculated.
 - Coil caps (start and end) are constructed to close the geometry.
-
-This parametric approach allows flexible coil configurations matched precisely to the plasma shape. <image here> showing 3D coils wrapping around plasma surface.
-
-The implementation reflects domain expertise by combining classical fusion plasma geometry theory with clean numerical methods and clear 2D-to-3D transformations. Visualization functions support immediate validation and interactive exploration.
 
