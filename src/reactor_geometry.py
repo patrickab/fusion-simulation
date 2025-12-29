@@ -12,7 +12,7 @@ from src.lib.geometry_config import (
     ToroidalCoil3D,
     ToroidalCoilConfig,
 )
-from src.lib.visualization import initialize_plotter, render_fusion_plasma, visualize_2d_geometry
+from src.lib.visualization import initialize_plotter, render_2d_geometry, render_fusion_plasma
 
 COIL_RESOLUTION_3D = 64  # Number of points in the toroidal direction for 3D coils
 
@@ -209,7 +209,7 @@ if __name__ == "__main__":
     plotter = initialize_plotter(shape=(1, 2))
 
     plotter.subplot(0, 0)
-    visualize_2d_geometry(plotter=plotter, plasma_boundary=plasma_boundary, toroidal_coil_2d=toroidal_coil_2d)
+    render_2d_geometry(plotter=plotter, plasma_boundary=plasma_boundary, toroidal_coil_2d=toroidal_coil_2d)
     plotter.subplot(0, 1)
     render_fusion_plasma(
         plotter=plotter,
