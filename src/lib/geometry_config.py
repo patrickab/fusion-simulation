@@ -56,7 +56,7 @@ class FusionPlasma:
     Z: np.ndarray  # Z coordinates (m)
     Boundary: PlasmaBoundary
 
-    def to_ply_structuregrid(self, filename: str = Filepaths.REACTOR_POLYGONIAL_MESH) -> None:
+    def to_ply_structuregrid(self, filename: str = Filepaths.PLASMA_SURFACE) -> None:
         """
         Exports the toroidal plasma surface to a polygonal mesh in .ply format.
         """
