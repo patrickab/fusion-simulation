@@ -1,12 +1,13 @@
 """Utility functions for visualizing fusion simulation geometry."""
 
 import os
+from typing import Optional
 
 import numpy as np
 import pyvista as pv
 
 from src.lib.config import Filepaths
-from src.lib.geometry_config import FusionPlasma, PlasmaBoundary, ToroidalCoil2D, ToroidalCoil3D
+from src.lib.geometry_config import FusionPlasma, PlasmaBoundary, RotationalAngles, ToroidalCoil2D, ToroidalCoil3D
 from src.lib.linalg_utils import convert_rz_to_xyz
 
 
