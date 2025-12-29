@@ -23,7 +23,7 @@ def export_plasmasurface(
     print(f"✅ Exported plasma surface to: {os.path.abspath(filename)}")
 
 
-def display_theta_coordinates(
+def display_cylindrical_angles(
     plotter: pv.Plotter,
     n_angles: int = 8,
     radius: float = 10.0,
@@ -128,6 +128,25 @@ def visualize_2d_geometry(plotter: pv.Plotter, plasma_boundary: PlasmaBoundary, 
     plotter.camera_position = "iso"
 
 
+def get_sparse_wireframe(fusion_plasma: FusionPlasma | pv.PolyData, N: int = 8) -> Optional[pv.PolyData]:
+    """Generate a sparse wireframe mesh from FusionPlasma or PolyData."""
+
+    if isinstance(fusion_plasma, FusionPlasma):
+        x = fusion_plasma.X[::N, ::N]
+        y = fusion_plasma.Y[::N, ::N]
+        z = fusion_plasma.Z[::N, ::N]
+    elif isinstance(fusion_plasma, pv.PolyData):
+        points = fusion_plasma.points.reshape((RotationalAngles.n_phi, RotationalAngles.n_theta, 3))
+        sparse_points = points[::N, ::N, :]
+        x = sparse_points[:, :, 0]
+        y = sparse_points[:, :, 1]
+        z = sparse_points[:, :, 2]
+    else:
+        raise TypeError("Input data must be of type FusionPlasma or pv.PolyData.")
+
+    return pv.StructuredGrid(x, y, z).extract_surface()
+
+
 def visualize_3d_geometry(
     plotter: pv.Plotter,
     fusion_plasma: FusionPlasma,
@@ -141,18 +160,8 @@ def visualize_3d_geometry(
 
     # Create a sparser wireframe by subsampling the mesh points
     # Subsample every Nth point along each axis (e.g., every 4th point)
-    def add_sparse_wireframe(plotter: pv.Plotter, x: np.ndarray, y: np.ndarray, z: np.ndarray) -> None:
-        """Add a sparse wireframe mesh to the plotter."""
-
-        # Create a structured grid from the sparse points
-        N = 8
-        x = fusion_plasma.X[::N, ::N]
-        y = fusion_plasma.Y[::N, ::N]
-        z = fusion_plasma.Z[::N, ::N]
-        sparse_mesh = pv.StructuredGrid(x, y, z).extract_surface()
-        plotter.add_mesh(sparse_mesh, style="wireframe", color="cyan", line_width=2, opacity=0.7)
-
-    add_sparse_wireframe(plotter, fusion_plasma.X, fusion_plasma.Y, fusion_plasma.Z)
+    sparse_wireframe = get_sparse_wireframe(fusion_plasma=fusion_plasma)
+    plotter.add_mesh(sparse_wireframe, style="wireframe", color="cyan", line_width=1, opacity=0.5, name="plasma_wireframe")
 
     plasma_opacity = 0.8
     plotter.add_mesh(
@@ -223,7 +232,6 @@ def visualize_3d_geometry(
 
     plotter.add_title("3D Toroidal Geometry", font_size=16, color="white")
     set_camera_relative_to_body(plotter, distance_factor=3)
-    display_theta_coordinates(plotter)
     # display_phi_coordinates(plotter)
 
 
@@ -231,16 +239,14 @@ def initialize_plotter(shape: tuple[int, int] = (1, 1)) -> pv.Plotter:
     """Initialize a PyVista plotter with a black background and trackball style."""
 
     plotter = pv.Plotter(shape=shape, border=True, border_color="white")
-
     plotter.set_background("black")
-    plotter.enable_trackball_style()
-    plotter.camera.enable_parallel_projection()
     return plotter
 
 
 def render_fusion_plasma(
-    ply_file_path: str = PATH_PLASMA_SURFACE,
-    show_cylindrical_angles: bool = False,
+    plasma_file_path: str,
+    show_cylindrical_angles: bool,
+    show_wireframe: bool,
 ) -> None:
     """Load and render a fusion plasma surface from a ``.ply`` file.
 
@@ -252,24 +258,19 @@ def render_fusion_plasma(
         If ``True`` display angle guides for cylindrical coordinates.
     """
 
-    # Load the plasma mesh
-    mesh = pv.read(ply_file_path)
+    # Read mesh & compute normals for smooth shading
+    mesh_fusion_plasma = pv.read(plasma_file_path)
+    mesh_fusion_plasma.compute_normals(inplace=True)
 
     # Create a plotter
-    plotter = pv.Plotter(window_size=(1024, 768))
-    plotter.background_color.set_background(color="black")
-
-    # Compute normals for smooth shading
-    mesh.compute_normals(inplace=True)
-
-    # Choose an appealing color map
+    plotter = initialize_plotter()
     cmap = "plasma"
 
     # Add mesh to plotter (surface)
     plotter.add_mesh(
-        mesh,
+        mesh_fusion_plasma,
         color=None,
-        scalars=mesh.points[:, 2],
+        scalars=mesh_fusion_plasma.points[:, 2],
         cmap=cmap,
         smooth_shading=True,
         opacity=0.4,
@@ -279,14 +280,10 @@ def render_fusion_plasma(
         specular_power=15,
         name="plasma_surface",
     )
-    # Overlay wireframe for emphasis
-    plotter.add_mesh(
-        mesh,
-        style="wireframe",
-        color="cyan",
-        line_width=2,
-        name="plasma_wireframe",
-    )
+
+    if show_wireframe:
+        sparse_wireframe = get_sparse_wireframe(fusion_plasma=mesh_fusion_plasma)
+        plotter.add_mesh(sparse_wireframe, style="wireframe", color="cyan", line_width=1, opacity=0.2, name="plasma_wireframe")
 
     # Add light for dramatic effect
     light = pv.Light(position=(1, 1, 1), focal_point=(0, 0, 0), color="white", intensity=0.9)
@@ -300,8 +297,8 @@ def render_fusion_plasma(
     plotter.show_bounds(color="white")
 
     if show_cylindrical_angles:
-        radius = np.max(np.linalg.norm(mesh.points[:, :2], axis=1))
-        add_cylindrical_angle_guides(plotter, radius)
+        radius = np.max(np.linalg.norm(mesh_fusion_plasma.points[:, :2], axis=1))
+        display_cylindrical_angles(plotter=plotter, n_angles=8, radius=radius)
 
     # Render the visualization
     plotter.show(title="Fusion Plasma Surface")
