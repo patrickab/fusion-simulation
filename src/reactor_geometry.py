@@ -2,11 +2,12 @@
 
 import numpy as np
 
-from src.lib.config import RotationalAngles
+from src.lib.config import Filepaths
 from src.lib.geometry_config import (
     FusionPlasma,
     PlasmaBoundary,
     PlasmaConfig,
+    RotationalAngles,
     ToroidalCoil2D,
     ToroidalCoil3D,
     ToroidalCoilConfig,
@@ -219,3 +220,4 @@ if __name__ == "__main__":
     # Render the visualization
     title_bar = "Fusion Reactor Visualization"
     plotter.show(title=title_bar, interactive=True)
+    fusion_plasma.to_ply_structuregrid(Filepaths.PLASMA_SURFACE)
