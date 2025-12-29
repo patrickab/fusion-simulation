@@ -20,6 +20,7 @@ class RotationalAngles:
     PHI = np.linspace(0, 2 * np.pi, n_phi)  # Azimuthal angle in radians
     THETA = np.linspace(0, 2 * np.pi, n_theta)  # Polar angle in radians
 
+
 @dataclass
 class PlasmaConfig:
     """
@@ -30,6 +31,7 @@ class PlasmaConfig:
     a: float  # Minor radius of the torus (m)
     kappa: float  # Elongation factor
     delta: float  # Triangularity factor
+
 
 @dataclass
 class ToroidalCoilConfig:
@@ -44,6 +46,7 @@ class ToroidalCoilConfig:
     angular_span: float  # angular span of the coil (degrees) - defines the coil's extent in the toroidal direction
     n_field_coils: int  # of field coils
 
+
 @dataclass
 class PlasmaBoundary:
     """
@@ -52,6 +55,7 @@ class PlasmaBoundary:
 
     R_2d: np.ndarray  # R coordinates (m)
     Z_2d: np.ndarray  # Z coordinates (m)
+
 
 @dataclass
 class FusionPlasma:
@@ -72,6 +76,7 @@ class FusionPlasma:
         grid = pv.StructuredGrid(self.X, self.Y, self.Z).extract_surface()
         grid.save(filename)
         print(f"✅ Exported plasma surface to: {os.path.abspath(filename)}")
+
 
 @dataclass
 class ToroidalCoil2D:
@@ -95,6 +100,7 @@ class ToroidalCoil2D:
         # Stack inner and outer boundary points
         points = np.column_stack((np.concatenate([self.R_inner, self.R_outer]), np.concatenate([self.Z_inner, self.Z_outer])))
         return Delaunay(points)
+
 
 @dataclass
 class ToroidalCoil3D:
@@ -172,42 +178,3 @@ class ToroidalCoil3D:
         meta_path = os.path.join(base_path, f"coil_{coil_id:02d}_meta.json")
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta, f, indent=2)
-
-    @classmethod
-    def from_ply(cls, base_path: str | os.PathLike) -> list[dict[str, pv.PolyData]]:
-        """
-        Load toroidal coil meshes from disk.
-
-        Returns:
-            A list of dicts, one per coil:
-                {"inner": PolyData, "outer": PolyData, "cap_start": PolyData, "cap_end": PolyData}
-        """
-        base_path = os.fspath(base_path)
-        if not os.path.isdir(base_path):
-            return []
-
-        coils: list[dict[str, pv.PolyData]] = []
-        meta_files = sorted(
-            f for f in os.listdir(base_path)
-            if f.startswith("coil_") and f.endswith("_meta.json")
-        )
-
-        for meta_file in meta_files:
-            meta_path = os.path.join(base_path, meta_file)
-            with open(meta_path, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-
-            coil_meshes: dict[str, pv.PolyData] = {}
-            for part in ("inner", "outer", "cap_start", "cap_end"):
-                filename = meta.get(part)
-                if not filename:
-                    continue
-                path = os.path.join(base_path, filename)
-                if not os.path.isfile(path):
-                    continue
-                coil_meshes[part] = pv.read(path)
-
-            if coil_meshes:
-                coils.append(coil_meshes)
-
-        return coils

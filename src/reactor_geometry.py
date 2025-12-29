@@ -12,7 +12,7 @@ from src.lib.geometry_config import (
     ToroidalCoil3D,
     ToroidalCoilConfig,
 )
-from src.lib.visualization import initialize_plotter, visualize_2d_geometry, visualize_3d_geometry
+from src.lib.visualization import initialize_plotter, render_fusion_plasma, visualize_2d_geometry
 
 COIL_RESOLUTION_3D = 64  # Number of points in the toroidal direction for 3D coils
 
@@ -211,15 +211,14 @@ if __name__ == "__main__":
     plotter.subplot(0, 0)
     visualize_2d_geometry(plotter=plotter, plasma_boundary=plasma_boundary, toroidal_coil_2d=toroidal_coil_2d)
     plotter.subplot(0, 1)
-    visualize_3d_geometry(
+    render_fusion_plasma(
         plotter=plotter,
         fusion_plasma=fusion_plasma,
-        toroidal_coils_3d=toroidal_coils_3d,
+        toroidal_coils=toroidal_coils_3d,
     )
 
     # Render the visualization
-    title_bar = "Fusion Reactor Visualization"
-    plotter.show(title=title_bar, interactive=True)
+    plotter.show(title="Fusion Reactor Visualization", interactive=True)
 
     # Save geometry to PLY files
     fusion_plasma.to_ply_structuregrid(Filepaths.PLASMA_SURFACE)
