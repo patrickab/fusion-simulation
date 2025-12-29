@@ -43,20 +43,16 @@ def plot_plasma(
 ) -> None:
     """Add a plasma surface (FusionPlasma or PolyData) to the plotter."""
 
-    def get_sparse_wireframe(plasma: pv.PolyData, N: int = 8) -> Optional[pv.PolyData]:
-        """Generate a sparse wireframe mesh from normalized PolyData."""
-        if isinstance(plasma, FusionPlasma):
-            x = plasma.X[::N, ::N]
-            y = plasma.Y[::N, ::N]
-            z = plasma.Z[::N, ::N]
-        elif isinstance(plasma, pv.PolyData):
-            points = plasma.points.reshape((RotationalAngles.n_phi, RotationalAngles.n_theta, 3))
-            sparse_points = points[::N, ::N, :]
-            x = sparse_points[:, :, 0]
-            y = sparse_points[:, :, 1]
-            z = sparse_points[:, :, 2]
-        else:
-            raise TypeError("Input data must be of type FusionPlasma or pv.PolyData.")
+    def get_sparse_wireframe(plasma_mesh: pv.PolyData, step: int = 8) -> Optional[pv.PolyData]:
+        """Generate a sparse wireframe mesh from a structured plasma PolyData."""
+        # The plasma mesh is assumed to be a structured grid flattened into points.
+        # We reconstruct the (phi, theta, 3) shape using the known sampling counts.
+        points = plasma_mesh.points.reshape((RotationalAngles.n_phi, RotationalAngles.n_theta, 3))
+        sparse_points = points[::step, ::step, :]
+
+        x = sparse_points[:, :, 0]
+        y = sparse_points[:, :, 1]
+        z = sparse_points[:, :, 2]
 
         return pv.StructuredGrid(x, y, z).extract_surface()
 
@@ -78,7 +74,7 @@ def plot_plasma(
     )
 
     if show_wireframe:
-        sparse_wireframe = get_sparse_wireframe(plasma=plasma_mesh)
+        sparse_wireframe = get_sparse_wireframe(plasma_mesh=plasma_mesh)
         plotter.add_mesh(
             sparse_wireframe,
             style="wireframe",
@@ -118,13 +114,14 @@ def display_phi_coordinates(
     """
     Adds cylindrical coordinate system lines for phi angles to the plotter.
     """
-    # Add cylindrical coordinate system (phi)
-    n_angles = 9
     angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
+    radius = 10.0
+
     for angle in angles:
-        x = np.array([0, 0])
-        y = np.array([0, 10 * np.cos(angle)])
-        z = np.array([0, 10 * np.sin(angle)])
+        x = np.array([0.0, 0.0])
+        y = np.array([0.0, radius * np.cos(angle)])
+        z = np.array([0.0, radius * np.sin(angle)])
+
         plotter.add_lines(
             np.column_stack((x, y, z)),
             color="lightgray",
@@ -138,35 +135,52 @@ def visualize_2d_geometry(plotter: pv.Plotter, plasma_boundary: PlasmaBoundary, 
     plotter.add_title("2D Poloidal Cross-Section", font_size=16, color="white")
 
     # Rotate plasma boundary and toroidal coil 2d by 90 degrees around the x-axis
-    radians_90 = 90 * np.pi / 180
-    coordinates_xyz_plasma_boundary = convert_rz_to_xyz(R=plasma_boundary.R_2d, Z=plasma_boundary.Z_2d, phi=radians_90)
-    coordinates_xyz_inner_coil = convert_rz_to_xyz(R=toroidal_coil_2d.R_inner, Z=toroidal_coil_2d.Z_inner, phi=radians_90)
-    coordinates_xyz_outer_coil = convert_rz_to_xyz(R=toroidal_coil_2d.R_outer, Z=toroidal_coil_2d.Z_outer, phi=radians_90)
-    coordinates_xyz_coil_center = convert_rz_to_xyz(R=toroidal_coil_2d.R_center, Z=toroidal_coil_2d.Z_center, phi=radians_90)
+    rotation_phi = np.deg2rad(90.0)
+
+    plasma_boundary_xyz = convert_rz_to_xyz(
+        R=plasma_boundary.R_2d,
+        Z=plasma_boundary.Z_2d,
+        phi=rotation_phi,
+    )
+    coil_inner_xyz = convert_rz_to_xyz(
+        R=toroidal_coil_2d.R_inner,
+        Z=toroidal_coil_2d.Z_inner,
+        phi=rotation_phi,
+    )
+    coil_outer_xyz = convert_rz_to_xyz(
+        R=toroidal_coil_2d.R_outer,
+        Z=toroidal_coil_2d.Z_outer,
+        phi=rotation_phi,
+    )
+    coil_center_xyz = convert_rz_to_xyz(
+        R=toroidal_coil_2d.R_center,
+        Z=toroidal_coil_2d.Z_center,
+        phi=rotation_phi,
+    )
 
     # Add plasma boundary (2D poloidal cross-section)
     plotter.add_lines(
-        np.column_stack(coordinates_xyz_plasma_boundary),
+        np.column_stack(plasma_boundary_xyz),
         color="cyan",
         width=2,
     )
 
     # Add toroidal coil 2D boundaries (inner and outer)
     plotter.add_lines(
-        np.column_stack(coordinates_xyz_inner_coil),
+        np.column_stack(coil_inner_xyz),
         color="purple",
         width=2,
         label="Toroidal Coil Inner Boundary",
     )
     plotter.add_lines(
-        np.column_stack(coordinates_xyz_outer_coil),
+        np.column_stack(coil_outer_xyz),
         color="purple",
         width=2,
         label="Toroidal Coil Outer Boundary",
     )
 
     plotter.add_lines(
-        np.column_stack(coordinates_xyz_coil_center),
+        np.column_stack(coil_center_xyz),
         color="purple",
         width=2,
         label="Toroidal Coil Center Boundary",

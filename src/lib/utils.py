@@ -72,7 +72,6 @@ def _plasma_to_polydata(plasma: FusionPlasma | pv.PolyData | Path) -> pv.PolyDat
     """Convert FusionPlasma, PolyData, or a file path to a PolyData surface mesh."""
     if isinstance(plasma, Path):
         try:
-            print(f"Loading plasma mesh from: {plasma}")
             return pv.read(plasma)
         except FileNotFoundError:
             raise FileNotFoundError(f"PLY file not found at path: {plasma}") from None
