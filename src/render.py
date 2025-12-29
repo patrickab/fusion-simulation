@@ -20,8 +20,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Display a sparse wireframe overlay of the plasma surface.",
     )
+    parser.add_argument(
+        "--show-coils",
+        action="store_true",
+        help="Display toroidal coils in the plot.",
+    )
     args = parser.parse_args()
 
     render_fusion_plasma(
-        plasma_file_path=args.fusion_plasma_file, show_cylindrical_angles=args.show_angles, show_wireframe=args.show_wireframe
+        plasma_file_path=args.fusion_plasma_file,
+        show_cylindrical_angles=args.show_angles,
+        show_wireframe=args.show_wireframe,
+        show_coils=args.show_coils,
     )
