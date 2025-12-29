@@ -11,6 +11,13 @@ from src.lib.linalg_utils import convert_rz_to_xyz
 from src.lib.utils import _coils_to_polydata, _plasma_to_polydata
 
 
+def initialize_plotter(shape: tuple[int, int] = (1, 1)) -> pv.Plotter:
+    """Initialize a PyVista plotter with a black background and trackball style."""
+    plotter = pv.Plotter(shape=shape, border=True, border_color="white")
+    plotter.set_background("black")
+    return plotter
+
+
 def plot_toroidal_coils(
     plotter: pv.Plotter,
     toroidal_coils: list[ToroidalCoil3D] | list[pv.PolyData] | list[Path] | list[dict[str, pv.PolyData]],
@@ -45,15 +52,14 @@ def plot_plasma(
 
     def get_sparse_wireframe(plasma_mesh: pv.PolyData, step: int = 8) -> Optional[pv.PolyData]:
         """Generate a sparse wireframe mesh from a structured plasma PolyData."""
-        # The plasma mesh is assumed to be a structured grid flattened into points.
-        # We reconstruct the (phi, theta, 3) shape using the known sampling counts.
+        # Extract and reshape points into structured grid format
         points = plasma_mesh.points.reshape((RotationalAngles.n_phi, RotationalAngles.n_theta, 3))
+
+        # Create sparse sampling
         sparse_points = points[::step, ::step, :]
 
-        x = sparse_points[:, :, 0]
-        y = sparse_points[:, :, 1]
-        z = sparse_points[:, :, 2]
-
+        # Extract coordinate arrays for structured grid
+        x, y, z = sparse_points[:, :, 0], sparse_points[:, :, 1], sparse_points[:, :, 2]
         return pv.StructuredGrid(x, y, z).extract_surface()
 
     plasma_mesh = _plasma_to_polydata(plasma)
@@ -107,76 +113,42 @@ def display_cylindrical_angles(
         )
 
 
-def display_phi_coordinates(
-    plotter: pv.Plotter,
-    n_angles: int = 16,
-) -> None:
-    """
-    Adds cylindrical coordinate system lines for phi angles to the plotter.
-    """
-    angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
-    radius = 10.0
-
-    for angle in angles:
-        x = np.array([0.0, 0.0])
-        y = np.array([0.0, radius * np.cos(angle)])
-        z = np.array([0.0, radius * np.sin(angle)])
-
-        plotter.add_lines(
-            np.column_stack((x, y, z)),
-            color="lightgray",
-            width=1,
-            label=f"Phi {np.degrees(angle):.1f}°",
-        )
-
-
-def visualize_2d_geometry(plotter: pv.Plotter, plasma_boundary: PlasmaBoundary, toroidal_coil_2d: ToroidalCoil2D) -> None:
+def render_2d_geometry(plotter: pv.Plotter, plasma_boundary: PlasmaBoundary, toroidal_coil_2d: ToroidalCoil2D) -> None:
     """Display 2D boundaries of plasma and toroidal coil in the plotter."""
     plotter.add_title("2D Poloidal Cross-Section", font_size=16, color="white")
 
-    # Rotate all 2D boundaries by 90 degrees around the x-axis for visualization
-    rotation_phi = np.deg2rad(90.0)
+    ROTATION_ANGLE = np.deg2rad(90.0)
+    COIL_BOUNDARIES = [
+        (toroidal_coil_2d.R_inner, toroidal_coil_2d.Z_inner, "Inner"),
+        (toroidal_coil_2d.R_outer, toroidal_coil_2d.Z_outer, "Outer"),
+        (toroidal_coil_2d.R_center, toroidal_coil_2d.Z_center, "Center"),
+    ]
 
-    # Convert plasma boundary to 3D coordinates
-    plasma_boundary_xyz = convert_rz_to_xyz(
+    plasma_points_3d = convert_rz_to_xyz(
         R=plasma_boundary.R_2d,
         Z=plasma_boundary.Z_2d,
-        phi=rotation_phi,
+        phi=ROTATION_ANGLE,
     )
-
-    # Convert coil boundaries to 3D coordinates
-    coil_boundaries = [
-        (toroidal_coil_2d.R_inner, toroidal_coil_2d.Z_inner, "Toroidal Coil Inner Boundary"),
-        (toroidal_coil_2d.R_outer, toroidal_coil_2d.Z_outer, "Toroidal Coil Outer Boundary"),
-        (toroidal_coil_2d.R_center, toroidal_coil_2d.Z_center, "Toroidal Coil Center Boundary"),
-    ]
 
     # Add plasma boundary (2D poloidal cross-section)
     plotter.add_lines(
-        np.column_stack(plasma_boundary_xyz),
+        np.column_stack(plasma_points_3d),
         color="cyan",
         width=2,
+        label="Plasma Boundary",
     )
 
     # Add all toroidal coil boundaries
-    for R_coil, Z_coil, label in coil_boundaries:
-        coil_xyz = convert_rz_to_xyz(R=R_coil, Z=Z_coil, phi=rotation_phi)
+    for R_coil, Z_coil, boundary_type in COIL_BOUNDARIES:
+        coil_points_3d = convert_rz_to_xyz(R=R_coil, Z=Z_coil, phi=ROTATION_ANGLE)
         plotter.add_lines(
-            np.column_stack(coil_xyz),
+            np.column_stack(coil_points_3d),
             color="purple",
             width=2,
-            label=label,
+            label=f"Toroidal Coil {boundary_type} Boundary",
         )
 
     plotter.camera_position = "iso"
-
-
-def initialize_plotter(shape: tuple[int, int] = (1, 1)) -> pv.Plotter:
-    """Initialize a PyVista plotter with a black background and trackball style."""
-
-    plotter = pv.Plotter(shape=shape, border=True, border_color="white")
-    plotter.set_background("black")
-    return plotter
 
 
 def render_fusion_plasma(
@@ -186,25 +158,20 @@ def render_fusion_plasma(
     show_wireframe: bool = True,
     plotter: pv.Plotter | None = None,
 ) -> None:
-    """Load and render a fusion plasma surface from a ``.ply`` file.
+    """Load and render a fusion plasma surface from a ``.ply`` file."""
 
-    Parameters
-    ----------
-    ply_file_path:
-        Path to the PLY file containing the plasma mesh.
-    show_cylindrical_angles:
-        If ``True`` display angle guides for cylindrical coordinates.
-    """
-    mesh_fusion_plasma = _plasma_to_polydata(fusion_plasma)
+    # Early return if no valid plasma data
+    if fusion_plasma is None:
+        return
 
-    # Create a plotter
-    if plotter is None:
-        plotter = initialize_plotter()
-        is_own_plotter = True
-    else:
-        is_own_plotter = False
+    # Create plotter if not provided
+    plotter_was_provided = plotter is not None
+    plotter = plotter or initialize_plotter()
 
-    # Plot plasma (pass original argument; plot_plasma will normalize)
+    # Convert plasma to mesh format
+    plasma_mesh = _plasma_to_polydata(fusion_plasma)
+
+    # Plot plasma surface
     plot_plasma(
         plotter=plotter,
         plasma=fusion_plasma,
@@ -214,7 +181,7 @@ def render_fusion_plasma(
         name_prefix="plasma",
     )
 
-    # Optionally add toroidal coils from PLY files
+    # Add toroidal coils if provided
     if toroidal_coils:
         plot_toroidal_coils(
             plotter=plotter,
@@ -222,18 +189,19 @@ def render_fusion_plasma(
             name_prefix="Toroidal Coil",
         )
 
+    # Add cylindrical angle guides if requested
     if show_cylindrical_angles:
-        radius = np.max(np.linalg.norm(mesh_fusion_plasma.points[:, :2], axis=1))
-        display_cylindrical_angles(plotter=plotter, n_angles=8, radius=radius)
+        max_radius = np.max(np.linalg.norm(plasma_mesh.points[:, :2], axis=1))
+        display_cylindrical_angles(plotter=plotter, n_angles=8, radius=max_radius)
 
-    # Add light for dramatic effect
+    # Enhance visualization with lighting and reference elements
     light = pv.Light(position=(1, 1, 1), focal_point=(0, 0, 0), color="white", intensity=0.5)
     plotter.add_light(light)
 
-    # Add axes and bounds
     plotter.add_axes(line_width=2)
     plotter.show_bounds(color="white")
     plotter.add_title("3D Toroidal Geometry", font_size=16, color="white")
 
-    if is_own_plotter:
+    # Only show plotter if created internally
+    if not plotter_was_provided:
         plotter.show(title="Fusion Plasma Surface")
