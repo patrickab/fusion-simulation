@@ -220,4 +220,8 @@ if __name__ == "__main__":
     # Render the visualization
     title_bar = "Fusion Reactor Visualization"
     plotter.show(title=title_bar, interactive=True)
+
+    # Save geometry to PLY files
     fusion_plasma.to_ply_structuregrid(Filepaths.PLASMA_SURFACE)
+    for i, coil in enumerate(toroidal_coils_3d, start=1):
+        coil.to_ply(base_path=Filepaths.TOROIDAL_COIL_3D_DIR, coil_id=i)

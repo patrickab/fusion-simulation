@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import json
 import os
 
 import numpy as np
@@ -30,7 +31,6 @@ class PlasmaConfig:
     kappa: float  # Elongation factor
     delta: float  # Triangularity factor
 
-
 @dataclass
 class ToroidalCoilConfig:
     """
@@ -44,7 +44,6 @@ class ToroidalCoilConfig:
     angular_span: float  # angular span of the coil (degrees) - defines the coil's extent in the toroidal direction
     n_field_coils: int  # of field coils
 
-
 @dataclass
 class PlasmaBoundary:
     """
@@ -53,7 +52,6 @@ class PlasmaBoundary:
 
     R_2d: np.ndarray  # R coordinates (m)
     Z_2d: np.ndarray  # Z coordinates (m)
-
 
 @dataclass
 class FusionPlasma:
@@ -74,7 +72,6 @@ class FusionPlasma:
         grid = pv.StructuredGrid(self.X, self.Y, self.Z).extract_surface()
         grid.save(filename)
         print(f"✅ Exported plasma surface to: {os.path.abspath(filename)}")
-
 
 @dataclass
 class ToroidalCoil2D:
@@ -98,7 +95,6 @@ class ToroidalCoil2D:
         # Stack inner and outer boundary points
         points = np.column_stack((np.concatenate([self.R_inner, self.R_outer]), np.concatenate([self.Z_inner, self.Z_outer])))
         return Delaunay(points)
-
 
 @dataclass
 class ToroidalCoil3D:
@@ -141,3 +137,77 @@ class ToroidalCoil3D:
             )
         )
         return Delaunay(points)
+
+    def to_ply(self, base_path: str | os.PathLike, coil_id: int) -> None:
+        """
+        Export this coil's surfaces to PLY files in ``base_path``.
+        Creates:
+          coil_{id:02d}_inner.ply
+          coil_{id:02d}_outer.ply
+          coil_{id:02d}_cap_start.ply
+          coil_{id:02d}_cap_end.ply
+          coil_{id:02d}_meta.json
+        """
+        base_path = os.fspath(base_path)
+        os.makedirs(base_path, exist_ok=True)
+
+        def _save_structured(x: np.ndarray, y: np.ndarray, z: np.ndarray, suffix: str) -> str:
+            grid = pv.StructuredGrid(x, y, z).extract_surface()
+            filename = f"coil_{coil_id:02d}_{suffix}.ply"
+            path = os.path.join(base_path, filename)
+            grid.save(path)
+            return filename
+
+        inner_file = _save_structured(self.X_inner, self.Y_inner, self.Z_inner, "inner")
+        outer_file = _save_structured(self.X_outer, self.Y_outer, self.Z_outer, "outer")
+        cap_start_file = _save_structured(self.X_cap_start, self.Y_cap_start, self.Z_cap_start, "cap_start")
+        cap_end_file = _save_structured(self.X_cap_end, self.Y_cap_end, self.Z_cap_end, "cap_end")
+
+        meta = {
+            "inner": inner_file,
+            "outer": outer_file,
+            "cap_start": cap_start_file,
+            "cap_end": cap_end_file,
+        }
+        meta_path = os.path.join(base_path, f"coil_{coil_id:02d}_meta.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+
+    @classmethod
+    def from_ply(cls, base_path: str | os.PathLike) -> list[dict[str, pv.PolyData]]:
+        """
+        Load toroidal coil meshes from disk.
+
+        Returns:
+            A list of dicts, one per coil:
+                {"inner": PolyData, "outer": PolyData, "cap_start": PolyData, "cap_end": PolyData}
+        """
+        base_path = os.fspath(base_path)
+        if not os.path.isdir(base_path):
+            return []
+
+        coils: list[dict[str, pv.PolyData]] = []
+        meta_files = sorted(
+            f for f in os.listdir(base_path)
+            if f.startswith("coil_") and f.endswith("_meta.json")
+        )
+
+        for meta_file in meta_files:
+            meta_path = os.path.join(base_path, meta_file)
+            with open(meta_path, "r", encoding="utf-8") as f:
+                meta = json.load(f)
+
+            coil_meshes: dict[str, pv.PolyData] = {}
+            for part in ("inner", "outer", "cap_start", "cap_end"):
+                filename = meta.get(part)
+                if not filename:
+                    continue
+                path = os.path.join(base_path, filename)
+                if not os.path.isfile(path):
+                    continue
+                coil_meshes[part] = pv.read(path)
+
+            if coil_meshes:
+                coils.append(coil_meshes)
+
+        return coils
