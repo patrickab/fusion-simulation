@@ -9,12 +9,10 @@ from src.lib.config import Filepaths
 from src.lib.geometry_config import FusionPlasma, PlasmaBoundary, ToroidalCoil2D, ToroidalCoil3D
 from src.lib.linalg_utils import convert_rz_to_xyz
 
-PATH_PLASMA_SURFACE = Filepaths.ROOT + "/" + Filepaths.OUTPUT_DIR + "/" + Filepaths.REACTOR_POLYGONIAL_MESH
 
-
-def export_polygonal_plasmasurface(
+def export_plasmasurface(
     fusion_plasma: FusionPlasma,
-    filename: str = Filepaths.REACTOR_POLYGONIAL_MESH,
+    filename: str = Filepaths.PLASMA_SURFACE,
 ) -> None:
     """Converts the toroidal plasma surface to a polygonal mesh & stores it as .ply"""
 
