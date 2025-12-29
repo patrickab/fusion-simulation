@@ -134,29 +134,22 @@ def visualize_2d_geometry(plotter: pv.Plotter, plasma_boundary: PlasmaBoundary, 
     """Display 2D boundaries of plasma and toroidal coil in the plotter."""
     plotter.add_title("2D Poloidal Cross-Section", font_size=16, color="white")
 
-    # Rotate plasma boundary and toroidal coil 2d by 90 degrees around the x-axis
+    # Rotate all 2D boundaries by 90 degrees around the x-axis for visualization
     rotation_phi = np.deg2rad(90.0)
 
+    # Convert plasma boundary to 3D coordinates
     plasma_boundary_xyz = convert_rz_to_xyz(
         R=plasma_boundary.R_2d,
         Z=plasma_boundary.Z_2d,
         phi=rotation_phi,
     )
-    coil_inner_xyz = convert_rz_to_xyz(
-        R=toroidal_coil_2d.R_inner,
-        Z=toroidal_coil_2d.Z_inner,
-        phi=rotation_phi,
-    )
-    coil_outer_xyz = convert_rz_to_xyz(
-        R=toroidal_coil_2d.R_outer,
-        Z=toroidal_coil_2d.Z_outer,
-        phi=rotation_phi,
-    )
-    coil_center_xyz = convert_rz_to_xyz(
-        R=toroidal_coil_2d.R_center,
-        Z=toroidal_coil_2d.Z_center,
-        phi=rotation_phi,
-    )
+
+    # Convert coil boundaries to 3D coordinates
+    coil_boundaries = [
+        (toroidal_coil_2d.R_inner, toroidal_coil_2d.Z_inner, "Toroidal Coil Inner Boundary"),
+        (toroidal_coil_2d.R_outer, toroidal_coil_2d.Z_outer, "Toroidal Coil Outer Boundary"),
+        (toroidal_coil_2d.R_center, toroidal_coil_2d.Z_center, "Toroidal Coil Center Boundary"),
+    ]
 
     # Add plasma boundary (2D poloidal cross-section)
     plotter.add_lines(
@@ -165,26 +158,15 @@ def visualize_2d_geometry(plotter: pv.Plotter, plasma_boundary: PlasmaBoundary, 
         width=2,
     )
 
-    # Add toroidal coil 2D boundaries (inner and outer)
-    plotter.add_lines(
-        np.column_stack(coil_inner_xyz),
-        color="purple",
-        width=2,
-        label="Toroidal Coil Inner Boundary",
-    )
-    plotter.add_lines(
-        np.column_stack(coil_outer_xyz),
-        color="purple",
-        width=2,
-        label="Toroidal Coil Outer Boundary",
-    )
-
-    plotter.add_lines(
-        np.column_stack(coil_center_xyz),
-        color="purple",
-        width=2,
-        label="Toroidal Coil Center Boundary",
-    )
+    # Add all toroidal coil boundaries
+    for R_coil, Z_coil, label in coil_boundaries:
+        coil_xyz = convert_rz_to_xyz(R=R_coil, Z=Z_coil, phi=rotation_phi)
+        plotter.add_lines(
+            np.column_stack(coil_xyz),
+            color="purple",
+            width=2,
+            label=label,
+        )
 
     plotter.camera_position = "iso"
 
