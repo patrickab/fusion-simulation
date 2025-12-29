@@ -35,7 +35,6 @@ if __name__ == "__main__":
     toroidal_coils = None
     if args.coils is not None:
         coil_dir = Path(args.coils)
-        print(coil_dir)
 
         if not coil_dir.exists():
             raise FileNotFoundError(f"Coil directory does not exist: {coil_dir}")
