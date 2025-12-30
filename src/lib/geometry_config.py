@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import json
 import os
 
 import numpy as np
@@ -6,6 +7,18 @@ import pyvista as pv
 from scipy.spatial import Delaunay
 
 from src.lib.config import Filepaths
+
+
+class RotationalAngles:
+    """
+    Configuration class for rotational angles used in the application.
+    """
+
+    n_phi = 360  # Number of points in toroidal direction
+    n_theta = 360  # Number of points in poloidal direction
+
+    PHI = np.linspace(0, 2 * np.pi, n_phi)  # Azimuthal angle in radians
+    THETA = np.linspace(0, 2 * np.pi, n_theta)  # Polar angle in radians
 
 
 @dataclass
@@ -56,7 +69,7 @@ class FusionPlasma:
     Z: np.ndarray  # Z coordinates (m)
     Boundary: PlasmaBoundary
 
-    def to_ply_structuregrid(self, filename: str = Filepaths.REACTOR_POLYGONIAL_MESH) -> None:
+    def to_ply_structuregrid(self, filename: str = Filepaths.PLASMA_SURFACE) -> None:
         """
         Exports the toroidal plasma surface to a polygonal mesh in .ply format.
         """
@@ -130,3 +143,38 @@ class ToroidalCoil3D:
             )
         )
         return Delaunay(points)
+
+    def to_ply(self, base_path: str | os.PathLike, coil_id: int) -> None:
+        """
+        Export this coil's surfaces to PLY files in ``base_path``.
+        Creates:
+          coil_{id:02d}_inner.ply
+          coil_{id:02d}_outer.ply
+          coil_{id:02d}_cap_start.ply
+          coil_{id:02d}_cap_end.ply
+          coil_{id:02d}_meta.json
+        """
+        base_path = os.fspath(base_path)
+        os.makedirs(base_path, exist_ok=True)
+
+        def _save_structured(x: np.ndarray, y: np.ndarray, z: np.ndarray, suffix: str) -> str:
+            grid = pv.StructuredGrid(x, y, z).extract_surface()
+            filename = f"coil_{coil_id:02d}_{suffix}.ply"
+            path = os.path.join(base_path, filename)
+            grid.save(path)
+            return filename
+
+        inner_file = _save_structured(self.X_inner, self.Y_inner, self.Z_inner, "inner")
+        outer_file = _save_structured(self.X_outer, self.Y_outer, self.Z_outer, "outer")
+        cap_start_file = _save_structured(self.X_cap_start, self.Y_cap_start, self.Z_cap_start, "cap_start")
+        cap_end_file = _save_structured(self.X_cap_end, self.Y_cap_end, self.Z_cap_end, "cap_end")
+
+        meta = {
+            "inner": inner_file,
+            "outer": outer_file,
+            "cap_start": cap_start_file,
+            "cap_end": cap_end_file,
+        }
+        meta_path = os.path.join(base_path, f"coil_{coil_id:02d}_meta.json")
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
