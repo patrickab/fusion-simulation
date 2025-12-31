@@ -199,7 +199,7 @@ def render_fusion_plasma(
         plotter=plotter,
         plasma=fusion_plasma,
         show_wireframe=show_wireframe,
-        opacity=0.6,
+        opacity=0.8,
         cmap="plasma",
         name_prefix="plasma",
     )
