@@ -6,9 +6,20 @@ from typing import Optional
 import numpy as np
 import pyvista as pv
 
-from src.lib.geometry_config import FusionPlasma, PlasmaBoundary, RotationalAngles, ToroidalCoil2D, ToroidalCoil3D
+from src.lib.config import Filepaths
+from src.lib.geometry_config import (
+    FusionPlasma,
+    PlasmaBoundary,
+    PlasmaConfig,
+    RotationalAngles,
+    ToroidalCoil2D,
+    ToroidalCoil3D,
+    ToroidalCoilConfig,
+)
 from src.lib.linalg_utils import convert_rz_to_xyz
 from src.lib.utils import _coils_to_polydata, _plasma_to_polydata
+from src.reactor_geometry import calculate_poloidal_boundary, generate_fusion_plasma
+from src.toroidal_geometry import calculate_toroidal_coil_boundary, generate_toroidal_coils_3d
 
 
 def initialize_plotter(shape: tuple[int, int] = (1, 1)) -> pv.Plotter:
@@ -16,6 +27,18 @@ def initialize_plotter(shape: tuple[int, int] = (1, 1)) -> pv.Plotter:
     plotter = pv.Plotter(shape=shape, border=True, border_color="white")
     plotter.set_background("black")
     return plotter
+
+
+def calculate_2d_geometry(
+    plasma_config: PlasmaConfig, toroid_coil_config: ToroidalCoilConfig
+) -> tuple[PlasmaBoundary, ToroidalCoil2D]:
+    """
+    Returns R and Z coordinates for a 2D poloidal plasma boundary shape.
+    Cross-section of a tokamak plasma in the poloidal plane.
+    """
+    plasma_boundary = calculate_poloidal_boundary(plasma_config)
+    toroidal_coil_2d = calculate_toroidal_coil_boundary(plasma_boundary, toroid_coil_config)
+    return plasma_boundary, toroidal_coil_2d
 
 
 def plot_toroidal_coils(
@@ -206,14 +229,8 @@ def render_fusion_plasma(
     if not plotter_was_provided:
         plotter.show(title="Fusion Plasma Surface")
 
+
 def render_all_geometries() -> None:
-    from src.lib.config import Filepaths
-    from src.lib.geometry_config import PlasmaConfig, ToroidalCoilConfig
-    from src.reactor_geometry import (
-        calculate_2d_geometry,
-        generate_fusion_plasma,
-        generate_toroidal_coils_3d,
-    )
     plasma_config = PlasmaConfig(
         R0=6.2,  # Major radius (m)
         a=3.2,  # Minor radius (m)
@@ -251,6 +268,7 @@ def render_all_geometries() -> None:
     fusion_plasma.to_ply_structuregrid(Filepaths.PLASMA_SURFACE)
     for i, coil in enumerate(toroidal_coils_3d, start=1):
         coil.to_ply(base_path=Filepaths.TOROIDAL_COIL_3D_DIR, coil_id=i)
+
 
 if __name__ == "__main__":
     render_all_geometries()
