@@ -8,6 +8,8 @@ from scipy.spatial import Delaunay
 
 from src.lib.config import Filepaths
 
+COIL_RESOLUTION_3D = 64  # Number of points in the toroidal direction for 3D coils
+
 
 class RotationalAngles:
     """
