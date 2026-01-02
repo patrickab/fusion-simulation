@@ -1,6 +1,7 @@
 import jax
 import jax.numpy as jnp
 
+from engine.plasma import calculate_poloidal_boundary
 from src.lib.geometry_config import (
     COIL_RESOLUTION_3D,
     PlasmaConfig,
@@ -8,7 +9,6 @@ from src.lib.geometry_config import (
     ToroidalCoil3D,
     ToroidalCoilConfig,
 )
-from src.reactor_geometry import calculate_poloidal_boundary
 
 
 def get_R_single(plasma_config: PlasmaConfig) -> jnp.ndarray:
