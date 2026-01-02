@@ -10,7 +10,7 @@ from src.lib.geometry_config import (
 )
 
 
-def calculate_poloidal_boundary(plasma_config: PlasmaConfig) -> PlasmaBoundary:
+def calculate_poloidal_boundary(theta: jnp.ndarray, plasma_config: PlasmaConfig) -> PlasmaBoundary:
     """Compute R-Z coordinates for a shaped tokamak plasma boundary.
 
     Args:
@@ -19,8 +19,6 @@ def calculate_poloidal_boundary(plasma_config: PlasmaConfig) -> PlasmaBoundary:
     Returns:
         2D boundary coordinates
     """
-    theta = RotationalAngles.THETA
-
     # Shaping terms for readability
     major_radius = plasma_config.R0
     minor_radius = plasma_config.a
