@@ -34,7 +34,7 @@ def calculate_2d_geometry(
 ) -> tuple[PlasmaBoundary, ToroidalCoil2D]:
     """Compute 2D plasma and coil boundaries."""
     plasma_boundary = calculate_poloidal_boundary(plasma_config)
-    toroidal_coil_2d = calculate_toroidal_coil_boundary(plasma_boundary, toroid_coil_config)
+    toroidal_coil_2d = calculate_toroidal_coil_boundary(plasma_config=plasma_config, toroid_coil_config=toroid_coil_config)
     return plasma_boundary, toroidal_coil_2d
 
 
