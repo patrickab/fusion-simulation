@@ -1,5 +1,6 @@
 from pathlib import Path, PosixPath
 
+import jax
 import numpy as np
 import pyvista as pv
 
@@ -22,7 +23,7 @@ def _coils_to_polydata(
     if coils is None or not coils:
         return []
 
-    first = coils[0]
+    first = jax.tree_util.tree_map(lambda x: x[0], coils)
 
     # Case 1: already list[dict[str, PolyData]]
     if isinstance(first, dict):
@@ -34,18 +35,26 @@ def _coils_to_polydata(
         for coil in coils:
             parts: dict[str, pv.PolyData] = {}
 
-            inner = pv.StructuredGrid(coil.X_inner, coil.Y_inner, coil.Z_inner).extract_surface()
+            x_inner, y_inner, z_inner = np.array(coil.X_inner), np.array(coil.Y_inner), np.array(coil.Z_inner)
+            inner = pv.StructuredGrid(x_inner, y_inner, z_inner).extract_surface()
             parts["inner"] = inner
 
-            outer = pv.StructuredGrid(coil.X_outer, coil.Y_outer, coil.Z_outer).extract_surface()
+            x_outer, y_outer, z_outer = np.array(coil.X_outer), np.array(coil.Y_outer), np.array(coil.Z_outer)
+            outer = pv.StructuredGrid(x_outer, y_outer, z_outer).extract_surface()
             parts["outer"] = outer
 
             if coil.X_cap_start.size > 0:
-                cap_start = pv.StructuredGrid(coil.X_cap_start, coil.Y_cap_start, coil.Z_cap_start).extract_surface()
+                x_cap_start, y_cap_start, z_cap_start = (
+                    np.array(coil.X_cap_start),
+                    np.array(coil.Y_cap_start),
+                    np.array(coil.Z_cap_start),
+                )
+                cap_start = pv.StructuredGrid(x_cap_start, y_cap_start, z_cap_start).extract_surface()
                 parts["cap_start"] = cap_start
 
             if coil.X_cap_end.size > 0:
-                cap_end = pv.StructuredGrid(coil.X_cap_end, coil.Y_cap_end, coil.Z_cap_end).extract_surface()
+                x_cap_end, y_cap_end, z_cap_end = np.array(coil.X_cap_end), np.array(coil.Y_cap_end), np.array(coil.Z_cap_end)
+                cap_end = pv.StructuredGrid(x_cap_end, y_cap_end, z_cap_end).extract_surface()
                 parts["cap_end"] = cap_end
 
             out.append(parts)
