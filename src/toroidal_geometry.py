@@ -1,7 +1,7 @@
 import jax
 import jax.numpy as jnp
 
-from engine.plasma import calculate_poloidal_boundary
+from src.engine.plasma import calculate_poloidal_boundary
 from src.lib.geometry_config import (
     COIL_RESOLUTION_3D,
     PlasmaConfig,

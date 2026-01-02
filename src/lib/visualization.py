@@ -6,7 +6,7 @@ from typing import Optional
 import numpy as np
 import pyvista as pv
 
-from engine.plasma import calculate_poloidal_boundary, generate_fusion_plasma
+from src.engine.plasma import calculate_poloidal_boundary, generate_fusion_plasma
 from src.lib.config import Filepaths
 from src.lib.geometry_config import (
     FusionPlasma,
