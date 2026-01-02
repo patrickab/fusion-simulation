@@ -6,6 +6,7 @@ from typing import Optional
 import numpy as np
 import pyvista as pv
 
+from engine.plasma import calculate_poloidal_boundary, generate_fusion_plasma
 from src.lib.config import Filepaths
 from src.lib.geometry_config import (
     FusionPlasma,
@@ -18,12 +19,11 @@ from src.lib.geometry_config import (
 )
 from src.lib.linalg_utils import convert_rz_to_xyz
 from src.lib.utils import _coils_to_polydata, _plasma_to_polydata
-from src.reactor_geometry import calculate_poloidal_boundary, generate_fusion_plasma
 from src.toroidal_geometry import calculate_toroidal_coil_boundary, generate_toroidal_coils_3d
 
 
 def initialize_plotter(shape: tuple[int, int] = (1, 1)) -> pv.Plotter:
-    """Initialize a PyVista plotter with a black background and trackball style."""
+    """Create PyVista plotter with standard theme."""
     plotter = pv.Plotter(shape=shape, border=True, border_color="white")
     plotter.set_background("black")
     return plotter
@@ -32,10 +32,7 @@ def initialize_plotter(shape: tuple[int, int] = (1, 1)) -> pv.Plotter:
 def calculate_2d_geometry(
     plasma_config: PlasmaConfig, toroid_coil_config: ToroidalCoilConfig
 ) -> tuple[PlasmaBoundary, ToroidalCoil2D]:
-    """
-    Returns R and Z coordinates for a 2D poloidal plasma boundary shape.
-    Cross-section of a tokamak plasma in the poloidal plane.
-    """
+    """Compute 2D plasma and coil boundaries."""
     plasma_boundary = calculate_poloidal_boundary(plasma_config)
     toroidal_coil_2d = calculate_toroidal_coil_boundary(plasma_boundary, toroid_coil_config)
     return plasma_boundary, toroidal_coil_2d
@@ -46,7 +43,13 @@ def plot_toroidal_coils(
     toroidal_coils: list[ToroidalCoil3D] | list[pv.PolyData] | list[Path] | list[dict[str, pv.PolyData]],
     name_prefix: str = "Toroidal Coil",
 ) -> None:
-    """Add toroidal coils (3D objects or loaded meshes) to the plotter."""
+    """Add 3D coil meshes to active plotter.
+
+    Args:
+        plotter: target plotter
+        toroidal_coils: coil data or paths
+        name_prefix: label prefix
+    """
     coil_mesh_sets = _coils_to_polydata(toroidal_coils)
 
     for i, coil_parts in enumerate(coil_mesh_sets, start=1):
@@ -71,7 +74,16 @@ def plot_plasma(
     cmap: str = "plasma",
     name_prefix: str = "plasma",
 ) -> None:
-    """Add a plasma surface (FusionPlasma or PolyData) to the plotter."""
+    """Add plasma surface and optional wireframe to plotter.
+
+    Args:
+        plotter: target plotter
+        plasma: plasma data or path
+        show_wireframe: toggle sparse grid
+        opacity: transparency
+        cmap: colormap
+        name_prefix: label prefix
+    """
 
     def get_sparse_wireframe(plasma_mesh: pv.PolyData, step: int = 8) -> Optional[pv.PolyData]:
         """Generate a sparse wireframe mesh from a structured plasma PolyData."""
@@ -120,8 +132,13 @@ def display_cylindrical_angles(
     radius: float = 10.0,
     color: str = "grey",
 ) -> None:
-    """
-    Adds cylindrical coordinate system lines for theta angles to the plotter.
+    """Add radial reference lines for toroidal angles.
+
+    Args:
+        plotter: target plotter
+        n_angles: number of lines
+        radius: line length
+        color: line color
     """
     angles = np.linspace(0, 2 * np.pi, n_angles, endpoint=False)
     for angle in angles:
@@ -137,7 +154,13 @@ def display_cylindrical_angles(
 
 
 def render_2d_geometry(plotter: pv.Plotter, plasma_boundary: PlasmaBoundary, toroidal_coil_2d: ToroidalCoil2D) -> None:
-    """Display 2D boundaries of plasma and toroidal coil in the plotter."""
+    """Plot 2D cross-section of plasma and coils.
+
+    Args:
+        plotter: target plotter
+        plasma_boundary: 2D plasma
+        toroidal_coil_2d: 2D coil
+    """
     plotter.add_title("2D Poloidal Cross-Section", font_size=16, color="white")
 
     ROTATION_ANGLE = np.deg2rad(90.0)
@@ -181,7 +204,15 @@ def render_fusion_plasma(
     show_wireframe: bool = True,
     plotter: pv.Plotter | None = None,
 ) -> None:
-    """Load and render a fusion plasma surface from a ``.ply`` file."""
+    """Orchestrate 3D rendering of plasma and coils.
+
+    Args:
+        fusion_plasma: plasma data
+        toroidal_coils: coil list
+        show_cylindrical_angles: toggle guides
+        show_wireframe: toggle wireframe
+        plotter: optional existing plotter
+    """
 
     # Early return if no valid plasma data
     if fusion_plasma is None:
@@ -231,6 +262,10 @@ def render_fusion_plasma(
 
 
 def render_all_geometries() -> None:
+    """Execute full simulation pipeline from config to visualization and export.
+
+    Note: Modifies filesystem and opens interactive window.
+    """
     plasma_config = PlasmaConfig(
         R0=6.2,  # Major radius (m)
         a=3.2,  # Minor radius (m)

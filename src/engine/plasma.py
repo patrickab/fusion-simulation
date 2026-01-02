@@ -11,11 +11,14 @@ from src.lib.geometry_config import (
 
 
 def calculate_poloidal_boundary(plasma_config: PlasmaConfig) -> PlasmaBoundary:
-    """
-    Calculate the poloidal plasma boundary in R-Z coordinates.
-    """
+    """Compute R-Z coordinates for a shaped tokamak plasma boundary.
 
-    # Define plasma boundary
+    Args:
+        plasma_config: geometric parameters (R0, a, kappa, delta)
+
+    Returns:
+        2D boundary coordinates
+    """
     theta = RotationalAngles.THETA
 
     # Shaping terms for readability
@@ -35,40 +38,26 @@ def calculate_poloidal_boundary(plasma_config: PlasmaConfig) -> PlasmaBoundary:
 
 
 def generate_fusion_plasma(plasma_boundary: PlasmaBoundary) -> FusionPlasma:
+    """Revolve 2D poloidal cross-section into 3D toroidal volume via rotational symmetry.
+
+    The function maps the (R, Z) boundary across a range of toroidal angles (φ) to create
+    a parametric mesh, then transforms the resulting cylindrical coordinates into
+    Cartesian (X, Y, Z) space.
+
+    Args:
+        plasma_boundary: The 2D R-Z coordinates defining the plasma edge.
+
+    Returns:
+        A FusionPlasma object containing the 3D Cartesian mesh and original boundary.
     """
-    Generates a 3D toroidal surface by rotating a poloidal cross-section around the Z-axis.
-
-    This function creates a tokamak-like surface with elongation (kappa) and triangularity (delta).
-    The process works as follows:
-
-    1. Generate poloidal coordinates
-    2. Create a meshgrid that extends this 2D shape into 3D space:
-       - (1) np.meshgrid(R_2D, phi) creates two 2D arrays:
-         * R_grid: Contains the R coordinates repeated for each toroidal angle
-         * phi_grid: Contains the toroidal angles repeated for each point on the poloidal contour
-       - This effectively creates a parametric surface where each toroidal section (phi=constant)
-         has identical poloidal cross-sections
-    3. Extend Z coordinates by repeating the Z_2D array for each toroidal angle using np.tile
-    4. Transform from cylindrical coordinates (R, φ, Z) to Cartesian coordinates (X, Y, Z):
-       - X = R * cos(φ)
-       - Y = R * sin(φ)
-       - Z remains unchanged
-
-    This transformation maps the toroidal surface into 3D Cartesian space, where each poloidal
-    cross-section is identical but rotated around the Z-axis according to the toroidal angle φ.
-    """
-
-    # Poloidal contour in R-Z
     R_poloidal = plasma_boundary.R_2d
     Z_poloidal = plasma_boundary.Z_2d
 
-    # Toroidal angles for revolution
-    phi = RotationalAngles.PHI
-
     # 2D meshgrid for revolution: each row is a toroidal angle, each column a poloidal point
+    phi = RotationalAngles.PHI
     R_grid, phi_grid = jnp.meshgrid(R_poloidal, phi)
 
-    # Repeat Z along the toroidal direction to match R_grid/phi_grid shape
+    # Repeat Z along the toroidal direction
     Z_grid = jnp.tile(Z_poloidal, (RotationalAngles.n_phi, 1))
 
     # Convert cylindrical (R, φ, Z) → Cartesian (X, Y, Z)
