@@ -6,6 +6,7 @@ import jax.numpy as jnp
 import numpy as np
 import pyvista as pv
 from scipy.spatial import Delaunay
+import numpy as np
 
 from src.lib.config import Filepaths
 
@@ -64,7 +65,7 @@ class FusionPlasma:
 
         Note: Writes to filesystem.
         """
-        grid = pv.StructuredGrid(self.X, self.Y, self.Z).extract_surface()
+        grid = pv.StructuredGrid(np.array(self.X), np.array(self.Y), np.array(self.Z)).extract_surface()
         grid.save(filename)
         print(f"✅ Exported plasma surface to: {os.path.abspath(filename)}")
 
@@ -135,7 +136,7 @@ class ToroidalCoil3D:
         os.makedirs(base_path, exist_ok=True)
 
         def _save_structured(x: jnp.ndarray, y: jnp.ndarray, z: jnp.ndarray, suffix: str) -> str:
-            grid = pv.StructuredGrid(x, y, z).extract_surface()
+            grid = pv.StructuredGrid(np.array(x), np.array(y), np.array(z)).extract_surface()
             filename = f"coil_{coil_id:02d}_{suffix}.ply"
             path = os.path.join(base_path, filename)
             grid.save(path)

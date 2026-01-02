@@ -1,5 +1,6 @@
 from pathlib import Path, PosixPath
 
+import numpy as np
 import pyvista as pv
 
 from src.lib.geometry_config import FusionPlasma, ToroidalCoil3D
@@ -77,7 +78,7 @@ def _plasma_to_polydata(plasma: FusionPlasma | pv.PolyData | Path) -> pv.PolyDat
             raise FileNotFoundError(f"PLY file not found at path: {plasma}") from None
 
     if isinstance(plasma, FusionPlasma):
-        return pv.StructuredGrid(plasma.X, plasma.Y, plasma.Z).extract_surface()
+        return pv.StructuredGrid(np.array(plasma.X), np.array(plasma.Y), np.array(plasma.Z)).extract_surface()
 
     if isinstance(plasma, pv.PolyData):
         return plasma
