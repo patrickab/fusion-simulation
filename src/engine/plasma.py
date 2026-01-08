@@ -1,5 +1,6 @@
 """Module for parametric expression of a tokamak plasma surfaces"""
 
+import jax
 import jax.numpy as jnp
 
 from src.lib.geometry_config import (

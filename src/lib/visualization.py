@@ -43,7 +43,10 @@ def calculate_2d_geometry(
 
 def plot_toroidal_coils(
     plotter: pv.Plotter,
-    toroidal_coils: list[ToroidalCoil3D] | list[pv.PolyData] | list[Path] | list[dict[str, pv.PolyData]],
+    toroidal_coils: list[ToroidalCoil3D]
+    | list[pv.PolyData]
+    | list[Path]
+    | list[dict[str, pv.PolyData]],
     name_prefix: str = "Toroidal Coil",
 ) -> None:
     """Add 3D coil meshes to active plotter.
@@ -156,7 +159,9 @@ def display_cylindrical_angles(
         )
 
 
-def render_2d_geometry(plotter: pv.Plotter, plasma_boundary: PlasmaBoundary, toroidal_coil_2d: ToroidalCoil2D) -> None:
+def render_2d_geometry(
+    plotter: pv.Plotter, plasma_boundary: PlasmaBoundary, toroidal_coil_2d: ToroidalCoil2D
+) -> None:
     """Plot 2D cross-section of plasma and coils.
 
     Args:
@@ -202,7 +207,10 @@ def render_2d_geometry(plotter: pv.Plotter, plasma_boundary: PlasmaBoundary, tor
 
 def render_fusion_plasma(
     fusion_plasma: Path | FusionPlasma | pv.PolyData,
-    toroidal_coils: list[ToroidalCoil3D] | list[pv.PolyData] | list[Path] | list[dict[str, pv.PolyData]],
+    toroidal_coils: list[ToroidalCoil3D]
+    | list[pv.PolyData]
+    | list[Path]
+    | list[dict[str, pv.PolyData]],
     show_cylindrical_angles: bool = True,
     show_wireframe: bool = True,
     plotter: pv.Plotter | None = None,
@@ -283,15 +291,21 @@ def render_all_geometries() -> None:
         n_field_coils=8,  # Number of field coils
     )
 
-    plasma_boundary, toroidal_coil_2d = calculate_2d_geometry(plasma_config=plasma_config, toroid_coil_config=toroid_coil_config)
+    plasma_boundary, toroidal_coil_2d = calculate_2d_geometry(
+        plasma_config=plasma_config, toroid_coil_config=toroid_coil_config
+    )
 
     fusion_plasma = generate_fusion_plasma(plasma_boundary=plasma_boundary)
-    toroidal_coils_3d = generate_toroidal_coils_3d(toroidal_coil_2d=toroidal_coil_2d, toroid_coil_config=toroid_coil_config)
+    toroidal_coils_3d = generate_toroidal_coils_3d(
+        toroidal_coil_2d=toroidal_coil_2d, toroid_coil_config=toroid_coil_config
+    )
 
     plotter = initialize_plotter(shape=(1, 2))
 
     plotter.subplot(0, 0)
-    render_2d_geometry(plotter=plotter, plasma_boundary=plasma_boundary, toroidal_coil_2d=toroidal_coil_2d)
+    render_2d_geometry(
+        plotter=plotter, plasma_boundary=plasma_boundary, toroidal_coil_2d=toroidal_coil_2d
+    )
     plotter.subplot(0, 1)
     render_fusion_plasma(
         plotter=plotter,

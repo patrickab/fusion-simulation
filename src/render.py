@@ -10,7 +10,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Render fusion plasma surface.")
 
     parser.add_argument(
-        "--fusion-plasma-filepath", type=str, help="Path to the fusion plasma data file.", default=Filepaths.PLASMA_SURFACE
+        "--fusion-plasma-filepath",
+        type=str,
+        help="Path to the fusion plasma data file.",
+        default=Filepaths.PLASMA_SURFACE,
     )
     parser.add_argument(
         "--show-angles",
