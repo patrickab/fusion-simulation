@@ -16,7 +16,9 @@ def get_R_single(theta: jnp.ndarray, plasma_config: PlasmaConfig) -> jnp.ndarray
     """
     Return R coordinate for a single theta value.
     """
-    plasma_boundary: PlasmaBoundary = calculate_poloidal_boundary(theta=theta, plasma_config=plasma_config)
+    plasma_boundary: PlasmaBoundary = calculate_poloidal_boundary(
+        theta=theta, plasma_config=plasma_config
+    )
     return plasma_boundary.R_2d
 
 
@@ -24,7 +26,9 @@ def get_Z_single(theta: jnp.ndarray, plasma_config: PlasmaConfig) -> jnp.ndarray
     """
     Return Z coordinate for a single theta value.
     """
-    plasma_boundary: PlasmaBoundary = calculate_poloidal_boundary(theta=theta, plasma_config=plasma_config)
+    plasma_boundary: PlasmaBoundary = calculate_poloidal_boundary(
+        theta=theta, plasma_config=plasma_config
+    )
     return plasma_boundary.Z_2d
 
 
@@ -49,7 +53,9 @@ def calculate_toroidal_coil_boundary(
     N_R, N_Z = N_R_raw / norm_mag, N_Z_raw / norm_mag
 
     # Base plasma boundary
-    plasma_boundary: PlasmaBoundary = calculate_poloidal_boundary(theta=theta, plasma_config=plasma_config)
+    plasma_boundary: PlasmaBoundary = calculate_poloidal_boundary(
+        theta=theta, plasma_config=plasma_config
+    )
     R = plasma_boundary.R_2d
     Z = plasma_boundary.Z_2d
 
@@ -70,7 +76,9 @@ def calculate_toroidal_coil_boundary(
 
 
 @jax.jit
-def _generate_single_coil_jit(phi_center: jnp.ndarray, phi_sweep: jnp.ndarray, toroidal_coil_2d: ToroidalCoil2D) -> ToroidalCoil3D:
+def _generate_single_coil_jit(
+    phi_center: jnp.ndarray, phi_sweep: jnp.ndarray, toroidal_coil_2d: ToroidalCoil2D
+) -> ToroidalCoil3D:
     """JIT-compiled kernel for a single coil geometry calculation."""
     # Shift phi sweep to coil center
     phi_local = phi_sweep + phi_center
@@ -141,4 +149,6 @@ def generate_toroidal_coils_3d(
     phi_sweep = jnp.linspace(-angular_span_rad / 2, angular_span_rad / 2, COIL_RESOLUTION_3D)
 
     # Vectorized over coils using vmap; phi_centers is the batched dimension
-    return jax.vmap(_generate_single_coil_jit, in_axes=(0, None, None))(phi_centers, phi_sweep, toroidal_coil_2d)
+    return jax.vmap(_generate_single_coil_jit, in_axes=(0, None, None))(
+        phi_centers, phi_sweep, toroidal_coil_2d
+    )

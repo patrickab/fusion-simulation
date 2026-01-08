@@ -40,7 +40,7 @@ class ToroidalCoilConfig(BaseModel):
     distance_from_plasma: float  # Plasma Boundary <-> Field Coil Center (m)
     radial_thickness: float  # radial thickness of the coil (m)
     vertical_thickness: float  # vertical thickness of the coil (m)
-    angular_span: float  # angular span of the coil (degrees) - defines the coil's extent in the toroidal direction
+    angular_span: float  # angular span of the coil (degrees) - extent in the toroidal direction
     n_field_coils: int  # of field coils
 
 
@@ -69,7 +69,9 @@ class FusionPlasma(BaseModel):
 
         Note: Writes to filesystem.
         """
-        grid = pv.StructuredGrid(np.array(self.X), np.array(self.Y), np.array(self.Z)).extract_surface()
+        grid = pv.StructuredGrid(
+            np.array(self.X), np.array(self.Y), np.array(self.Z)
+        ).extract_surface()
         grid.save(filename)
         print(f"✅ Exported plasma surface to: {os.path.abspath(filename)}")
 
@@ -89,7 +91,12 @@ class ToroidalCoil2D(BaseModel):
     def express_delaunay_triangles(self) -> Delaunay:
         """Return Delaunay triangulation of R-Z boundary points."""
         # Stack inner and outer boundary points
-        points = np.column_stack((np.concatenate([self.R_inner, self.R_outer]), np.concatenate([self.Z_inner, self.Z_outer])))
+        points = np.column_stack(
+            (
+                np.concatenate([self.R_inner, self.R_outer]),
+                np.concatenate([self.Z_inner, self.Z_outer]),
+            )
+        )
         return Delaunay(points)
 
 
@@ -150,7 +157,9 @@ class ToroidalCoil3D(BaseModel):
 
         inner_file = _save_structured(self.X_inner, self.Y_inner, self.Z_inner, "inner")
         outer_file = _save_structured(self.X_outer, self.Y_outer, self.Z_outer, "outer")
-        cap_start_file = _save_structured(self.X_cap_start, self.Y_cap_start, self.Z_cap_start, "cap_start")
+        cap_start_file = _save_structured(
+            self.X_cap_start, self.Y_cap_start, self.Z_cap_start, "cap_start"
+        )
         cap_end_file = _save_structured(self.X_cap_end, self.Y_cap_end, self.Z_cap_end, "cap_end")
 
         meta = {
