@@ -179,8 +179,8 @@ def render_2d_geometry(
     ]
 
     plasma_points_3d = convert_rz_to_xyz(
-        R=plasma_boundary.R_2d,
-        Z=plasma_boundary.Z_2d,
+        R=plasma_boundary.R,
+        Z=plasma_boundary.Z,
         phi=ROTATION_ANGLE,
     )
 
