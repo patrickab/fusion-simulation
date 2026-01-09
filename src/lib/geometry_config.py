@@ -50,6 +50,9 @@ class PlasmaBoundary(BaseModel):
 
     R_2d: jnp.ndarray  # R coordinates (m)
     Z_2d: jnp.ndarray  # Z coordinates (m)
+    R_center: float  # Magnetic axis R (m)
+    Z_center: float  # Magnetic axis Z (m)
+    phi: float  # Toroidal angle (rad)
 
 
 @dataclass
@@ -59,6 +62,10 @@ class FusionPlasma(BaseModel):
     X: jnp.ndarray  # X coordinates (m)
     Y: jnp.ndarray  # Y coordinates (m)
     Z: jnp.ndarray  # Z coordinates (m)
+    R: jnp.ndarray  # Radial coordinates (m)
+    phi: jnp.ndarray  # Toroidal angles (rad)
+    R_center: float
+    Z_center: float
     Boundary: PlasmaBoundary
 
     def to_ply_structuregrid(self, filename: str = Filepaths.PLASMA_SURFACE) -> None:

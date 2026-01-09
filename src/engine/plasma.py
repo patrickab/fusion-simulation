@@ -11,11 +11,15 @@ from src.lib.geometry_config import (
 )
 
 
-def calculate_poloidal_boundary(theta: jnp.ndarray, plasma_config: PlasmaConfig) -> PlasmaBoundary:
+def calculate_poloidal_boundary(
+    theta: jnp.ndarray, plasma_config: PlasmaConfig, phi: float = 0.0
+) -> PlasmaBoundary:
     """Compute R-Z coordinates for a shaped tokamak plasma boundary.
 
     Args:
+        theta: poloidal angles
         plasma_config: geometric parameters (R0, a, kappa, delta)
+        phi: toroidal angle (rad)
 
     Returns:
         2D boundary coordinates
@@ -33,7 +37,9 @@ def calculate_poloidal_boundary(theta: jnp.ndarray, plasma_config: PlasmaConfig)
     R_plasma = major_radius + minor_radius * jnp.cos(shaped_theta)
     Z_plasma = elongation * minor_radius * jnp.sin(theta)
 
-    return PlasmaBoundary(R_2d=R_plasma, Z_2d=Z_plasma)
+    return PlasmaBoundary(
+        R_2d=R_plasma, Z_2d=Z_plasma, R_center=major_radius, Z_center=0.0, phi=phi
+    )
 
 
 def generate_fusion_plasma(plasma_boundary: PlasmaBoundary) -> FusionPlasma:
@@ -64,4 +70,13 @@ def generate_fusion_plasma(plasma_boundary: PlasmaBoundary) -> FusionPlasma:
     Y = R_grid * jnp.sin(phi_grid)
     Z = Z_grid
 
-    return FusionPlasma(X=X, Y=Y, Z=Z, Boundary=plasma_boundary)
+    return FusionPlasma(
+        X=X,
+        Y=Y,
+        Z=Z,
+        R=R_grid,
+        phi=phi_grid,
+        R_center=plasma_boundary.R_center,
+        Z_center=plasma_boundary.Z_center,
+        Boundary=plasma_boundary,
+    )
