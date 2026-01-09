@@ -19,7 +19,7 @@ def get_R_single(theta: jnp.ndarray, plasma_config: PlasmaConfig) -> jnp.ndarray
     plasma_boundary: PlasmaBoundary = calculate_poloidal_boundary(
         theta=theta, plasma_config=plasma_config
     )
-    return plasma_boundary.R_2d
+    return plasma_boundary.R
 
 
 def get_Z_single(theta: jnp.ndarray, plasma_config: PlasmaConfig) -> jnp.ndarray:
@@ -29,7 +29,7 @@ def get_Z_single(theta: jnp.ndarray, plasma_config: PlasmaConfig) -> jnp.ndarray
     plasma_boundary: PlasmaBoundary = calculate_poloidal_boundary(
         theta=theta, plasma_config=plasma_config
     )
-    return plasma_boundary.Z_2d
+    return plasma_boundary.Z
 
 
 # Create vectorized gradient functions
@@ -56,8 +56,8 @@ def calculate_toroidal_coil_boundary(
     plasma_boundary: PlasmaBoundary = calculate_poloidal_boundary(
         theta=theta, plasma_config=plasma_config
     )
-    R = plasma_boundary.R_2d
-    Z = plasma_boundary.Z_2d
+    R = plasma_boundary.R
+    Z = plasma_boundary.Z
 
     # Offset boundaries
     R_inner = R + toroid_coil_config.distance_from_plasma * N_R

@@ -11,6 +11,25 @@ from src.lib.geometry_config import (
 )
 
 
+def get_poloidal_points(theta: float, plasma_config: PlasmaConfig) -> tuple[float, float]:
+    """
+    Calculates a single (R, Z) point for a given theta.
+    Intentionally not vectorized to perform Nx2 instead of NxN jacobian computations.
+    """
+    # unpack parameters for readability
+    major_radius = plasma_config.R0
+    minor_radius = plasma_config.a
+    triangularity = plasma_config.delta
+    elongation = plasma_config.kappa
+
+    shaped_theta = theta + triangularity * jnp.sin(theta)
+
+    # calculate coordinates
+    R = major_radius + minor_radius * jnp.cos(shaped_theta)
+    Z = elongation * minor_radius * jnp.sin(theta)
+    return R, Z
+
+
 def calculate_poloidal_boundary(
     theta: jnp.ndarray, plasma_config: PlasmaConfig, phi: float = 0.0
 ) -> PlasmaBoundary:
@@ -24,24 +43,19 @@ def calculate_poloidal_boundary(
     Returns:
         2D boundary coordinates
     """
-    # Shaping terms for readability
-    major_radius = plasma_config.R0
-    minor_radius = plasma_config.a
-    triangularity = plasma_config.delta
-    elongation = plasma_config.kappa
-
-    # Triangularity modifies the poloidal angle
-    shaped_theta = theta + triangularity * jnp.sin(theta)
-
-    # Standard tokamak cross-section: shifted circle with shaping
-    R_plasma = major_radius + minor_radius * jnp.cos(shaped_theta)
-    Z_plasma = elongation * minor_radius * jnp.sin(theta)
+    points, grads = jax.vmap(lambda t: jax.value_and_jacfwd(get_poloidal_points)(t, plasma_config))(
+        theta
+    )
+    R, Z = points
+    dR_dtheta, dZ_dtheta = grads
 
     return PlasmaBoundary(
-        R_2d=R_plasma,
-        Z_2d=Z_plasma,
+        R=R,
+        Z=Z,
         theta=theta,
-        R_center=major_radius,
+        dR_dtheta=dR_dtheta,
+        dZ_dtheta=dZ_dtheta,
+        R_center=plasma_config.R0,
         Z_center=0.0,
         phi=phi,
     )
@@ -60,8 +74,8 @@ def generate_fusion_plasma(plasma_boundary: PlasmaBoundary) -> FusionPlasma:
     Returns:
         A FusionPlasma object containing the 3D Cartesian mesh and original boundary.
     """
-    R_poloidal = plasma_boundary.R_2d
-    Z_poloidal = plasma_boundary.Z_2d
+    R_poloidal = plasma_boundary.R
+    Z_poloidal = plasma_boundary.Z
     theta_poloidal = plasma_boundary.theta
 
     # 2D meshgrid for revolution: each row is a toroidal angle, each column a poloidal point

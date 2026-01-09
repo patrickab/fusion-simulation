@@ -48,9 +48,11 @@ class ToroidalCoilConfig(BaseModel):
 class PlasmaBoundary(BaseModel):
     """Store poloidal plasma boundary coordinates in R-Z plane."""
 
-    R_2d: jnp.ndarray  # R coordinates (m)
-    Z_2d: jnp.ndarray  # Z coordinates (m)
+    R: jnp.ndarray  # R coordinates (m)
+    Z: jnp.ndarray  # Z coordinates (m)
     theta: jnp.ndarray  # Poloidal angles (rad)
+    dR_dtheta: jnp.ndarray  # dR/dtheta (m/rad)
+    dZ_dtheta: jnp.ndarray  # dZ/dtheta (m/rad)
     R_center: float  # Magnetic axis R (m)
     Z_center: float  # Magnetic axis Z (m)
     phi: float  # Toroidal angle (rad)
