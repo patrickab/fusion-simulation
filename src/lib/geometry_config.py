@@ -50,6 +50,7 @@ class PlasmaBoundary(BaseModel):
 
     R_2d: jnp.ndarray  # R coordinates (m)
     Z_2d: jnp.ndarray  # Z coordinates (m)
+    theta: jnp.ndarray  # Poloidal angles (rad)
     R_center: float  # Magnetic axis R (m)
     Z_center: float  # Magnetic axis Z (m)
     phi: float  # Toroidal angle (rad)
@@ -64,6 +65,7 @@ class FusionPlasma(BaseModel):
     Z: jnp.ndarray  # Z coordinates (m)
     R: jnp.ndarray  # Radial coordinates (m)
     phi: jnp.ndarray  # Toroidal angles (rad)
+    theta: jnp.ndarray  # Poloidal angles (rad)
     R_center: float
     Z_center: float
     Boundary: PlasmaBoundary

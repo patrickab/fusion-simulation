@@ -38,7 +38,12 @@ def calculate_poloidal_boundary(
     Z_plasma = elongation * minor_radius * jnp.sin(theta)
 
     return PlasmaBoundary(
-        R_2d=R_plasma, Z_2d=Z_plasma, R_center=major_radius, Z_center=0.0, phi=phi
+        R_2d=R_plasma,
+        Z_2d=Z_plasma,
+        theta=theta,
+        R_center=major_radius,
+        Z_center=0.0,
+        phi=phi,
     )
 
 
@@ -57,13 +62,15 @@ def generate_fusion_plasma(plasma_boundary: PlasmaBoundary) -> FusionPlasma:
     """
     R_poloidal = plasma_boundary.R_2d
     Z_poloidal = plasma_boundary.Z_2d
+    theta_poloidal = plasma_boundary.theta
 
     # 2D meshgrid for revolution: each row is a toroidal angle, each column a poloidal point
     phi = RotationalAngles.PHI
     R_grid, phi_grid = jnp.meshgrid(R_poloidal, phi)
 
-    # Repeat Z along the toroidal direction
+    # Repeat Z and theta along the toroidal direction
     Z_grid = jnp.tile(Z_poloidal, (RotationalAngles.n_phi, 1))
+    theta_grid = jnp.tile(theta_poloidal, (RotationalAngles.n_phi, 1))
 
     # Convert cylindrical (R, φ, Z) → Cartesian (X, Y, Z)
     X = R_grid * jnp.cos(phi_grid)
@@ -76,6 +83,7 @@ def generate_fusion_plasma(plasma_boundary: PlasmaBoundary) -> FusionPlasma:
         Z=Z,
         R=R_grid,
         phi=phi_grid,
+        theta=theta_grid,
         R_center=plasma_boundary.R_center,
         Z_center=plasma_boundary.Z_center,
         Boundary=plasma_boundary,
