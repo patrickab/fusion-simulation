@@ -12,52 +12,25 @@ from src.lib.geometry_config import (
 )
 
 
-def get_R_single(theta: jnp.ndarray, plasma_config: PlasmaConfig) -> jnp.ndarray:
-    """
-    Return R coordinate for a single theta value.
-    """
-    plasma_boundary: PlasmaBoundary = calculate_poloidal_boundary(
-        theta=theta, plasma_config=plasma_config
-    )
-    return plasma_boundary.R
-
-
-def get_Z_single(theta: jnp.ndarray, plasma_config: PlasmaConfig) -> jnp.ndarray:
-    """
-    Return Z coordinate for a single theta value.
-    """
-    plasma_boundary: PlasmaBoundary = calculate_poloidal_boundary(
-        theta=theta, plasma_config=plasma_config
-    )
-    return plasma_boundary.Z
-
-
-# Create vectorized gradient functions
-dR_dtheta_v = jax.vmap(jax.grad(get_R_single, 0), in_axes=(0, None))
-dZ_dtheta_v = jax.vmap(jax.grad(get_Z_single, 0), in_axes=(0, None))
-
-
 def calculate_toroidal_coil_boundary(
     theta: jnp.ndarray, plasma_config: PlasmaConfig, toroid_coil_config: ToroidalCoilConfig
 ) -> ToroidalCoil2D:
     """
     Compute toroidal coil 2D cross-section by offsetting plasma boundary along normal vectors.
     """
-    # Compute exact derivatives using automatic differentiation
-    grad_R = dR_dtheta_v(theta, plasma_config)
-    grad_Z = dZ_dtheta_v(theta, plasma_config)
-
-    # Normal vector (90° rotation of tangent) and normalization
-    N_R_raw, N_Z_raw = grad_Z, -grad_R
-    norm_mag = jnp.sqrt(N_R_raw**2 + N_Z_raw**2)
-    N_R, N_Z = N_R_raw / norm_mag, N_Z_raw / norm_mag
-
-    # Base plasma boundary
+    # Base plasma boundary (contains R, Z and their derivatives)
     plasma_boundary: PlasmaBoundary = calculate_poloidal_boundary(
         theta=theta, plasma_config=plasma_config
     )
     R = plasma_boundary.R
     Z = plasma_boundary.Z
+    grad_R = plasma_boundary.dR_dtheta
+    grad_Z = plasma_boundary.dZ_dtheta
+
+    # Normal vector (90° rotation of tangent) and normalization
+    N_R_raw, N_Z_raw = grad_Z, -grad_R
+    norm_mag = jnp.sqrt(N_R_raw**2 + N_Z_raw**2)
+    N_R, N_Z = N_R_raw / norm_mag, N_Z_raw / norm_mag
 
     # Offset boundaries
     R_inner = R + toroid_coil_config.distance_from_plasma * N_R

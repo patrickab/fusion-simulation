@@ -43,11 +43,13 @@ def calculate_poloidal_boundary(
     Returns:
         2D boundary coordinates
     """
-    points, grads = jax.vmap(lambda t: jax.value_and_jacfwd(get_poloidal_points)(t, plasma_config))(
-        theta
+    # Use jax.jvp to compute values and derivatives simultaneously.
+    # Since get_poloidal_points is element-wise, passing a tangent of ones
+    # correctly computes the element-wise gradients for both scalars and arrays.
+    tangent = jnp.ones_like(theta)
+    (R, Z), (dR_dtheta, dZ_dtheta) = jax.jvp(
+        lambda t: get_poloidal_points(t, plasma_config), (theta,), (tangent,)
     )
-    R, Z = points
-    dR_dtheta, dZ_dtheta = grads
 
     return PlasmaBoundary(
         R=R,
