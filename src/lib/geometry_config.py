@@ -13,6 +13,38 @@ COIL_RESOLUTION_3D = 64  # Number of points in the toroidal direction for 3D coi
 
 
 @dataclass
+class CylindricalCoordinates(BaseModel):
+    """Represent coordinates in cylindrical system (R, phi, Z)."""
+
+    R: jnp.ndarray  # Radial coordinate (m)
+    phi: jnp.ndarray  # Azimuthal angle (rad)
+    Z: jnp.ndarray  # Vertical coordinate (m)
+
+    def to_cartesian(self) -> "CartesianCoordinates":
+        """Convert cylindrical coordinates to Cartesian coordinates."""
+        X = self.R * jnp.cos(self.phi)
+        Y = self.R * jnp.sin(self.phi)
+        Z = self.Z
+        return CartesianCoordinates(X=X, Y=Y, Z=Z)
+
+
+@dataclass
+class CartesianCoordinates(BaseModel):
+    """Represent coordinates in Cartesian system (X, Y, Z)."""
+
+    X: jnp.ndarray  # X coordinate (m)
+    Y: jnp.ndarray  # Y coordinate (m)
+    Z: jnp.ndarray  # Z coordinate (m)
+
+    def to_cylindrical(self) -> "CylindricalCoordinates":
+        """Convert Cartesian coordinates to cylindrical coordinates."""
+        R = jnp.sqrt(self.X**2 + self.Y**2)
+        phi = jnp.arctan2(self.Y, self.X)
+        Z = self.Z
+        return CylindricalCoordinates(R=R, phi=phi, Z=Z)
+
+
+@dataclass
 class RotationalAngles(BaseModel):
     """Define toroidal and poloidal rotational angle arrays."""
 
@@ -48,29 +80,56 @@ class ToroidalCoilConfig(BaseModel):
 class PlasmaBoundary(BaseModel):
     """Store poloidal plasma boundary coordinates in R-Z plane."""
 
-    R: jnp.ndarray  # R coordinates (m)
-    Z: jnp.ndarray  # Z coordinates (m)
+    coords: CylindricalCoordinates  # Cylindrical coordinates (R, phi, Z)
     theta: jnp.ndarray  # Poloidal angles (rad)
     dR_dtheta: jnp.ndarray  # dR/dtheta (m/rad)
     dZ_dtheta: jnp.ndarray  # dZ/dtheta (m/rad)
     R_center: float  # Magnetic axis R (m)
     Z_center: float  # Magnetic axis Z (m)
-    phi: float  # Toroidal angle (rad)
+
+    @property
+    def R(self) -> jnp.ndarray:
+        return self.coords.R
+
+    @property
+    def Z(self) -> jnp.ndarray:
+        return self.coords.Z
+
+    @property
+    def phi(self) -> jnp.ndarray:
+        return self.coords.phi
 
 
 @dataclass
 class FusionPlasma(BaseModel):
     """Store 3D coordinates and boundary of the toroidal plasma surface."""
 
-    X: jnp.ndarray  # X coordinates (m)
-    Y: jnp.ndarray  # Y coordinates (m)
-    Z: jnp.ndarray  # Z coordinates (m)
-    R: jnp.ndarray  # Radial coordinates (m)
-    phi: jnp.ndarray  # Toroidal angles (rad)
+    cylindrical_coords: CylindricalCoordinates  # Cylindrical coordinates (R, phi, Z)
+    cartesian_coords: CartesianCoordinates  # Cartesian coordinates (X, Y, Z)
     theta: jnp.ndarray  # Poloidal angles (rad)
     R_center: float
     Z_center: float
     Boundary: PlasmaBoundary
+
+    @property
+    def X(self) -> jnp.ndarray:
+        return self.cartesian_coords.X
+
+    @property
+    def Y(self) -> jnp.ndarray:
+        return self.cartesian_coords.Y
+
+    @property
+    def Z(self) -> jnp.ndarray:
+        return self.cartesian_coords.Z
+
+    @property
+    def R(self) -> jnp.ndarray:
+        return self.cylindrical_coords.R
+
+    @property
+    def phi(self) -> jnp.ndarray:
+        return self.cylindrical_coords.phi
 
     def to_ply_structuregrid(self, filename: str = Filepaths.PLASMA_SURFACE) -> None:
         """Export plasma surface to PLY file.
