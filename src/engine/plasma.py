@@ -8,6 +8,8 @@ from src.lib.geometry_config import (
     PlasmaBoundary,
     PlasmaConfig,
     RotationalAngles,
+    CylindricalCoordinates,
+    CartesianCoordinates,
 )
 
 
@@ -51,15 +53,17 @@ def calculate_poloidal_boundary(
         lambda t: get_poloidal_points(t, plasma_config), (theta,), (tangent,)
     )
 
+    # Create cylindrical coordinates with constant phi
+    phi_array = jnp.full_like(R, phi)
+    coords = CylindricalCoordinates(R=R, phi=phi_array, Z=Z)
+
     return PlasmaBoundary(
-        R=R,
-        Z=Z,
+        coords=coords,
         theta=theta,
         dR_dtheta=dR_dtheta,
         dZ_dtheta=dZ_dtheta,
         R_center=plasma_config.R0,
         Z_center=0.0,
-        phi=phi,
     )
 
 
@@ -88,17 +92,13 @@ def calculate_fusion_plasma(plasma_boundary: PlasmaBoundary) -> FusionPlasma:
     Z_grid = jnp.tile(Z_poloidal, (RotationalAngles.n_phi, 1))
     theta_grid = jnp.tile(theta_poloidal, (RotationalAngles.n_phi, 1))
 
-    # Convert cylindrical (R, φ, Z) → Cartesian (X, Y, Z)
-    X = R_grid * jnp.cos(phi_grid)
-    Y = R_grid * jnp.sin(phi_grid)
-    Z = Z_grid
+    # Create coordinate objects
+    cylindrical_coords = CylindricalCoordinates(R=R_grid, phi=phi_grid, Z=Z_grid)
+    cartesian_coords: CartesianCoordinates = cylindrical_coords.to_cartesian()
 
     return FusionPlasma(
-        X=X,
-        Y=Y,
-        Z=Z,
-        R=R_grid,
-        phi=phi_grid,
+        cartesian_coords=cartesian_coords,
+        cylindrical_coords=cylindrical_coords,
         theta=theta_grid,
         R_center=plasma_boundary.R_center,
         Z_center=plasma_boundary.Z_center,
