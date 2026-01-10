@@ -4,12 +4,12 @@ import jax
 import jax.numpy as jnp
 
 from src.lib.geometry_config import (
+    CartesianCoordinates,
+    CylindricalCoordinates,
     FusionPlasma,
     PlasmaBoundary,
     PlasmaConfig,
     RotationalAngles,
-    CylindricalCoordinates,
-    CartesianCoordinates,
 )
 
 
@@ -104,3 +104,64 @@ def calculate_fusion_plasma(plasma_boundary: PlasmaBoundary) -> FusionPlasma:
         Z_center=plasma_boundary.Z_center,
         Boundary=plasma_boundary,
     )
+
+
+def is_point_in_plasma(
+    coords_test: CylindricalCoordinates | CartesianCoordinates,
+    plasma: PlasmaBoundary | FusionPlasma,
+) -> jnp.ndarray:
+    """
+    Determine whether a point (or array of points) lies inside the plasma volume.
+
+    The algorithm exploits the toroidal symmetry of the Tokamak:
+        1. Project 3D coordinates onto the 2D Poloidal plane (R, Z).
+        2. Transform (R, Z) into local polar coordinates (r, theta) relative to the magnetic axis.
+        3. Interpolate the boundary radius at angle theta.
+        4. Compare test radius vs boundary radius.
+
+    Complexity: O(log N) per point due to binary search interpolation.
+
+    Args:
+        coords_test: Spatial coordinates of test points.
+                     Accepts Cartesian (X, Y, Z) or Cylindrical (R, φ, Z).
+        plasma: The plasma definition.
+                Accepts 2D PlasmaBoundary or 3D FusionPlasma.
+
+    Returns
+    -------
+    is_inside : jnp.ndarray (bool)
+        Boolean mask. True if the point lies strictly inside the boundary.
+    """
+    # 1. Resolve Plasma Source
+    # If a full 3D plasma is passed, extract the 2D boundary definition
+    boundary = plasma.Boundary if isinstance(plasma, FusionPlasma) else plasma
+
+    # 2. Normalize to 2D Poloidal Coordinates (R, Z)
+    # If Cartesian, project R = sqrt(X^2 + Y^2). If Cylindrical, use R directly.
+    if isinstance(coords_test, CartesianCoordinates):
+        R_test = jnp.sqrt(coords_test.X**2 + coords_test.Y**2)
+        Z_test = coords_test.Z
+    else:
+        R_test = coords_test.R
+        Z_test = coords_test.Z
+
+    # 3. Transform to Local Polar Coordinates (relative to Magnetic Axis)
+    # We shift the origin from the machine center (0,0) to the plasma center (R0, Z0)
+    dR = R_test - boundary.R_center
+    dZ = Z_test - boundary.Z_center
+
+    r_test = jnp.sqrt(dR**2 + dZ**2)
+    alpha_test = jnp.arctan2(dZ, dR)
+
+    # 4. Interpolate Boundary Radius
+    # We find the radius of the boundary at the exact angle of the test point.
+    # period=2pi ensures correct wrapping for angles near -pi/pi.
+    r_boundary = jnp.interp(
+        alpha_test,
+        boundary.alpha_geom,
+        boundary.r_geom,
+        period=2 * jnp.pi,
+    )
+
+    # 5. Check Containment
+    return r_test < r_boundary
