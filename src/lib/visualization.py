@@ -159,7 +159,7 @@ def display_cylindrical_angles(
         )
 
 
-def render_2d_geometry(
+def render_plasma_boundary(
     plotter: pv.Plotter, plasma_boundary: PlasmaBoundary, toroidal_coil_2d: ToroidalCoil2D
 ) -> None:
     """Plot 2D cross-section of plasma and coils.
@@ -303,7 +303,7 @@ def render_all_geometries() -> None:
     plotter = initialize_plotter(shape=(1, 2))
 
     plotter.subplot(0, 0)
-    render_2d_geometry(
+    render_plasma_boundary(
         plotter=plotter, plasma_boundary=plasma_boundary, toroidal_coil_2d=toroidal_coil_2d
     )
     plotter.subplot(0, 1)
