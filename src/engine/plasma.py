@@ -63,7 +63,7 @@ def calculate_poloidal_boundary(
     )
 
 
-def generate_fusion_plasma(plasma_boundary: PlasmaBoundary) -> FusionPlasma:
+def calculate_fusion_plasma(plasma_boundary: PlasmaBoundary) -> FusionPlasma:
     """Revolve 2D poloidal cross-section into 3D toroidal volume via rotational symmetry.
 
     The function maps the (R, Z) boundary across a range of toroidal angles (φ) to create
