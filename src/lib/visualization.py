@@ -6,7 +6,7 @@ from typing import Optional
 import numpy as np
 import pyvista as pv
 
-from src.engine.plasma import calculate_poloidal_boundary, generate_fusion_plasma
+from src.engine.plasma import calculate_fusion_plasma, calculate_poloidal_boundary
 from src.lib.config import Filepaths
 from src.lib.geometry_config import (
     FusionPlasma,
@@ -295,7 +295,7 @@ def render_all_geometries() -> None:
         plasma_config=plasma_config, toroid_coil_config=toroid_coil_config
     )
 
-    fusion_plasma = generate_fusion_plasma(plasma_boundary=plasma_boundary)
+    fusion_plasma = calculate_fusion_plasma(plasma_boundary=plasma_boundary)
     toroidal_coils_3d = generate_toroidal_coils_3d(
         toroidal_coil_2d=toroidal_coil_2d, toroid_coil_config=toroid_coil_config
     )
