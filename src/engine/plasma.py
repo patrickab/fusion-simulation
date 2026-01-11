@@ -8,12 +8,12 @@ from src.lib.geometry_config import (
     CylindricalCoordinates,
     FusionPlasma,
     PlasmaBoundary,
-    PlasmaConfig,
+    PlasmaGeometry,
     RotationalAngles,
 )
 
 
-def get_poloidal_points(theta: float, plasma_config: PlasmaConfig) -> tuple[float, float]:
+def get_poloidal_points(theta: float, plasma_config: PlasmaGeometry) -> tuple[float, float]:
     """
     Calculates a single (R, Z) point for a given theta.
     Intentionally not vectorized to perform Nx2 instead of NxN jacobian computations.
@@ -33,7 +33,7 @@ def get_poloidal_points(theta: float, plasma_config: PlasmaConfig) -> tuple[floa
 
 
 def calculate_poloidal_boundary(
-    theta: jnp.ndarray, plasma_config: PlasmaConfig, phi: float = 0.0
+    theta: jnp.ndarray, plasma_config: PlasmaGeometry, phi: float = 0.0
 ) -> PlasmaBoundary:
     """Compute R-Z coordinates for a shaped tokamak plasma boundary.
 

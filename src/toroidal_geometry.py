@@ -5,7 +5,7 @@ from src.engine.plasma import calculate_poloidal_boundary
 from src.lib.geometry_config import (
     COIL_RESOLUTION_3D,
     PlasmaBoundary,
-    PlasmaConfig,
+    PlasmaGeometry,
     ToroidalCoil2D,
     ToroidalCoil3D,
     ToroidalCoilConfig,
@@ -13,7 +13,7 @@ from src.lib.geometry_config import (
 
 
 def calculate_toroidal_coil_boundary(
-    theta: jnp.ndarray, plasma_config: PlasmaConfig, toroid_coil_config: ToroidalCoilConfig
+    theta: jnp.ndarray, plasma_config: PlasmaGeometry, toroid_coil_config: ToroidalCoilConfig
 ) -> ToroidalCoil2D:
     """
     Compute toroidal coil 2D cross-section by offsetting plasma boundary along normal vectors.
