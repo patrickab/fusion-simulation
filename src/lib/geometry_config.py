@@ -56,7 +56,7 @@ class RotationalAngles(BaseModel):
 
 
 @dataclass
-class PlasmaConfig(BaseModel):
+class PlasmaGeometry(BaseModel):
     """Define geometric parameters for the plasma torus shape."""
 
     R0: float  # Major radius of the torus (m)

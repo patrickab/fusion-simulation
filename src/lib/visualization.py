@@ -11,7 +11,7 @@ from src.lib.config import Filepaths
 from src.lib.geometry_config import (
     FusionPlasma,
     PlasmaBoundary,
-    PlasmaConfig,
+    PlasmaGeometry,
     RotationalAngles,
     ToroidalCoil2D,
     ToroidalCoil3D,
@@ -30,7 +30,7 @@ def initialize_plotter(shape: tuple[int, int] = (1, 1)) -> pv.Plotter:
 
 
 def calculate_2d_geometry(
-    plasma_config: PlasmaConfig, toroid_coil_config: ToroidalCoilConfig
+    plasma_config: PlasmaGeometry, toroid_coil_config: ToroidalCoilConfig
 ) -> tuple[PlasmaBoundary, ToroidalCoil2D]:
     """Compute 2D plasma and coil boundaries."""
     theta = RotationalAngles.THETA
@@ -277,7 +277,7 @@ def render_all_geometries() -> None:
 
     Note: Modifies filesystem and opens interactive window.
     """
-    plasma_config = PlasmaConfig(
+    plasma_config = PlasmaGeometry(
         R0=6.2,  # Major radius (m)
         a=3.2,  # Minor radius (m)
         kappa=1.7,  # Elongation factor
