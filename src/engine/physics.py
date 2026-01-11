@@ -53,7 +53,6 @@ def pressure_profile(
     Args:
         psi: Poloidal flux ψ(R, Z).
         psi_axis: Flux at the magnetic axis.
-        psi_edge: Flux at the plasma boundary.
         p0: Pressure at the magnetic axis.
         alpha: Profile shape parameter.
 
@@ -75,20 +74,19 @@ def shafranov_operator(psi_fn: callable, params: jnp.ndarray, R: float, Z: float
     Returns:
         Δ*ψ as a scalar.
     """
-
-    def psi_and_grad(inputs: jnp.ndarray):  # noqa
-        R_val, Z_val = inputs
-        psi, grad_fn = jax.value_and_grad(lambda x: psi_fn(params, x[0], x[1]))((R_val, Z_val))
-        return psi, grad_fn
-
     R_stable = R + 1e-8
 
-    # Gradient
-    _, (dpsi_dR, _) = psi_and_grad((R_stable, Z))
+    # Define gradient function w.r.t (R, Z)
+    def grad_psi(r, z):  # noqa
+        return jax.grad(psi_fn, argnums=(1, 2))(params, r, z)
 
-    # Hessians
-    hessian_fn = jax.jacfwd(lambda x: psi_and_grad(x)[1])
-    (d2psi_dR2, _), (_, d2psi_dZ2) = hessian_fn((R_stable, Z))
+    # Use JVP to compute gradients and diagonal Hessian terms efficiently
+    # JVP 1: R-direction (1, 0) -> Gets (dpsi_dR, dpsi_dZ) and (d2psi_dR2, d2psi_dZdR)
+    (dpsi_dR, _), (d2psi_dR2, _) = jax.jvp(grad_psi, (R_stable, Z), (1.0, 0.0))
+
+    # JVP 2: Z-direction (0, 1) -> Gets (dpsi_dR, dpsi_dZ) and (d2psi_dRdZ, d2psi_dZ2)
+    # We only need the second component of the tangent (d2psi_dZ2)
+    _, (_, d2psi_dZ2) = jax.jvp(grad_psi, (R_stable, Z), (0.0, 1.0))
 
     return d2psi_dR2 - (1.0 / R_stable) * dpsi_dR + d2psi_dZ2
 
@@ -138,14 +136,15 @@ def grad_shafranov_residual(
     def p_fn(p: jnp.ndarray) -> jnp.ndarray:
         return pressure_profile(p, psi_axis, p0, pressure_alpha)
 
-    dp_dpsi = jax.grad(p_fn)(psi)
+    # Use JVP for scalar derivative (forward mode)
+    _, dp_dpsi = jax.jvp(p_fn, (psi,), (1.0,))
 
     # Toroidal field term: F(ψ)F'(ψ)
     def f_fn(f: jnp.ndarray) -> jnp.ndarray:
         return toroidal_field_flux_function(f, psi_axis, F_axis, field_exponent)
 
-    F_val = f_fn(psi)
-    dF_dpsi = jax.grad(f_fn)(psi)
+    # Use JVP to get both value and gradient in one pass
+    F_val, dF_dpsi = jax.jvp(f_fn, (psi,), (1.0,))
 
     # 4. Assemble Equation
     # GS Eq: Δ*ψ = -μ₀ R² p' - F F'
