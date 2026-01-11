@@ -48,8 +48,8 @@ class CartesianCoordinates(BaseModel):
 class RotationalAngles(BaseModel):
     """Define toroidal and poloidal rotational angle arrays."""
 
-    n_phi = 360  # Number of points in toroidal direction
-    n_theta = 360  # Number of points in poloidal direction
+    n_phi = 256  # Number of points in toroidal direction
+    n_theta = 256  # Number of points in poloidal direction
 
     PHI = jnp.linspace(0, 2 * jnp.pi, n_phi)  # Azimuthal angle in radians
     THETA = jnp.linspace(0, 2 * jnp.pi, n_theta)  # Polar angle in radians
@@ -63,6 +63,16 @@ class PlasmaGeometry(BaseModel):
     a: float  # Minor radius of the torus (m)
     kappa: float  # Elongation factor
     delta: float  # Triangularity factor
+
+
+@dataclass
+class PlasmaState(BaseModel):
+    """Define physical state parameters for the plasma."""
+
+    p0: float  # Central pressure [Pa]
+    F_axis: float  # Toroidal field function at axis [T·m]
+    pressure_alpha: float = 1.0  # Pressure profile shape
+    field_exponent: float = 1.0  # Current profile shape
 
 
 @dataclass
