@@ -7,7 +7,7 @@ from src.lib.geometry_config import PlasmaConfig
 
 MU_0 = 4 * jnp.pi * 1e-7
 PSI_EDGE = 0.0  # Poloidal flux at plasma boundary
-WEIGHT_BOUNDARY_CONDITION = 100.0
+WEIGHT_BOUNDARY_CONDITION = 10.0
 
 
 def toroidal_field_flux_function(
