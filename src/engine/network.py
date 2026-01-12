@@ -23,7 +23,7 @@ class HyperParams:
     input_dim: int = 10  # 2 (RZ) + 8 (Params)
     output_dim: int = 1
     hidden_dims: tuple[int, ...] = (512, 256, 128)
-    learning_rate_max: float = 1e-3
+    learning_rate_max: float = 5e-4
     learning_rate_min: float = 1e-5
     batch_size: int = 32
     n_rz_samples: int = 1024
