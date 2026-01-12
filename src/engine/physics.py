@@ -37,7 +37,9 @@ def toroidal_field_flux_function(
         Calculated F(ψ) values.
     """
     # Ensure numerical stability with 1e-8 and clip normalized flux
-    psi_norm = (psi - psi_axis) / (PSI_EDGE - psi_axis - 1e-8)
+    flux_depth = PSI_EDGE - psi_axis
+    flux_depth = jnp.where(flux_depth < 1e-4, 1e-4, flux_depth)
+    psi_norm = (psi - psi_axis) / flux_depth
     base = jnp.maximum(0.0, jnp.minimum(1.0, psi_norm))
     return F_axis * (1.0 - (base + 1e-8) ** exponent)
 
@@ -62,7 +64,9 @@ def pressure_profile(
         Calculated pressure p(ψ).
     """
     # Ensure numerical stability with 1e-8 and clip normalized pressure
-    psi_norm = (psi - psi_axis) / (PSI_EDGE - psi_axis - 1e-8)
+    flux_depth = PSI_EDGE - psi_axis
+    flux_depth = jnp.where(flux_depth < 1e-4, 1e-4, flux_depth)
+    psi_norm = (psi - psi_axis) / flux_depth
     base = jnp.maximum(0.0, jnp.minimum(1.0, psi_norm))
     return p0 * (1.0 - (base + 1e-8) ** alpha)
 
