@@ -145,7 +145,7 @@ def grad_shafranov_residual(
     )
 
     rhs = -(MU_0 * R**2 * dp_dpsi) - (F_val * dF_dpsi)
-    return delta_star - rhs
+    return (delta_star - rhs) / (p0 + 1e-6)
 
 
 @partial(jax.jit, static_argnums=(0,))
