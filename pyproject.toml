@@ -13,6 +13,7 @@ dependencies = [
   "ruff>=0.12.7",
   "scipy>=1.16.1",
   "scipy-stubs>=1.16.1.0",
+  "jax[cuda12]",
 ]
 
 [build-system]

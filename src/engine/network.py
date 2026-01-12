@@ -22,16 +22,17 @@ class HyperParams:
 
     input_dim: int = 10  # 2 (RZ) + 8 (Params)
     output_dim: int = 1
-    hidden_dims: tuple[int, ...] = (512, 256, 128)
+    hidden_dims: tuple[int, ...] = (256, 256, 256)
     learning_rate_max: float = 5e-4
-    learning_rate_min: float = 1e-5
+    learning_rate_min: float = 5e-7
     batch_size: int = 32
-    n_rz_samples: int = 1024
-    n_train: int = 128
+    n_rz_inner_samples: int = 1792
+    n_rz_boundary_samples: int = 256
+    n_train: int = 512
     n_test: int = 32
     n_val: int = 64
-    warmup_steps: int = 500
-    decay_steps: int = 10000
+    warmup_steps: int = 200
+    decay_steps: int = 1000
 
 
 @struct.dataclass
@@ -222,7 +223,7 @@ class PINNTrainer:
     def _init_state(self) -> train_state.TrainState:
         """Initialize the training state with dummy data."""
         key = jax.random.PRNGKey(BASE_SEED)
-        d_rz = jnp.ones((1, self.config.n_rz_samples))
+        d_rz = jnp.ones((1, self.config.n_rz_inner_samples))
         d_p = jnp.ones(1)
 
         geom = PlasmaGeometry(R0=d_p, a=d_p, kappa=d_p, delta=d_p)
@@ -271,20 +272,22 @@ class PINNTrainer:
         loss, grads = jax.value_and_grad(loss_fn)(state.params)
         return state.apply_gradients(grads=grads), loss
 
-    def train(self, epochs: int) -> None:
+    def train(self) -> None:
         """Train the model for specified number of epochs."""
+        epochs = self.config.decay_steps + self.config.warmup_steps
         print(f"Starting training for {epochs} epochs...")
-
         for epoch in range(epochs):
             for i in range(0, len(self.train_set), self.config.batch_size):
                 train_batch = self.train_set[i : i + self.config.batch_size]
                 # Sample RZ points for each plasma configuration in the batch
                 inputs = self.sampler.sample_flux_input(
-                    seed=epoch + i, n_samples=self.config.n_rz_samples, plasma_configs=train_batch
+                    seed=epoch + i,
+                    n_samples=self.config.n_rz_inner_samples,
+                    plasma_configs=train_batch,
                 )
                 self.state, loss = self.train_step(state=self.state, inputs=inputs)
 
-            if epoch % 2 == 0:
+            if epoch % 10 == 0:
                 print(f"Epoch {epoch}: Loss = {loss:.6f}")
 
     def predict(self, inputs: FluxInput) -> jnp.ndarray:
@@ -293,3 +296,9 @@ class PINNTrainer:
         r_n, z_n = inputs.normalize_coords(inputs.R_sample, inputs.Z_sample)
         psi_norm = self.model.apply(self.state.params, r=r_n, z=z_n, **norm_params)
         return psi_norm * inputs.get_physical_scale()
+
+
+if __name__ == "__main__":
+    config = HyperParams()
+    trainer = PINNTrainer(config)
+    trainer.train()
