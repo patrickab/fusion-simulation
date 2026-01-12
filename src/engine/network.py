@@ -1,3 +1,5 @@
+from typing import Any, Callable, Dict, Tuple
+
 from flax import linen as nn
 from flax import struct
 from flax.training import train_state
@@ -6,8 +8,10 @@ import jax.numpy as jnp
 import optax
 from scipy.stats import qmc
 
-from engine.plasma import get_poloidal_points
+from src.engine.physics import pinn_loss_function
+from src.engine.plasma import calculate_poloidal_boundary, get_poloidal_points
 from src.lib.geometry_config import (
+    PlasmaConfig,
     PlasmaGeometry,
     PlasmaState,
 )
@@ -20,14 +24,14 @@ class HyperParams:
 
     input_dim: int = 10  # 2 (RZ) + 8 (Params)
     output_dim: int = 1
-    hidden_dims: tuple[int, ...] = (256, 256, 128)
+    hidden_dims: tuple[int, ...] = (512, 256, 128)
     learning_rate_max: float = 1e-3
     learning_rate_min: float = 1e-5
-    batch_size: int = 64
-    n_rz_samples: int = 2048
-    n_train: int = 256
-    n_test: int = 64
-    n_val: int = 128
+    batch_size: int = 32
+    n_rz_samples: int = 1024
+    n_train: int = 128
+    n_test: int = 32
+    n_val: int = 64
     warmup_steps: int = 500
     decay_steps: int = 10000
 
@@ -46,9 +50,24 @@ class DomainBounds:
     exponent: tuple[float, float] = (0.5, 3.0)  # Current profile shape
 
 
-def min_max_scale(val: jnp.ndarray, bounds: tuple[float, float]) -> jnp.ndarray:
+def min_max_scale(val: jnp.ndarray, bounds: Tuple[float, float]) -> jnp.ndarray:
+    """Normalize value to [-1, 1] range based on bounds."""
     min_v, max_v = bounds
     return 2.0 * (val - min_v) / (max_v - min_v) - 1.0
+
+
+def normalize_plasma_config(config: PlasmaConfig) -> Dict[str, jnp.ndarray]:
+    """Normalize plasma parameters for network input."""
+    return {
+        "r0": min_max_scale(config.Geometry.R0, DomainBounds.R0),
+        "a": min_max_scale(config.Geometry.a, DomainBounds.a),
+        "kappa": min_max_scale(config.Geometry.kappa, DomainBounds.kappa),
+        "delta": min_max_scale(config.Geometry.delta, DomainBounds.delta),
+        "p0": min_max_scale(config.State.p0, DomainBounds.p0),
+        "f_axis": min_max_scale(config.State.F_axis, DomainBounds.F_axis),
+        "alpha": min_max_scale(config.State.pressure_alpha, DomainBounds.alpha),
+        "exponent": min_max_scale(config.State.field_exponent, DomainBounds.exponent),
+    }
 
 
 # --- B. Physics Containers (JAX Pytrees) ---
@@ -56,48 +75,24 @@ def min_max_scale(val: jnp.ndarray, bounds: tuple[float, float]) -> jnp.ndarray:
 class FluxInput:
     """Batch-first Pytree container for physics inputs."""
 
-    R: jnp.ndarray  # Shape (B, N) or (N,)
-    Z: jnp.ndarray  # Shape (B, N) or (N,)
-    geometry: PlasmaGeometry
-    state: PlasmaState
+    R_sample: jnp.ndarray  # Shape (B, N)
+    Z_sample: jnp.ndarray  # Shape (B, N)
+    config: PlasmaConfig
 
-    def normalize(self) -> dict[str, jnp.ndarray]:
-        """
-        Dual-Space Normalization
-        Physics preserving transformation using min-max scaling.
-        Returns a dictionary for **kwargs unpacking into FluxPINN.
-        """
-        R = jnp.atleast_2d(self.R)
-        Z = jnp.atleast_2d(self.Z)
+    def get_norm_params(self) -> Dict[str, jnp.ndarray]:
+        """Normalize plasma parameters for network input."""
+        normed = normalize_plasma_config(self.config)
+        return {k: jnp.atleast_1d(v)[:, jnp.newaxis] for k, v in normed.items()}
 
-        def norm_param(val: jnp.ndarray, bounds: tuple[float, float]) -> jnp.ndarray:
-            v = jnp.atleast_1d(val)
-            v_norm = min_max_scale(v, bounds)
-            return v_norm[:, jnp.newaxis]
-
-        # Use geometry parameters for coordinate normalization (Physics scale)
-        R0_phys = jnp.atleast_1d(self.geometry.R0)[:, jnp.newaxis]
-        a_phys = jnp.atleast_1d(self.geometry.a)[:, jnp.newaxis]
-
-        r_norm = (R - R0_phys) / a_phys
-        z_norm = Z / a_phys
-
-        return {
-            "r": r_norm,
-            "z": z_norm,
-            "r0": norm_param(self.geometry.R0, DomainBounds.R0),
-            "a": norm_param(self.geometry.a, DomainBounds.a),
-            "kappa": norm_param(self.geometry.kappa, DomainBounds.kappa),
-            "delta": norm_param(self.geometry.delta, DomainBounds.delta),
-            "p0": norm_param(self.state.p0, DomainBounds.p0),
-            "f_axis": norm_param(self.state.F_axis, DomainBounds.F_axis),
-            "alpha": norm_param(self.state.pressure_alpha, DomainBounds.alpha),
-            "exponent": norm_param(self.state.field_exponent, DomainBounds.exponent),
-        }
+    def normalize_coords(self, R: jnp.ndarray, Z: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Map physical (R, Z) coordinates to normalized (r, z) space."""
+        R0_phys = jnp.atleast_1d(self.config.Geometry.R0)[:, jnp.newaxis]
+        a_phys = jnp.atleast_1d(self.config.Geometry.a)[:, jnp.newaxis]
+        return (R - R0_phys) / a_phys, Z / a_phys
 
     def get_physical_scale(self) -> jnp.ndarray:
         """Denormalization factor to map network outputs to physical psi units."""
-        return (jnp.atleast_1d(self.state.F_axis) * jnp.atleast_1d(self.geometry.a))[
+        return (jnp.atleast_1d(self.config.State.F_axis) * jnp.atleast_1d(self.config.Geometry.a))[
             :, jnp.newaxis, jnp.newaxis
         ]
 
@@ -141,7 +136,8 @@ class Sampler:
     def __init__(self, config: HyperParams) -> None:
         self.config = config
 
-    def _build_domain_bounds(self) -> tuple[jnp.ndarray, jnp.ndarray]:
+    def _build_domain_bounds(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        """Create lower and upper bounds arrays for parameter sampling."""
         bound_names = ("R0", "a", "kappa", "delta", "p0", "F_axis", "alpha", "exponent")
         l_bounds = jnp.array([getattr(DomainBounds, name)[0] for name in bound_names])
         u_bounds = jnp.array([getattr(DomainBounds, name)[1] for name in bound_names])
@@ -154,6 +150,7 @@ class Sampler:
         lower_bounds: jnp.ndarray,
         upper_bounds: jnp.ndarray,
     ) -> jnp.ndarray:
+        """Generate Sobol sequence samples within specified bounds."""
         sampler = qmc.Sobol(d=len(lower_bounds), scramble=True, seed=seed)
         sample_unit = jnp.array(sampler.random(n_samples))
         return sample_unit * (upper_bounds - lower_bounds) + lower_bounds
@@ -164,49 +161,46 @@ class Sampler:
         n_samples: int,
         plasma_configs: jnp.ndarray,
     ) -> FluxInput:
-        """
-        Interface for sampling points specifically on the boundary of the plasma.
-        Requirements:
-        1. Sample 'theta' via Sobol in [0, 2pi].
-        2. Use 'plasma_boundary' logic to convert (theta, params) -> (R_wall, Z_wall).
-        """
-        # Sample theta and rho (scaling factor) via Sobol
+        """Sample interior and boundary points for a batch of plasma configurations."""
         sampler = qmc.Sobol(d=2, scramble=True, seed=seed)
         samples = jnp.array(sampler.random(n_samples))
-        theta = samples[:, 0] * 2 * jnp.pi
-        rho = samples[:, 1]
+        theta_int = samples[:, 0] * 2 * jnp.pi
+        rho_int = samples[:, 1]
 
-        # Extract parameters for batch calculation
-        R0 = plasma_configs[:, 0]
-        a = plasma_configs[:, 1]
-        kappa = plasma_configs[:, 2]
-        delta = plasma_configs[:, 3]
+        # Use linear spacing for boundary to ensure smooth contour
+        theta_b = jnp.linspace(0, 2 * jnp.pi, n_samples)
 
-        # Calculate R, Z coordinates inside the boundary using vmap
-        def compute_interior(
-            r0_val: jnp.ndarray,
-            a_val: jnp.ndarray,
-            k_val: jnp.ndarray,
-            d_val: jnp.ndarray,
-        ) -> tuple[jnp.ndarray, jnp.ndarray]:
-            geom = PlasmaGeometry(R0=r0_val, a=a_val, kappa=k_val, delta=d_val)
-            # vmap over both theta and rho to get interior points
-            r_pts, z_pts = jax.vmap(lambda t, s: get_poloidal_points(t, geom, s))(theta, rho)
-            return r_pts, z_pts
+        def compute_single_config(
+            plasma_config: jnp.ndarray,
+        ) -> tuple[PlasmaConfig, jnp.ndarray, jnp.ndarray]:
+            geom = PlasmaGeometry(
+                R0=plasma_config[0],
+                a=plasma_config[1],
+                kappa=plasma_config[2],
+                delta=plasma_config[3],
+            )
+            state = PlasmaState(
+                p0=plasma_config[4],
+                F_axis=plasma_config[5],
+                pressure_alpha=plasma_config[6],
+                field_exponent=plasma_config[7],
+            )
+            boundary = calculate_poloidal_boundary(theta_b, geom)
 
-        R, Z = jax.vmap(compute_interior)(R0, a, kappa, delta)
+            # Interior points
+            r_interior, z_interior = jax.vmap(lambda t, r: get_poloidal_points(t, geom, r))(
+                theta_int, rho_int
+            )
 
-        return FluxInput(
-            R=R,
-            Z=Z,
-            geometry=PlasmaGeometry(R0=R0, a=a, kappa=kappa, delta=delta),
-            state=PlasmaState(
-                p0=plasma_configs[:, 4],
-                F_axis=plasma_configs[:, 5],
-                pressure_alpha=plasma_configs[:, 6],
-                field_exponent=plasma_configs[:, 7],
-            ),
-        )
+            return (
+                PlasmaConfig(Geometry=geom, Boundary=boundary, State=state),
+                r_interior,
+                z_interior,
+            )
+
+        configs, R_int, Z_int = jax.vmap(compute_single_config)(plasma_configs)
+
+        return FluxInput(R_sample=R_int, Z_sample=Z_int, config=configs)
 
 
 # --- E. The Trainer ---
@@ -226,17 +220,21 @@ class PINNTrainer:
         )
 
     def _init_state(self) -> train_state.TrainState:
+        """Initialize the training state with dummy data."""
         key = jax.random.PRNGKey(BASE_SEED)
         d_rz = jnp.ones((1, self.config.n_rz_samples))
         d_p = jnp.ones(1)
 
-        dummy_input = FluxInput(
-            R=d_rz,
-            Z=d_rz,
-            geometry=PlasmaGeometry(R0=d_p, a=d_p, kappa=d_p, delta=d_p),
-            state=PlasmaState(p0=d_p, F_axis=d_p, pressure_alpha=d_p, field_exponent=d_p),
-        )
-        params = self.model.init(key, **dummy_input.normalize())
+        geom = PlasmaGeometry(R0=d_p, a=d_p, kappa=d_p, delta=d_p)
+        state = PlasmaState(p0=d_p, F_axis=d_p, pressure_alpha=d_p, field_exponent=d_p)
+        boundary = calculate_poloidal_boundary(jnp.zeros(1), geom)
+
+        dummy_config = PlasmaConfig(Geometry=geom, Boundary=boundary, State=state)
+        dummy_input = FluxInput(R_sample=d_rz, Z_sample=d_rz, config=dummy_config)
+
+        norm_params = dummy_input.get_norm_params()
+        r_n, z_n = dummy_input.normalize_coords(dummy_input.R_sample, dummy_input.Z_sample)
+        params = self.model.init(key, r=r_n, z=z_n, **norm_params)
 
         schedule = optax.warmup_cosine_decay_schedule(
             init_value=0.0,
@@ -253,21 +251,27 @@ class PINNTrainer:
     def train_step(
         state: train_state.TrainState,
         inputs: FluxInput,
-    ) -> tuple[train_state.TrainState, jnp.ndarray]:
-        def loss_fn(params: dict) -> jnp.ndarray:
-            # Single forward pass on the batched tensor_input
-            psi_norm = state.apply_fn(params, **inputs.normalize())
-            # Map to physical scale for physics loss evaluation
-            psi_phys = psi_norm * inputs.get_physical_scale()
-            #
-            # Placeholder for actual physics loss integration
-            return 0.0
+    ) -> Tuple[train_state.TrainState, jnp.ndarray]:
+        """Perform a single training step using physics-informed gradients."""
 
-        loss, grads = ...  # get loss and gradients
-        new_state = state.apply_gradients(grads=grads)
-        return new_state, loss
+        def loss_fn(params: Any) -> jnp.ndarray:
+            def psi_fn(p, R, Z, cfg):
+                # Map physical (R, Z) to normalized network input
+                r_n, z_n = (R - cfg.Geometry.R0) / cfg.Geometry.a, Z / cfg.Geometry.a
+                p_n = normalize_plasma_config(cfg)
+                # Denormalize output: psi = psi_net * (F_axis * a)
+                psi_n = state.apply_fn(p, r=r_n, z=z_n, **p_n)
+                return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
+
+            return pinn_loss_function(
+                psi_fn, params, inputs.R_sample, inputs.Z_sample, inputs.config
+            )
+
+        loss, grads = jax.value_and_grad(loss_fn)(state.params)
+        return state.apply_gradients(grads=grads), loss
 
     def train(self, epochs: int) -> None:
+        """Train the model for specified number of epochs."""
         print(f"Starting training for {epochs} epochs...")
 
         for epoch in range(epochs):
@@ -279,9 +283,12 @@ class PINNTrainer:
                 )
                 self.state, loss = self.train_step(state=self.state, inputs=inputs)
 
-            if epoch % 10 == 0:
+            if epoch % 2 == 0:
                 print(f"Epoch {epoch}: Loss = {loss:.6f}")
 
     def predict(self, inputs: FluxInput) -> jnp.ndarray:
-        psi_norm = self.model.apply(self.state.params, **inputs.normalize())
+        """Generate predictions for given inputs."""
+        norm_params = inputs.get_norm_params()
+        r_n, z_n = inputs.normalize_coords(inputs.R_sample, inputs.Z_sample)
+        psi_norm = self.model.apply(self.state.params, r=r_n, z=z_n, **norm_params)
         return psi_norm * inputs.get_physical_scale()

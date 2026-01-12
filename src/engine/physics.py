@@ -1,11 +1,14 @@
 from functools import partial
+from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
 
+from src.lib.geometry_config import PlasmaConfig
+
 MU_0 = 4 * jnp.pi * 1e-7
-PSI_EDGE = 0  # Poloidal flux at plasma boundary
-WEIGHT_BOUNDARY_CONDITION = 100.0  # Weight for boundary loss terms
+PSI_EDGE = 0.0  # Poloidal flux at plasma boundary
+WEIGHT_BOUNDARY_CONDITION = 100.0
 
 
 def toroidal_field_flux_function(
@@ -34,8 +37,10 @@ def toroidal_field_flux_function(
     Returns:
         Calculated F(ψ) values.
     """
-    psi_norm = (psi - psi_axis) / (PSI_EDGE - psi_axis)
-    return F_axis * (1.0 - psi_norm**exponent)
+    # Ensure numerical stability with 1e-8 and clip normalized flux
+    psi_norm = (psi - psi_axis) / (PSI_EDGE - psi_axis - 1e-8)
+    base = jnp.maximum(0.0, jnp.minimum(1.0, psi_norm))
+    return F_axis * (1.0 - (base + 1e-8) ** exponent)
 
 
 def pressure_profile(
@@ -46,9 +51,7 @@ def pressure_profile(
 ) -> jnp.ndarray:
     """Pressure profile: p(ψ).
 
-    Calculates the plasma pressure.
-    Note: Making pressure a function solely of ψ is a simplifying assumption
-    standard in static equilibrium MHD.
+    Simplifying assumption: Calculates the plasma pressure as a function of ψ
 
     Args:
         psi: Poloidal flux ψ(R, Z).
@@ -59,11 +62,19 @@ def pressure_profile(
     Returns:
         Calculated pressure p(ψ).
     """
-    psi_norm = (psi - psi_axis) / (PSI_EDGE - psi_axis)
-    return p0 * (1.0 - psi_norm**alpha)
+    # Ensure numerical stability with 1e-8 and clip normalized pressure
+    psi_norm = (psi - psi_axis) / (PSI_EDGE - psi_axis - 1e-8)
+    base = jnp.maximum(0.0, jnp.minimum(1.0, psi_norm))
+    return p0 * (1.0 - (base + 1e-8) ** alpha)
 
 
-def shafranov_operator(psi_fn: callable, params: jnp.ndarray, R: float, Z: float) -> float:
+def shafranov_operator(
+    psi_fn: Callable[..., jnp.ndarray],
+    params: Any,
+    R: jnp.ndarray,
+    Z: jnp.ndarray,
+    *args: Any,
+) -> jnp.ndarray:
     """Computes the Shafranov operator Δ*ψ for a given point (R, Z).
 
     Args:
@@ -76,32 +87,23 @@ def shafranov_operator(psi_fn: callable, params: jnp.ndarray, R: float, Z: float
     """
     R_stable = R + 1e-8
 
-    # Define gradient function w.r.t (R, Z)
-    def grad_psi(r, z):  # noqa
-        return jax.grad(psi_fn, argnums=(1, 2))(params, r, z)
+    def grad_psi(r: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
+        return jax.grad(psi_fn, argnums=(1, 2))(params, r, z, *args)
 
-    # Use JVP to compute gradients and diagonal Hessian terms efficiently
-    # JVP 1: R-direction (1, 0) -> Gets (dpsi_dR, dpsi_dZ) and (d2psi_dR2, d2psi_dZdR)
     (dpsi_dR, _), (d2psi_dR2, _) = jax.jvp(grad_psi, (R_stable, Z), (1.0, 0.0))
-
-    # JVP 2: Z-direction (0, 1) -> Gets (dpsi_dR, dpsi_dZ) and (d2psi_dRdZ, d2psi_dZ2)
-    # We only need the second component of the tangent (d2psi_dZ2)
     _, (_, d2psi_dZ2) = jax.jvp(grad_psi, (R_stable, Z), (0.0, 1.0))
 
     return d2psi_dR2 - (1.0 / R_stable) * dpsi_dR + d2psi_dZ2
 
 
 def grad_shafranov_residual(
-    psi_fn: callable,
-    params: jnp.ndarray,
-    R: float,
-    Z: float,
+    psi_fn: Callable[..., jnp.ndarray],
+    params: Any,
+    R: jnp.ndarray,
+    Z: jnp.ndarray,
     psi_axis: float,
-    p0: float,
-    F_axis: float,
-    pressure_alpha: float = 1.0,
-    field_exponent: float = 1.0,
-) -> float:
+    config: PlasmaConfig,
+) -> jnp.ndarray:
     """Compute the residual of the Grad-Shafranov equation at a given point.
 
     The Grad-Shafranov equation describes the force balance in an axisymmetric
@@ -125,76 +127,67 @@ def grad_shafranov_residual(
     Returns:
         The residual value (error) at the specified point.
     """
-    # 1. Compute Operator (LHS)
-    delta_star = shafranov_operator(psi_fn, params, R, Z)
+    delta_star = shafranov_operator(psi_fn, params, R, Z, config)
+    psi = psi_fn(params, R, Z, config)
 
-    # 2. Compute State
-    psi = psi_fn(params, R, Z)
+    # Profiles from config
+    p0, alpha = config.State.p0, config.State.pressure_alpha
+    F_axis, exponent = config.State.F_axis, config.State.field_exponent
 
-    # 3. Compute Source Terms (RHS)
-    # Pressure gradient term: p'(ψ)
-    def p_fn(p: jnp.ndarray) -> jnp.ndarray:
-        return pressure_profile(p, psi_axis, p0, pressure_alpha)
+    # Compute gradients via JVP
+    _, dp_dpsi = jax.jvp(lambda p: pressure_profile(p, psi_axis, p0, alpha), (psi,), (1.0,))
+    F_val, dF_dpsi = jax.jvp(
+        lambda f: toroidal_field_flux_function(f, psi_axis, F_axis, exponent), (psi,), (1.0,)
+    )
 
-    # Use JVP for scalar derivative (forward mode)
-    _, dp_dpsi = jax.jvp(p_fn, (psi,), (1.0,))
-
-    # Toroidal field term: F(ψ)F'(ψ)
-    def f_fn(f: jnp.ndarray) -> jnp.ndarray:
-        return toroidal_field_flux_function(f, psi_axis, F_axis, field_exponent)
-
-    # Use JVP to get both value and gradient in one pass
-    F_val, dF_dpsi = jax.jvp(f_fn, (psi,), (1.0,))
-
-    # 4. Assemble Equation
-    # GS Eq: Δ*ψ = -μ₀ R² p' - F F'
     rhs = -(MU_0 * R**2 * dp_dpsi) - (F_val * dF_dpsi)
-
     return delta_star - rhs
 
 
-# psi_fn must be makred as static for JIT compilation
 @partial(jax.jit, static_argnums=(0,))
 def pinn_loss_function(
-    psi_fn: callable,
-    params: jnp.ndarray,
-    R_sample: jnp.ndarray,
-    Z_sample: jnp.ndarray,
-    boundary_R: jnp.ndarray,
-    boundary_Z: jnp.ndarray,
-    boundary_dR_dtheta: jnp.ndarray,
-    boundary_dZ_dtheta: jnp.ndarray,
-    p0: float,
-    F_axis: float,
-) -> float:
-    """Computes the total PINN loss: L_total = L_residual + L_boundary"""
-    # --- 1. Dynamic Axis Estimation ---
-    # Predict psi for interior points
-    psi_interior = jax.vmap(lambda r, z: psi_fn(params, r, z))(R_sample, Z_sample)
+    psi_fn: Callable[..., jnp.ndarray],
+    params: Any,
+    R_interior: jnp.ndarray,
+    Z_interior: jnp.ndarray,
+    batch_config: PlasmaConfig,
+) -> jnp.ndarray:
+    """Computes the total PINN loss: L_total = L_residual + L_boundary
 
-    # Heuristic: Estimate psi_axis by getting the minimum (magnetic axis) for this batch
-    #            Assumes sufficiently large batchsize for good approximation
-    # stop_gradient ensures we don't backprop through the choice of the axis value itself
-    psi_axis_est = jax.lax.stop_gradient(jnp.min(psi_interior))
+    Uses a double-vectorization strategy.
 
-    # --- 2. Physics Residual Loss ---
-    batch_residual_fn = jax.vmap(
-        lambda r, z: grad_shafranov_residual(psi_fn, params, r, z, psi_axis_est, p0, F_axis)
-    )
-    residuals = batch_residual_fn(R_sample, Z_sample)
-    loss_physics = jnp.mean(residuals**2)
+    Design Reasoning:
+    1. Outer Vmap: Iterates over the batch of different plasma configurations.
+    2. Inner Vmap: Iterates over the spatial samples (interior and boundary).
 
-    # --- 3. Boundary Condition Loss (Neumann) ---
-    batch_boundary_gradients_psi = jax.vmap(jax.grad(psi_fn, argnums=(1, 2)), in_axes=(None, 0, 0))
-    dpsi_dR_boundary, dpsi_dZ_boundary = batch_boundary_gradients_psi(
-        params, boundary_R, boundary_Z
-    )
+    This allows JAX to perform the entire forward pass and gradient calculation
+    for the training batch in parallel, effectively fuses thousands of operations
+    into optimized GPU kernels.
+    """
 
-    norm_grad = dpsi_dR_boundary * boundary_dZ_dtheta - dpsi_dZ_boundary * boundary_dR_dtheta
-    loss_neumann = jnp.mean(norm_grad**2)
+    def single_config_loss(R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig) -> jnp.ndarray:
+        # 1. Axis Estimation
+        psi_int = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R, Z)
+        psi_axis = jax.lax.stop_gradient(jnp.min(psi_int))
 
-    # --- 4. Dirichlet Boundary Condition ---
-    psi_boundary_pred = jax.vmap(lambda r, z: psi_fn(params, r, z))(boundary_R, boundary_Z)
-    loss_dirichlet = jnp.mean((psi_boundary_pred - PSI_EDGE) ** 2)
+        # 2. PDE Residual Loss
+        residual_fn = jax.vmap(
+            lambda r, z: grad_shafranov_residual(psi_fn, params, r, z, psi_axis, config)
+        )
+        loss_res = jnp.mean(residual_fn(R, Z) ** 2)
 
-    return loss_physics + WEIGHT_BOUNDARY_CONDITION * (loss_neumann + loss_dirichlet)
+        # 3. Boundary Condition Loss (Dirichlet & Neumann)
+        R_b, Z_b = config.Boundary.R, config.Boundary.Z
+        psi_b = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R_b, Z_b)
+        loss_dir = jnp.mean((psi_b - PSI_EDGE) ** 2)
+
+        def grad_psi(r, z):
+            return jax.grad(psi_fn, argnums=(1, 2))(params, r, z, config)
+
+        dR_b, dZ_b = jax.vmap(grad_psi)(R_b, Z_b)
+        dpsi_dt = dR_b * config.Boundary.dR_dtheta + dZ_b * config.Boundary.dZ_dtheta
+        loss_neu = jnp.mean(dpsi_dt**2)
+
+        return loss_res + WEIGHT_BOUNDARY_CONDITION * (loss_dir + loss_neu)
+
+    return jnp.mean(jax.vmap(single_config_loss)(R_interior, Z_interior, batch_config))
