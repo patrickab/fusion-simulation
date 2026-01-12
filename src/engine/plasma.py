@@ -13,16 +13,16 @@ from src.lib.geometry_config import (
 )
 
 
-def get_poloidal_points(theta: float, plasma_config: PlasmaGeometry) -> tuple[float, float]:
+def get_poloidal_points(theta: float, plasma_geometry: PlasmaGeometry) -> tuple[float, float]:
     """
     Calculates a single (R, Z) point for a given theta.
     Intentionally not vectorized to perform Nx2 instead of NxN jacobian computations.
     """
     # unpack parameters for readability
-    major_radius = plasma_config.R0
-    minor_radius = plasma_config.a
-    triangularity = plasma_config.delta
-    elongation = plasma_config.kappa
+    major_radius = plasma_geometry.R0
+    minor_radius = plasma_geometry.a
+    triangularity = plasma_geometry.delta
+    elongation = plasma_geometry.kappa
 
     shaped_theta = theta + triangularity * jnp.sin(theta)
 
@@ -33,13 +33,13 @@ def get_poloidal_points(theta: float, plasma_config: PlasmaGeometry) -> tuple[fl
 
 
 def calculate_poloidal_boundary(
-    theta: jnp.ndarray, plasma_config: PlasmaGeometry, phi: float = 0.0
+    theta: jnp.ndarray, plasma_geometry: PlasmaGeometry, phi: float = 0.0
 ) -> PlasmaBoundary:
     """Compute R-Z coordinates for a shaped tokamak plasma boundary.
 
     Args:
         theta: poloidal angles
-        plasma_config: geometric parameters (R0, a, kappa, delta)
+        plasma_geometry: geometric parameters (R0, a, kappa, delta)
         phi: toroidal angle (rad)
 
     Returns:
@@ -50,7 +50,7 @@ def calculate_poloidal_boundary(
     # correctly computes the element-wise gradients for both scalars and arrays.
     tangent = jnp.ones_like(theta)
     (R, Z), (dR_dtheta, dZ_dtheta) = jax.jvp(
-        lambda t: get_poloidal_points(t, plasma_config), (theta,), (tangent,)
+        lambda t: get_poloidal_points(t, plasma_geometry), (theta,), (tangent,)
     )
 
     # Create cylindrical coordinates with constant phi
@@ -62,7 +62,7 @@ def calculate_poloidal_boundary(
         theta=theta,
         dR_dtheta=dR_dtheta,
         dZ_dtheta=dZ_dtheta,
-        R_center=plasma_config.R0,
+        R_center=plasma_geometry.R0,
         Z_center=0.0,
     )
 
