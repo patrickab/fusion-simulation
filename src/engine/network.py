@@ -70,7 +70,7 @@ class FluxInput:
         R = jnp.atleast_2d(self.R)
         Z = jnp.atleast_2d(self.Z)
 
-        def norm_param(val, bounds):
+        def norm_param(val: jnp.ndarray, bounds: tuple[float, float]) -> jnp.ndarray:
             v = jnp.atleast_1d(val)
             v_norm = min_max_scale(v, bounds)
             return v_norm[:, jnp.newaxis]
@@ -107,7 +107,19 @@ class FluxPINN(nn.Module):
     hidden_dims: tuple[int, ...]
 
     @nn.compact
-    def __call__(self, r, z, r0, a, kappa, delta, p0, f_axis, alpha, exponent) -> jnp.ndarray:
+    def __call__(
+        self,
+        r: jnp.ndarray,
+        z: jnp.ndarray,
+        r0: jnp.ndarray,
+        a: jnp.ndarray,
+        kappa: jnp.ndarray,
+        delta: jnp.ndarray,
+        p0: jnp.ndarray,
+        f_axis: jnp.ndarray,
+        alpha: jnp.ndarray,
+        exponent: jnp.ndarray,
+    ) -> jnp.ndarray:
         # Broadcast all inputs to match coordinate shape (B, N)
         target_shape = r.shape
         params = [r, z, r0, a, kappa, delta, p0, f_axis, alpha, exponent]
@@ -136,14 +148,21 @@ class Sampler:
         return l_bounds, u_bounds
 
     def _get_sobol_sample(
-        self, n_samples: int, seed: int, lower_bounds: jnp.ndarray, upper_bounds: jnp.ndarray
+        self,
+        n_samples: int,
+        seed: int,
+        lower_bounds: jnp.ndarray,
+        upper_bounds: jnp.ndarray,
     ) -> jnp.ndarray:
         sampler = qmc.Sobol(d=len(lower_bounds), scramble=True, seed=seed)
         sample_unit = jnp.array(sampler.random(n_samples))
         return sample_unit * (upper_bounds - lower_bounds) + lower_bounds
 
     def sample_flux_input(
-        self, seed: int, n_samples: int, plasma_configs: jnp.ndarray
+        self,
+        seed: int,
+        n_samples: int,
+        plasma_configs: jnp.ndarray,
     ) -> FluxInput:
         """
         Interface for sampling points specifically on the boundary of the plasma.
@@ -164,7 +183,12 @@ class Sampler:
         delta = plasma_configs[:, 3]
 
         # Calculate R, Z coordinates inside the boundary using vmap
-        def compute_interior(r0_val, a_val, k_val, d_val):
+        def compute_interior(
+            r0_val: jnp.ndarray,
+            a_val: jnp.ndarray,
+            k_val: jnp.ndarray,
+            d_val: jnp.ndarray,
+        ) -> tuple[jnp.ndarray, jnp.ndarray]:
             geom = PlasmaGeometry(R0=r0_val, a=a_val, kappa=k_val, delta=d_val)
             # vmap over both theta and rho to get interior points
             r_pts, z_pts = jax.vmap(lambda t, s: get_poloidal_points(t, geom, s))(theta, rho)
@@ -187,7 +211,7 @@ class Sampler:
 
 # --- E. The Trainer ---
 class PINNTrainer:
-    def __init__(self, config: HyperParams):
+    def __init__(self, config: HyperParams) -> None:
         self.config = config
         self.model = FluxPINN(hidden_dims=config.hidden_dims)
         self.sampler: Sampler = Sampler(config)
@@ -226,8 +250,11 @@ class PINNTrainer:
 
     @staticmethod
     @jax.jit
-    def train_step(state: train_state.TrainState, inputs: FluxInput):
-        def loss_fn(params):
+    def train_step(
+        state: train_state.TrainState,
+        inputs: FluxInput,
+    ) -> tuple[train_state.TrainState, jnp.ndarray]:
+        def loss_fn(params: dict) -> jnp.ndarray:
             # Single forward pass on the batched tensor_input
             psi_norm = state.apply_fn(params, **inputs.normalize())
             # Map to physical scale for physics loss evaluation
@@ -240,7 +267,7 @@ class PINNTrainer:
         new_state = state.apply_gradients(grads=grads)
         return new_state, loss
 
-    def train(self, epochs: int):
+    def train(self, epochs: int) -> None:
         print(f"Starting training for {epochs} epochs...")
 
         for epoch in range(epochs):
@@ -255,6 +282,6 @@ class PINNTrainer:
             if epoch % 10 == 0:
                 print(f"Epoch {epoch}: Loss = {loss:.6f}")
 
-    def predict(self, inputs: FluxInput):
+    def predict(self, inputs: FluxInput) -> jnp.ndarray:
         psi_norm = self.model.apply(self.state.params, **inputs.normalize())
         return psi_norm * inputs.get_physical_scale()

@@ -13,7 +13,9 @@ from src.lib.geometry_config import (
 )
 
 
-def get_poloidal_points(theta: float, plasma_geometry: PlasmaGeometry) -> tuple[float, float]:
+def get_poloidal_points(
+    theta: float, plasma_geometry: PlasmaGeometry, scaling_factor: float = 1.0
+) -> tuple[float, float]:
     """
     Calculates a single (R, Z) point for a given theta.
     Intentionally not vectorized to perform Nx2 instead of NxN jacobian computations.
@@ -27,8 +29,8 @@ def get_poloidal_points(theta: float, plasma_geometry: PlasmaGeometry) -> tuple[
     shaped_theta = theta + triangularity * jnp.sin(theta)
 
     # calculate coordinates
-    R = major_radius + minor_radius * jnp.cos(shaped_theta)
-    Z = elongation * minor_radius * jnp.sin(theta)
+    R = major_radius + scaling_factor * minor_radius * jnp.cos(shaped_theta)
+    Z = elongation * scaling_factor * minor_radius * jnp.sin(theta)
     return R, Z
 
 
@@ -50,7 +52,7 @@ def calculate_poloidal_boundary(
     # correctly computes the element-wise gradients for both scalars and arrays.
     tangent = jnp.ones_like(theta)
     (R, Z), (dR_dtheta, dZ_dtheta) = jax.jvp(
-        lambda t: get_poloidal_points(t, plasma_geometry), (theta,), (tangent,)
+        lambda t: get_poloidal_points(t, plasma_geometry, 1.0), (theta,), (tangent,)
     )
 
     # Create cylindrical coordinates with constant phi
