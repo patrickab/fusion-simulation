@@ -44,8 +44,10 @@ class DomainBounds:
     delta: tuple[float, float] = (0.0, 0.6)  # Triangularity factor
     p0: tuple[float, float] = (1e4, 1e6)  # Central pressure (Pa)
     F_axis: tuple[float, float] = (1.0, 50.0)  # Toroidal field function at axis (T*m)
-    alpha: tuple[float, float] = (0.5, 3.0)  # Pressure profile shape
-    exponent: tuple[float, float] = (0.5, 3.0)  # Current profile shape
+
+    # Exponent from 1.01 for numerical stability
+    alpha: tuple[float, float] = (1.01, 2.0)  # Pressure profile shape
+    exponent: tuple[float, float] = (1.01, 2.0)  # Current profile shape
 
 
 def min_max_scale(val: jnp.ndarray, bounds: tuple[float, float]) -> jnp.ndarray:
