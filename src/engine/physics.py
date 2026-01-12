@@ -1,5 +1,4 @@
 from functools import partial
-from typing import Any, Callable
 
 import jax
 import jax.numpy as jnp
@@ -69,25 +68,26 @@ def pressure_profile(
 
 
 def shafranov_operator(
-    psi_fn: Callable[..., jnp.ndarray],
-    params: Any,
+    psi_fn: callable,
+    params: any,
     R: jnp.ndarray,
     Z: jnp.ndarray,
-    *args: Any,
+    *args: any,
 ) -> jnp.ndarray:
     """Computes the Shafranov operator Δ*ψ for a given point (R, Z).
 
     Args:
-        psi_fn: A function that takes (params, R, Z) and returns a scalar ψ.
-        params: Neural network parameters.
+        psi_fn: A function that takes (params, R, Z, *args) and returns a scalar ψ.
+        params: Neural network parameters (PyTree/Dict).
         R, Z: Scalars or 0D arrays representing the coordinates.
+        *args: Additional arguments passed to psi_fn (e.g., PlasmaConfig).
 
     Returns:
         Δ*ψ as a scalar.
     """
     R_stable = R + 1e-8
 
-    def grad_psi(r: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
+    def grad_psi(r: jnp.ndarray, z: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
         return jax.grad(psi_fn, argnums=(1, 2))(params, r, z, *args)
 
     (dpsi_dR, _), (d2psi_dR2, _) = jax.jvp(grad_psi, (R_stable, Z), (1.0, 0.0))
@@ -97,8 +97,8 @@ def shafranov_operator(
 
 
 def grad_shafranov_residual(
-    psi_fn: Callable[..., jnp.ndarray],
-    params: Any,
+    psi_fn: callable,
+    params: any,
     R: jnp.ndarray,
     Z: jnp.ndarray,
     psi_axis: float,
@@ -114,7 +114,7 @@ def grad_shafranov_residual(
 
     Args:
         psi_fn: Function computing ψ(R, Z) from parameters.
-        params: Neural network parameters.
+        params: Neural network parameters (PyTree).
         R: Radial coordinate.
         Z: Vertical coordinate.
         psi_axis: Flux at the magnetic axis.
@@ -146,8 +146,8 @@ def grad_shafranov_residual(
 
 @partial(jax.jit, static_argnums=(0,))
 def pinn_loss_function(
-    psi_fn: Callable[..., jnp.ndarray],
-    params: Any,
+    psi_fn: callable,
+    params: any,
     R_interior: jnp.ndarray,
     Z_interior: jnp.ndarray,
     batch_config: PlasmaConfig,
@@ -181,7 +181,7 @@ def pinn_loss_function(
         psi_b = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R_b, Z_b)
         loss_dir = jnp.mean((psi_b - PSI_EDGE) ** 2)
 
-        def grad_psi(r, z):
+        def grad_psi(r: jnp.ndarray, z: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
             return jax.grad(psi_fn, argnums=(1, 2))(params, r, z, config)
 
         dR_b, dZ_b = jax.vmap(grad_psi)(R_b, Z_b)
