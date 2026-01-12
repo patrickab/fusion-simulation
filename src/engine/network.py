@@ -1,5 +1,3 @@
-from typing import Any, Callable, Dict, Tuple
-
 from flax import linen as nn
 from flax import struct
 from flax.training import train_state
@@ -50,13 +48,13 @@ class DomainBounds:
     exponent: tuple[float, float] = (0.5, 3.0)  # Current profile shape
 
 
-def min_max_scale(val: jnp.ndarray, bounds: Tuple[float, float]) -> jnp.ndarray:
+def min_max_scale(val: jnp.ndarray, bounds: tuple[float, float]) -> jnp.ndarray:
     """Normalize value to [-1, 1] range based on bounds."""
     min_v, max_v = bounds
     return 2.0 * (val - min_v) / (max_v - min_v) - 1.0
 
 
-def normalize_plasma_config(config: PlasmaConfig) -> Dict[str, jnp.ndarray]:
+def normalize_plasma_config(config: PlasmaConfig) -> dict[str, jnp.ndarray]:
     """Normalize plasma parameters for network input."""
     return {
         "r0": min_max_scale(config.Geometry.R0, DomainBounds.R0),
@@ -79,7 +77,7 @@ class FluxInput:
     Z_sample: jnp.ndarray  # Shape (B, N)
     config: PlasmaConfig
 
-    def get_norm_params(self) -> Dict[str, jnp.ndarray]:
+    def get_norm_params(self) -> dict[str, jnp.ndarray]:
         """Normalize plasma parameters for network input."""
         normed = normalize_plasma_config(self.config)
         return {k: jnp.atleast_1d(v)[:, jnp.newaxis] for k, v in normed.items()}
@@ -136,7 +134,7 @@ class Sampler:
     def __init__(self, config: HyperParams) -> None:
         self.config = config
 
-    def _build_domain_bounds(self) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    def _build_domain_bounds(self) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Create lower and upper bounds arrays for parameter sampling."""
         bound_names = ("R0", "a", "kappa", "delta", "p0", "F_axis", "alpha", "exponent")
         l_bounds = jnp.array([getattr(DomainBounds, name)[0] for name in bound_names])
@@ -251,16 +249,17 @@ class PINNTrainer:
     def train_step(
         state: train_state.TrainState,
         inputs: FluxInput,
-    ) -> Tuple[train_state.TrainState, jnp.ndarray]:
+    ) -> tuple[train_state.TrainState, jnp.ndarray]:
         """Perform a single training step using physics-informed gradients."""
 
-        def loss_fn(params: Any) -> jnp.ndarray:
-            def psi_fn(p, R, Z, cfg):
+        def loss_fn(params: any) -> jnp.ndarray:
+            def psi_fn(p: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
                 # Map physical (R, Z) to normalized network input
                 r_n, z_n = (R - cfg.Geometry.R0) / cfg.Geometry.a, Z / cfg.Geometry.a
                 p_n = normalize_plasma_config(cfg)
-                # Denormalize output: psi = psi_net * (F_axis * a)
                 psi_n = state.apply_fn(p, r=r_n, z=z_n, **p_n)
+
+                # Denormalize output: psi = psi_net * (F_axis * a)
                 return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
 
             return pinn_loss_function(
