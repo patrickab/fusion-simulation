@@ -36,9 +36,10 @@ def toroidal_field_flux_function(
     Returns:
         Calculated F(ψ) values.
     """
-    # Ensure numerical stability with 1e-8 and clip normalized flux
-    flux_depth = PSI_EDGE - psi_axis
-    flux_depth = jnp.where(flux_depth < 1e-4, 1e-4, flux_depth)
+    # Ensure numerical stability: clamp depth to 1.0 to prevent gradient explosion
+    # Use abs() to handle initial random weights where psi_axis > PSI_EDGE
+    flux_depth = jnp.maximum(jnp.abs(PSI_EDGE - psi_axis), 1.0)
+
     psi_norm = (psi - psi_axis) / flux_depth
     base = jnp.maximum(0.0, jnp.minimum(1.0, psi_norm))
     return F_axis * (1.0 - (base + 1e-8) ** exponent)
@@ -63,9 +64,9 @@ def pressure_profile(
     Returns:
         Calculated pressure p(ψ).
     """
-    # Ensure numerical stability with 1e-8 and clip normalized pressure
-    flux_depth = PSI_EDGE - psi_axis
-    flux_depth = jnp.where(flux_depth < 1e-4, 1e-4, flux_depth)
+    # Ensure numerical stability: clamp depth to 1.0 to prevent gradient explosion
+    flux_depth = jnp.maximum(jnp.abs(PSI_EDGE - psi_axis), 1.0)
+
     psi_norm = (psi - psi_axis) / flux_depth
     base = jnp.maximum(0.0, jnp.minimum(1.0, psi_norm))
     return p0 * (1.0 - (base + 1e-8) ** alpha)
@@ -145,7 +146,12 @@ def grad_shafranov_residual(
     )
 
     rhs = -(MU_0 * R**2 * dp_dpsi) - (F_val * dF_dpsi)
-    return (delta_star - rhs) / (p0 + 1e-6)
+
+    # Normalize by magnetic pressure scale (B_toroidal^2)
+    # This handles high-field/low-beta regimes robustly
+    scale = (F_axis / config.Geometry.R0) ** 2 + 1.0
+
+    return (delta_star - rhs) / scale
 
 
 @partial(jax.jit, static_argnums=(0,))
