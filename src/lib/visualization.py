@@ -30,13 +30,13 @@ def initialize_plotter(shape: tuple[int, int] = (1, 1)) -> pv.Plotter:
 
 
 def calculate_2d_geometry(
-    plasma_config: PlasmaGeometry, toroid_coil_config: ToroidalCoilConfig
+    plasma_geometry: PlasmaGeometry, toroid_coil_config: ToroidalCoilConfig
 ) -> tuple[PlasmaBoundary, ToroidalCoil2D]:
     """Compute 2D plasma and coil boundaries."""
     theta = RotationalAngles.THETA
-    plasma_boundary = calculate_poloidal_boundary(theta=theta, plasma_config=plasma_config)
+    plasma_boundary = calculate_poloidal_boundary(theta=theta, plasma_geometry=plasma_geometry)
     toroidal_coil_2d = calculate_toroidal_coil_boundary(
-        theta=theta, plasma_config=plasma_config, toroid_coil_config=toroid_coil_config
+        theta=theta, plasma_geometry=plasma_geometry, toroid_coil_config=toroid_coil_config
     )
     return plasma_boundary, toroidal_coil_2d
 
@@ -277,7 +277,7 @@ def render_all_geometries() -> None:
 
     Note: Modifies filesystem and opens interactive window.
     """
-    plasma_config = PlasmaGeometry(
+    plasma_geometry = PlasmaGeometry(
         R0=6.2,  # Major radius (m)
         a=3.2,  # Minor radius (m)
         kappa=1.7,  # Elongation factor
@@ -292,7 +292,7 @@ def render_all_geometries() -> None:
     )
 
     plasma_boundary, toroidal_coil_2d = calculate_2d_geometry(
-        plasma_config=plasma_config, toroid_coil_config=toroid_coil_config
+        plasma_geometry=plasma_geometry, toroid_coil_config=toroid_coil_config
     )
 
     fusion_plasma = calculate_fusion_plasma(plasma_boundary=plasma_boundary)

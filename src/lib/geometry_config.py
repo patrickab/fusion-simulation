@@ -76,17 +76,6 @@ class PlasmaState(BaseModel):
 
 
 @dataclass
-class ToroidalCoilConfig(BaseModel):
-    """Define geometric and positional parameters for toroidal field coils."""
-
-    distance_from_plasma: float  # Plasma Boundary <-> Field Coil Center (m)
-    radial_thickness: float  # radial thickness of the coil (m)
-    vertical_thickness: float  # vertical thickness of the coil (m)
-    angular_span: float  # angular span of the coil (degrees) - extent in the toroidal direction
-    n_field_coils: int  # of field coils
-
-
-@dataclass
 class PlasmaBoundary(BaseModel):
     """Store poloidal plasma boundary coordinates in R-Z plane."""
 
@@ -108,6 +97,26 @@ class PlasmaBoundary(BaseModel):
     @property
     def phi(self) -> jnp.ndarray:
         return self.coords.phi
+
+
+@dataclass
+class PlasmaConfig(BaseModel):
+    """Combine geometry and state to define a plasma configuration."""
+
+    Geometry: PlasmaGeometry
+    Boundary: PlasmaBoundary
+    State: PlasmaState
+
+
+@dataclass
+class ToroidalCoilConfig(BaseModel):
+    """Define geometric and positional parameters for toroidal field coils."""
+
+    distance_from_plasma: float  # Plasma Boundary <-> Field Coil Center (m)
+    radial_thickness: float  # radial thickness of the coil (m)
+    vertical_thickness: float  # vertical thickness of the coil (m)
+    angular_span: float  # angular span of the coil (degrees) - extent in the toroidal direction
+    n_field_coils: int  # of field coils
 
 
 @dataclass
