@@ -96,7 +96,7 @@ class Sampler:
         sampler = qmc.Sobol(d=2, scramble=True, seed=seed)
         samples = jnp.array(sampler.random(n_samples))
         theta_int = samples[:, 0] * 2 * jnp.pi
-        rho_int = samples[:, 1]
+        rho_int = jnp.sqrt(samples[:, 1])
 
         # Use Sobol sampling for boundary points
         sampler_b = qmc.Sobol(d=1, scramble=True, seed=seed + 9999)
