@@ -165,14 +165,12 @@ def pinn_loss_function(
     """Computes the total PINN loss: L_total = L_residual + L_boundary
 
     Uses a double-vectorization strategy.
+    Processes entire tensor batches of plasma configs in parallel.
+    Optimally saturates GPU throughput & allows automatic differentiation.
 
     Design Reasoning:
     1. Outer Vmap: Iterates over the batch of different plasma configurations.
     2. Inner Vmap: Iterates over the spatial samples (interior and boundary).
-
-    This allows JAX to perform the entire forward pass and gradient calculation
-    for the training batch in parallel, effectively fuses thousands of operations
-    into optimized GPU kernels.
     """
 
     def single_config_loss(R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig) -> jnp.ndarray:
