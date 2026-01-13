@@ -13,14 +13,14 @@ from src.lib.geometry_config import (
 
 
 def calculate_toroidal_coil_boundary(
-    theta: jnp.ndarray, plasma_config: PlasmaGeometry, toroid_coil_config: ToroidalCoilConfig
+    theta: jnp.ndarray, plasma_geometry: PlasmaGeometry, toroid_coil_config: ToroidalCoilConfig
 ) -> ToroidalCoil2D:
     """
     Compute toroidal coil 2D cross-section by offsetting plasma boundary along normal vectors.
     """
     # Base plasma boundary (contains R, Z and their derivatives)
     plasma_boundary: PlasmaBoundary = calculate_poloidal_boundary(
-        theta=theta, plasma_config=plasma_config
+        theta=theta, plasma_geometry=plasma_geometry
     )
     R = plasma_boundary.R
     Z = plasma_boundary.Z

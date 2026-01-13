@@ -272,24 +272,36 @@ def render_fusion_plasma(
         plotter.show(title="Fusion Plasma Surface")
 
 
-def render_all_geometries() -> None:
+def render_all_geometries(
+    plasma_geometry: Optional[PlasmaGeometry] = None,
+    toroid_coil_config: Optional[ToroidalCoilConfig] = None,
+    return_plotter: bool = False,
+    save_output: bool = True,
+) -> Optional[pv.Plotter]:
     """Execute full simulation pipeline from config to visualization and export.
 
-    Note: Modifies filesystem and opens interactive window.
+    Args:
+        plasma_geometry: Custom plasma configuration.
+        toroid_coil_config: Custom coil configuration.
+        return_plotter: If True, returns the plotter object instead of displaying it.
+        save_output: If True, saves geometry to PLY files.
     """
-    plasma_geometry = PlasmaGeometry(
-        R0=6.2,  # Major radius (m)
-        a=3.2,  # Minor radius (m)
-        kappa=1.7,  # Elongation factor
-        delta=0.33,  # Triangularity factor
-    )
-    toroid_coil_config = ToroidalCoilConfig(
-        distance_from_plasma=1.5,  # Distance from plasma surface (m)
-        radial_thickness=0.8,  # Radial thickness of the coil (m)
-        vertical_thickness=0.2,  # Vertical thickness of the coil (m)
-        angular_span=6,  # Angular span of the coil (degrees)
-        n_field_coils=8,  # Number of field coils
-    )
+    if plasma_geometry is None:
+        plasma_geometry = PlasmaGeometry(
+            R0=6.2,  # Major radius (m)
+            a=3.2,  # Minor radius (m)
+            kappa=1.7,  # Elongation factor
+            delta=0.33,  # Triangularity factor
+        )
+
+    if toroid_coil_config is None:
+        toroid_coil_config = ToroidalCoilConfig(
+            distance_from_plasma=1.5,  # Distance from plasma surface (m)
+            radial_thickness=0.8,  # Radial thickness of the coil (m)
+            vertical_thickness=0.2,  # Vertical thickness of the coil (m)
+            angular_span=6,  # Angular span of the coil (degrees)
+            n_field_coils=8,  # Number of field coils
+        )
 
     plasma_boundary, toroidal_coil_2d = calculate_2d_geometry(
         plasma_geometry=plasma_geometry, toroid_coil_config=toroid_coil_config
@@ -313,13 +325,18 @@ def render_all_geometries() -> None:
         toroidal_coils=toroidal_coils_3d,
     )
 
+    if save_output:
+        # Save geometry to PLY files
+        fusion_plasma.to_ply_structuregrid(Filepaths.PLASMA_SURFACE)
+        for i, coil in enumerate(toroidal_coils_3d, start=1):
+            coil.to_ply(base_path=Filepaths.TOROIDAL_COIL_3D_DIR, coil_id=i)
+
+    if return_plotter:
+        return plotter
+
     # Render the visualization
     plotter.show(title="Fusion Reactor Visualization", interactive=True)
-
-    # Save geometry to PLY files
-    fusion_plasma.to_ply_structuregrid(Filepaths.PLASMA_SURFACE)
-    for i, coil in enumerate(toroidal_coils_3d, start=1):
-        coil.to_ply(base_path=Filepaths.TOROIDAL_COIL_3D_DIR, coil_id=i)
+    return None
 
 
 if __name__ == "__main__":

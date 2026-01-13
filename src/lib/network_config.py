@@ -1,11 +1,12 @@
 from flax import struct
 import jax.numpy as jnp
 
+from src.lib.config import BaseModel
 from src.lib.geometry_config import PlasmaConfig
 
 
 @struct.dataclass
-class HyperParams:
+class HyperParams(BaseModel):
     """Central configuration for the experiment."""
 
     input_dim: int = 10  # 2 (RZ) + 8 (Params)
@@ -24,7 +25,7 @@ class HyperParams:
 
 
 @struct.dataclass
-class DomainBounds:
+class DomainBounds(BaseModel):
     """Define physical hypercube of domain for the network."""
 
     R0: tuple[float, float] = (1.0, 8.0)  # Major radius (m)
@@ -61,7 +62,7 @@ def normalize_plasma_config(config: PlasmaConfig) -> dict[str, jnp.ndarray]:
 
 # --- B. Physics Containers (JAX Pytrees) ---
 @struct.dataclass
-class FluxInput:
+class FluxInput(BaseModel):
     """Batch-first Pytree container for physics inputs."""
 
     R_sample: jnp.ndarray  # Shape (B, N)
