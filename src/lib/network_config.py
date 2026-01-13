@@ -12,16 +12,16 @@ class HyperParams(BaseModel):
     input_dim: int = 10  # 2 (RZ) + 8 (Params)
     output_dim: int = 1
     hidden_dims: tuple[int, ...] = (256, 256, 256, 256)
-    learning_rate_max: float = 5e-5
-    learning_rate_min: float = 5e-7
-    batch_size: int = 64
+    learning_rate_max: float = 2e-5
+    learning_rate_min: float = 2e-7
+    batch_size: int = 128
     n_rz_inner_samples: int = 2048
     n_rz_boundary_samples: int = 128
     n_train: int = 1024
     n_test: int = 32
     n_val: int = 64
-    warmup_steps: int = 100
-    decay_steps: int = 500
+    warmup_steps: int = 200
+    decay_steps: int = 1000
 
 
 @struct.dataclass
