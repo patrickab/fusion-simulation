@@ -29,6 +29,8 @@ def get_logger(name: str, log_dir: Optional[str] = None, level: int = logging.IN
         markup=True,
         rich_tracebacks=True,
         tracebacks_show_locals=True,
+        show_time=False,
+        show_path=False,
     )
     logger.addHandler(rich_handler)
     rich_handler.setFormatter(logging.Formatter("%(message)s"))
