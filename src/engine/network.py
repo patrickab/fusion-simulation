@@ -31,7 +31,7 @@ class HyperParams:
     learning_rate_max: float = 5e-4
     learning_rate_min: float = 5e-7
     batch_size: int = 32
-    n_rz_inner_samples: int = 1792
+    n_rz_inner_samples: int = 1024
     n_rz_boundary_samples: int = 256
     n_train: int = 128
     n_test: int = 32
