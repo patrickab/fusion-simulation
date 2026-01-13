@@ -1,4 +1,5 @@
 from flax import linen as nn
+import flax.serialization
 from flax.training import train_state
 import jax
 import jax.numpy as jnp
@@ -7,6 +8,7 @@ from scipy.stats import qmc
 
 from src.engine.physics import pinn_loss_function
 from src.engine.plasma import calculate_poloidal_boundary, get_poloidal_points
+from src.lib.config import Filepaths
 from src.lib.geometry_config import (
     PlasmaConfig,
     PlasmaGeometry,
@@ -49,6 +51,11 @@ class FluxPINN(nn.Module):
 
         psi_hat = nn.Dense(features=1)(x)
         return psi_hat
+
+    def to_disk(params, filepath: str) -> None:
+        """Save Flax model parameters to disk."""
+        with open(filepath, "wb") as f:
+            f.write(flax.serialization.to_bytes(params))
 
 
 # --- Sampler ---
@@ -214,6 +221,8 @@ class PINNTrainer:
 
             if epoch % 1 == 0 and epoch > 0:
                 logger.info(f"Epoch {epoch:5d} | Loss: [bold magenta]{loss:.2f}[/bold magenta] | ")
+
+        self.model.to_disk(params=self.state.params, filepath=Filepaths.PINN_PATH)
 
     def predict(self, inputs: FluxInput) -> jnp.ndarray:
         """Generate predictions for given inputs."""
