@@ -11,11 +11,9 @@ from src.lib.visualization import (
 from src.toroidal_geometry import generate_toroidal_coils_3d
 import streamlit as st
 
-st.title("Fusion Geometry Visualizer")
+st.title("Reactor Geometry")
 
-cols = st.columns([1, 5])
-
-with cols[0], st.form("geometry_coil_form"):
+with st.sidebar, st.form("geometry_coil_form"):
     st.header("Plasma Geometry")
     R0 = st.slider("Major Radius (R0) [m]", 3.0, 10.0, 6.2, 0.1)
     a = st.slider("Minor Radius (a) [m]", 1.0, 5.0, 3.2, 0.1)
@@ -42,7 +40,7 @@ toroid_coil_config = ToroidalCoilConfig(
 )
 
 # Generate and display the plot
-with cols[1], st.spinner("Calculating geometry..."):
+with st.spinner("Calculating geometry..."):
     # Calculate 2D geometry
     theta = RotationalAngles.THETA
     plasma_boundary = calculate_poloidal_boundary(theta=theta, plasma_geometry=plasma_geometry)
@@ -58,6 +56,7 @@ with cols[1], st.spinner("Calculating geometry..."):
 
     # Create plotter with vertical layout (2 rows, 1 column)
     plotter = initialize_plotter(shape=(1, 2))
+    plotter.window_size = (1000, 1000)
 
     # First row: 2D boundary
     plotter.subplot(0, 0)
@@ -74,6 +73,7 @@ with cols[1], st.spinner("Calculating geometry..."):
         show_cylindrical_angles=True,
         show_wireframe=True,
     )
+    plotter.view_isometric()
 
     # Display in Streamlit
-    stpyvista(plotter, key="fusion_plot")
+    stpyvista(plotter=plotter, key="fusion_plot")

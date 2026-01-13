@@ -121,8 +121,8 @@ with tab1:
 
     # Plotting
     n_plots = len(indices)
-    cols = min(n_plots, 2)
-    rows = (n_plots + 1) // 2
+    cols = n_plots
+    rows = 1
 
     # Adjust row height: Single column views need more height to match the wider container
     # while maintaining the 1:1 aspect ratio.
@@ -179,7 +179,7 @@ with tab1:
         showlegend=False,
         margin={"t": 40, "b": 40, "l": 10, "r": 10},  # Reduce margins
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="content")
 
 with tab2:
     st.info("Model Training metrics and loss curves will appear here.")
