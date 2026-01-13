@@ -72,7 +72,9 @@ def rotate_3d_points(
     return x_rot, y_rot, z_rot
 
 
-def convert_rz_to_xyz(R: np.ndarray, Z: np.ndarray, phi: float) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def convert_rz_to_xyz(
+    R: np.ndarray, Z: np.ndarray, phi: float
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Convert cylindrical coordinates (R, Z) to Cartesian coordinates (X, Y).
 

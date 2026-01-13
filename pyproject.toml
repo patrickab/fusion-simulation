@@ -5,12 +5,17 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "flax>=0.12.2",
+  "jax>=0.8.2",
   "numpy>=2.3.1",
   "plotly>=6.2.0",
   "pyvista>=0.45.3",
   "ruff>=0.12.7",
   "scipy>=1.16.1",
   "scipy-stubs>=1.16.1.0",
+  "stpyvista>=0.1.4",
+  "streamlit>=1.52.2",
+  "jax[cuda12]",
 ]
 
 [build-system]
@@ -23,7 +28,7 @@ packages = ["src"]
 [tool.ruff]
 target-version = "py312"
 respect-gitignore = true
-line-length = 135
+line-length = 100
 
 [tool.ruff.lint]
 select = [
