@@ -46,7 +46,7 @@ class FluxPINN(nn.Module):
         x = jnp.stack([jnp.broadcast_to(p, target_shape) for p in params], axis=-1)
 
         for dim in self.hidden_dims:
-            x = nn.Dense(features=dim)(x)
+            x = nn.Dense(features=dim, dtype=jnp.bfloat16)(x)
             x = nn.tanh(x)
 
         psi_hat = nn.Dense(features=1)(x)
@@ -82,7 +82,7 @@ class Sampler:
     ) -> jnp.ndarray:
         """Generate Sobol sequence samples within specified bounds."""
         sampler = qmc.Sobol(d=len(lower_bounds), scramble=True, seed=seed)
-        sample_unit = jnp.array(sampler.random(n_samples))
+        sample_unit = jnp.array(sampler.random(n_samples), dtype=jnp.bfloat16)
         return sample_unit * (upper_bounds - lower_bounds) + lower_bounds
 
     def sample_flux_input(
@@ -94,13 +94,17 @@ class Sampler:
     ) -> FluxInput:
         """Sample interior and boundary points for a batch of plasma configurations."""
         sampler = qmc.Sobol(d=2, scramble=True, seed=seed)
-        samples = jnp.array(sampler.random(n_samples))
+        samples = jnp.array(sampler.random(n_samples), dtype=jnp.bfloat16)
         theta_int = samples[:, 0] * 2 * jnp.pi
         rho_int = jnp.sqrt(samples[:, 1])
 
         # Use Sobol sampling for boundary points
         sampler_b = qmc.Sobol(d=1, scramble=True, seed=seed + 9999)
-        theta_b = jnp.array(sampler_b.random(n_boundary_samples)).flatten() * 2 * jnp.pi
+        theta_b = (
+            jnp.array(sampler_b.random(n_boundary_samples), dtype=jnp.bfloat16).flatten()
+            * 2
+            * jnp.pi
+        )
 
         def compute_single_config(
             plasma_config: jnp.ndarray,
