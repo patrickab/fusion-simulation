@@ -34,6 +34,11 @@ class BaseModel:
         for val in self.__dict__.values():
             if hasattr(val, "shape") and len(val.shape) > 0:
                 return val.shape[0]
+            # Recurse into nested BaseModels (e.g. PlasmaConfig -> PlasmaGeometry)
+            if isinstance(val, BaseModel):
+                length = len(val)
+                if length > 0:
+                    return length
         return 0
 
     def __getitem__(self, idx: int) -> Self:
@@ -49,7 +54,8 @@ class BaseModel:
         Handles JAX/NumPy arrays by converting them to standard Python lists.
         """
         out: dict[str, any] = {}
-        for k, v in self:
+        # Iterate over fields
+        for k, v in self.__dict__.items():
             if hasattr(v, "tolist"):  # Handle jnp.ndarray and np.ndarray
                 out[k] = v.tolist()
             elif isinstance(v, BaseModel):
@@ -62,7 +68,8 @@ class BaseModel:
         """String representation."""
         cls_name = self.__class__.__name__
         lines: list[str] = []
-        for k, v in self:
+        # Iterate over fields
+        for k, v in self.__dict__.items():
             if isinstance(v, (jnp.ndarray, np.ndarray)):
                 lines.append(f"  {k}: {type(v).__name__}[shape={v.shape}, dtype={v.dtype}]")
             elif isinstance(v, (float, int, str, bool)):
