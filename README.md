@@ -48,5 +48,3 @@ X = R \cos \phi, \quad Y = R \sin \phi, \quad Z = Z
 $$
 
 This produces a symmetric surface representing a tokamak plasma volume warped according to shaping parameters. The procedure efficiently uses numpy broadcasting for mesh generation. <image here> of resulting 3D plasma surface.
-
----
