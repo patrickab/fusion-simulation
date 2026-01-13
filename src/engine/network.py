@@ -191,6 +191,10 @@ class PINNTrainer:
         """Perform a single training step using physics-informed gradients."""
 
         def loss_fn(params: any) -> jnp.ndarray:
+            # Rematerialization trades compute for memory by recomputing activations during backprop.
+            # In PINNs, high-order PDE residuals create massive graphs; remat keeps memory footprint
+            # near-constant relative to depth, enabling larger networks and point batches.
+            @jax.checkpoint
             def psi_fn(p: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
                 # Map physical (R, Z) to normalized network input
                 r_n, z_n = (R - cfg.Geometry.R0) / cfg.Geometry.a, Z / cfg.Geometry.a
