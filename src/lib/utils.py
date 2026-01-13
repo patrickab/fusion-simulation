@@ -1,12 +1,17 @@
 from pathlib import Path, PosixPath
 
+import numpy as np
 import pyvista as pv
 
 from src.lib.geometry_config import FusionPlasma, ToroidalCoil3D
 
 
 def _coils_to_polydata(
-    coils: list[ToroidalCoil3D] | list[pv.PolyData] | list[Path | PosixPath] | list[dict[str, pv.PolyData]] | None,
+    coils: list[ToroidalCoil3D]
+    | list[pv.PolyData]
+    | list[Path | PosixPath]
+    | list[dict[str, pv.PolyData]]
+    | None,
 ) -> list[dict[str, pv.PolyData]]:
     """
     Normalize various coil representations into a list of dicts of PolyData meshes.
@@ -21,7 +26,11 @@ def _coils_to_polydata(
     if coils is None or not coils:
         return []
 
-    first = coils[0]
+    # Handle empty list
+    if len(coils) == 0:
+        return []
+
+    first = coils[0]  # Use simple indexing instead of jax.tree_util.tree_map
 
     # Case 1: already list[dict[str, PolyData]]
     if isinstance(first, dict):
@@ -33,18 +42,40 @@ def _coils_to_polydata(
         for coil in coils:
             parts: dict[str, pv.PolyData] = {}
 
-            inner = pv.StructuredGrid(coil.X_inner, coil.Y_inner, coil.Z_inner).extract_surface()
+            x_inner, y_inner, z_inner = (
+                np.array(coil.X_inner),
+                np.array(coil.Y_inner),
+                np.array(coil.Z_inner),
+            )
+            inner = pv.StructuredGrid(x_inner, y_inner, z_inner).extract_surface()
             parts["inner"] = inner
 
-            outer = pv.StructuredGrid(coil.X_outer, coil.Y_outer, coil.Z_outer).extract_surface()
+            x_outer, y_outer, z_outer = (
+                np.array(coil.X_outer),
+                np.array(coil.Y_outer),
+                np.array(coil.Z_outer),
+            )
+            outer = pv.StructuredGrid(x_outer, y_outer, z_outer).extract_surface()
             parts["outer"] = outer
 
             if coil.X_cap_start.size > 0:
-                cap_start = pv.StructuredGrid(coil.X_cap_start, coil.Y_cap_start, coil.Z_cap_start).extract_surface()
+                x_cap_start, y_cap_start, z_cap_start = (
+                    np.array(coil.X_cap_start),
+                    np.array(coil.Y_cap_start),
+                    np.array(coil.Z_cap_start),
+                )
+                cap_start = pv.StructuredGrid(
+                    x_cap_start, y_cap_start, z_cap_start
+                ).extract_surface()
                 parts["cap_start"] = cap_start
 
             if coil.X_cap_end.size > 0:
-                cap_end = pv.StructuredGrid(coil.X_cap_end, coil.Y_cap_end, coil.Z_cap_end).extract_surface()
+                x_cap_end, y_cap_end, z_cap_end = (
+                    np.array(coil.X_cap_end),
+                    np.array(coil.Y_cap_end),
+                    np.array(coil.Z_cap_end),
+                )
+                cap_end = pv.StructuredGrid(x_cap_end, y_cap_end, z_cap_end).extract_surface()
                 parts["cap_end"] = cap_end
 
             out.append(parts)
@@ -65,10 +96,14 @@ def _coils_to_polydata(
             out_path.append({"coil": mesh})
         return out_path
 
-    raise TypeError("coils must be a list of ToroidalCoil3D, pv.PolyData, Path, or dict[str, pv.PolyData]")
+    raise TypeError(
+        "coils must be a list of ToroidalCoil3D, pv.PolyData, Path, or dict[str, pv.PolyData]"
+    )
 
 
-def _plasma_to_polydata(plasma: FusionPlasma | pv.PolyData | Path) -> pv.PolyData:
+def _plasma_to_polydata(
+    plasma: FusionPlasma | pv.PolyData | Path,
+) -> pv.PolyData:
     """Convert FusionPlasma, PolyData, or a file path to a PolyData surface mesh."""
     if isinstance(plasma, Path):
         try:
@@ -77,7 +112,9 @@ def _plasma_to_polydata(plasma: FusionPlasma | pv.PolyData | Path) -> pv.PolyDat
             raise FileNotFoundError(f"PLY file not found at path: {plasma}") from None
 
     if isinstance(plasma, FusionPlasma):
-        return pv.StructuredGrid(plasma.X, plasma.Y, plasma.Z).extract_surface()
+        return pv.StructuredGrid(
+            np.array(plasma.X), np.array(plasma.Y), np.array(plasma.Z)
+        ).extract_surface()
 
     if isinstance(plasma, pv.PolyData):
         return plasma

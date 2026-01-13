@@ -1,31 +1,63 @@
-from dataclasses import dataclass
 import json
 import os
 
+from flax.struct import dataclass
+import jax.numpy as jnp
 import numpy as np
 import pyvista as pv
 from scipy.spatial import Delaunay
 
-from src.lib.config import Filepaths
+from src.lib.config import BaseModel, Filepaths
 
-
-class RotationalAngles:
-    """
-    Configuration class for rotational angles used in the application.
-    """
-
-    n_phi = 360  # Number of points in toroidal direction
-    n_theta = 360  # Number of points in poloidal direction
-
-    PHI = np.linspace(0, 2 * np.pi, n_phi)  # Azimuthal angle in radians
-    THETA = np.linspace(0, 2 * np.pi, n_theta)  # Polar angle in radians
+COIL_RESOLUTION_3D = 64  # Number of points in the toroidal direction for 3D coils
 
 
 @dataclass
-class PlasmaConfig:
-    """
-    Configuration class for toroidal geometry parameters.
-    """
+class CylindricalCoordinates(BaseModel):
+    """Represent coordinates in cylindrical system (R, phi, Z)."""
+
+    R: jnp.ndarray  # Radial coordinate (m)
+    phi: jnp.ndarray  # Azimuthal angle (rad)
+    Z: jnp.ndarray  # Vertical coordinate (m)
+
+    def to_cartesian(self) -> "CartesianCoordinates":
+        """Convert cylindrical coordinates to Cartesian coordinates."""
+        X = self.R * jnp.cos(self.phi)
+        Y = self.R * jnp.sin(self.phi)
+        Z = self.Z
+        return CartesianCoordinates(X=X, Y=Y, Z=Z)
+
+
+@dataclass
+class CartesianCoordinates(BaseModel):
+    """Represent coordinates in Cartesian system (X, Y, Z)."""
+
+    X: jnp.ndarray  # X coordinate (m)
+    Y: jnp.ndarray  # Y coordinate (m)
+    Z: jnp.ndarray  # Z coordinate (m)
+
+    def to_cylindrical(self) -> "CylindricalCoordinates":
+        """Convert Cartesian coordinates to cylindrical coordinates."""
+        R = jnp.sqrt(self.X**2 + self.Y**2)
+        phi = jnp.arctan2(self.Y, self.X)
+        Z = self.Z
+        return CylindricalCoordinates(R=R, phi=phi, Z=Z)
+
+
+@dataclass
+class RotationalAngles(BaseModel):
+    """Define toroidal and poloidal rotational angle arrays."""
+
+    n_phi = 256  # Number of points in toroidal direction
+    n_theta = 256  # Number of points in poloidal direction
+
+    PHI = jnp.linspace(0, 2 * jnp.pi, n_phi)  # Azimuthal angle in radians
+    THETA = jnp.linspace(0, 2 * jnp.pi, n_theta)  # Polar angle in radians
+
+
+@dataclass
+class PlasmaGeometry(BaseModel):
+    """Define geometric parameters for the plasma torus shape."""
 
     R0: float  # Major radius of the torus (m)
     a: float  # Minor radius of the torus (m)
@@ -34,106 +66,155 @@ class PlasmaConfig:
 
 
 @dataclass
-class ToroidalCoilConfig:
-    """
-    Class representing a toroidal field coil.
-    Contains parameters for the coil's geometry and position.
-    """
+class PlasmaState(BaseModel):
+    """Define physical state parameters for the plasma."""
+
+    p0: float  # Central pressure [Pa]
+    F_axis: float  # Toroidal field function at axis [T·m]
+    pressure_alpha: float = 1.0  # Pressure profile shape
+    field_exponent: float = 1.0  # Current profile shape
+
+
+@dataclass
+class PlasmaBoundary(BaseModel):
+    """Store poloidal plasma boundary coordinates in R-Z plane."""
+
+    coords: CylindricalCoordinates  # Cylindrical coordinates (R, phi, Z)
+    theta: jnp.ndarray  # Poloidal angles (rad)
+    dR_dtheta: jnp.ndarray  # dR/dtheta (m/rad)
+    dZ_dtheta: jnp.ndarray  # dZ/dtheta (m/rad)
+    R_center: float  # Magnetic axis R (m)
+    Z_center: float  # Magnetic axis Z (m)
+
+    @property
+    def R(self) -> jnp.ndarray:
+        return self.coords.R
+
+    @property
+    def Z(self) -> jnp.ndarray:
+        return self.coords.Z
+
+    @property
+    def phi(self) -> jnp.ndarray:
+        return self.coords.phi
+
+
+@dataclass
+class PlasmaConfig(BaseModel):
+    """Combine geometry and state to define a plasma configuration."""
+
+    Geometry: PlasmaGeometry
+    Boundary: PlasmaBoundary
+    State: PlasmaState
+
+
+@dataclass
+class ToroidalCoilConfig(BaseModel):
+    """Define geometric and positional parameters for toroidal field coils."""
 
     distance_from_plasma: float  # Plasma Boundary <-> Field Coil Center (m)
     radial_thickness: float  # radial thickness of the coil (m)
     vertical_thickness: float  # vertical thickness of the coil (m)
-    angular_span: float  # angular span of the coil (degrees) - defines the coil's extent in the toroidal direction
+    angular_span: float  # angular span of the coil (degrees) - extent in the toroidal direction
     n_field_coils: int  # of field coils
 
 
 @dataclass
-class PlasmaBoundary:
-    """
-    R-Z coordinates of poloidal plasma boundary
-    """
+class FusionPlasma(BaseModel):
+    """Store 3D coordinates and boundary of the toroidal plasma surface."""
 
-    R_2d: np.ndarray  # R coordinates (m)
-    Z_2d: np.ndarray  # Z coordinates (m)
-
-
-@dataclass
-class FusionPlasma:
-    """
-    Class representing a toroidal surface.
-    Contains the 3D coordinates of the toroidal plasma surface.
-    """
-
-    X: np.ndarray  # X coordinates (m)
-    Y: np.ndarray  # Y coordinates (m)
-    Z: np.ndarray  # Z coordinates (m)
+    cylindrical_coords: CylindricalCoordinates  # Cylindrical coordinates (R, phi, Z)
+    cartesian_coords: CartesianCoordinates  # Cartesian coordinates (X, Y, Z)
+    theta: jnp.ndarray  # Poloidal angles (rad)
+    R_center: float
+    Z_center: float
     Boundary: PlasmaBoundary
 
+    @property
+    def X(self) -> jnp.ndarray:
+        return self.cartesian_coords.X
+
+    @property
+    def Y(self) -> jnp.ndarray:
+        return self.cartesian_coords.Y
+
+    @property
+    def Z(self) -> jnp.ndarray:
+        return self.cartesian_coords.Z
+
+    @property
+    def R(self) -> jnp.ndarray:
+        return self.cylindrical_coords.R
+
+    @property
+    def phi(self) -> jnp.ndarray:
+        return self.cylindrical_coords.phi
+
     def to_ply_structuregrid(self, filename: str = Filepaths.PLASMA_SURFACE) -> None:
+        """Export plasma surface to PLY file.
+
+        Args:
+            filename: Target file path.
+
+        Note: Writes to filesystem.
         """
-        Exports the toroidal plasma surface to a polygonal mesh in .ply format.
-        """
-        grid = pv.StructuredGrid(self.X, self.Y, self.Z).extract_surface()
+        grid = pv.StructuredGrid(
+            np.array(self.X), np.array(self.Y), np.array(self.Z)
+        ).extract_surface()
         grid.save(filename)
         print(f"✅ Exported plasma surface to: {os.path.abspath(filename)}")
 
 
 @dataclass
-class ToroidalCoil2D:
-    """
-    Represents 2D toroidal field coil in the poloidal (R-Z) plane.
-    Also provides Delaunay triangulation for meshing.
-    """
+class ToroidalCoil2D(BaseModel):
+    """Represent 2D toroidal field coil in the poloidal R-Z plane."""
 
-    R_inner: np.ndarray
-    R_outer: np.ndarray
-    R_center: np.ndarray
+    R_inner: jnp.ndarray
+    R_outer: jnp.ndarray
+    R_center: jnp.ndarray
 
-    Z_inner: np.ndarray
-    Z_outer: np.ndarray
-    Z_center: np.ndarray
+    Z_inner: jnp.ndarray
+    Z_outer: jnp.ndarray
+    Z_center: jnp.ndarray
 
     def express_delaunay_triangles(self) -> Delaunay:
-        """
-        Returns Delaunay triangulation of the inner and outer boundaries in the R-Z plane.
-        """
+        """Return Delaunay triangulation of R-Z boundary points."""
         # Stack inner and outer boundary points
-        points = np.column_stack((np.concatenate([self.R_inner, self.R_outer]), np.concatenate([self.Z_inner, self.Z_outer])))
+        points = np.column_stack(
+            (
+                np.concatenate([self.R_inner, self.R_outer]),
+                np.concatenate([self.Z_inner, self.Z_outer]),
+            )
+        )
         return Delaunay(points)
 
 
 @dataclass
-class ToroidalCoil3D:
-    """
-    Represents a full 3D toroidal field coil geometry.
-    Suitable for visualization, export, and simulation.
-    Also provides Delaunay triangulation for meshing.
-    """
+class ToroidalCoil3D(BaseModel):
+    """Represent 3D toroidal field coil geometry for visualization."""
 
-    X_inner: np.ndarray  # (n_phi, COIL_RESOLUTION_3D) inner wall swept
-    Y_inner: np.ndarray
-    Z_inner: np.ndarray
+    X_inner: jnp.ndarray  # (n_phi, COIL_RESOLUTION_3D) inner wall swept
+    Y_inner: jnp.ndarray
+    Z_inner: jnp.ndarray
 
-    X_outer: np.ndarray  # (n_phi, COIL_RESOLUTION_3D) outer wall swept
-    Y_outer: np.ndarray
-    Z_outer: np.ndarray
+    X_outer: jnp.ndarray  # (n_phi, COIL_RESOLUTION_3D) outer wall swept
+    Y_outer: jnp.ndarray
+    Z_outer: jnp.ndarray
 
-    X_cap_start: np.ndarray  # (2, n_pts) cap at start of toroidal span
-    Y_cap_start: np.ndarray
-    Z_cap_start: np.ndarray
+    X_cap_start: jnp.ndarray  # (2, n_pts) cap at start of toroidal span
+    Y_cap_start: jnp.ndarray
+    Z_cap_start: jnp.ndarray
 
-    X_cap_end: np.ndarray  # (2, n_pts) cap at end of toroidal span
-    Y_cap_end: np.ndarray
-    Z_cap_end: np.ndarray
+    X_cap_end: jnp.ndarray  # (2, n_pts) cap at end of toroidal span
+    Y_cap_end: jnp.ndarray
+    Z_cap_end: jnp.ndarray
 
-    CentralPlane: np.ndarray
+    CentralPlane: jnp.ndarray
 
     ToroidalCoil2D: ToroidalCoil2D  # Original 2D definition (for regeneration/reuse)
 
     def express_delaunay_triangles(self) -> Delaunay:
-        """
-        Returns Delaunay triangulation of the coil's inner and outer surfaces in 3D.
-        """
+        """Return Delaunay triangulation of 3D coil surface points."""
         # Flatten inner and outer surface points
         points = np.column_stack(
             (
@@ -145,20 +226,19 @@ class ToroidalCoil3D:
         return Delaunay(points)
 
     def to_ply(self, base_path: str | os.PathLike, coil_id: int) -> None:
-        """
-        Export this coil's surfaces to PLY files in ``base_path``.
-        Creates:
-          coil_{id:02d}_inner.ply
-          coil_{id:02d}_outer.ply
-          coil_{id:02d}_cap_start.ply
-          coil_{id:02d}_cap_end.ply
-          coil_{id:02d}_meta.json
+        """Export coil components and metadata to PLY and JSON.
+
+        Args:
+            base_path: Output directory path.
+            coil_id: Unique integer identifier.
+
+        Note: Creates directory and multiple files.
         """
         base_path = os.fspath(base_path)
         os.makedirs(base_path, exist_ok=True)
 
-        def _save_structured(x: np.ndarray, y: np.ndarray, z: np.ndarray, suffix: str) -> str:
-            grid = pv.StructuredGrid(x, y, z).extract_surface()
+        def _save_structured(x: jnp.ndarray, y: jnp.ndarray, z: jnp.ndarray, suffix: str) -> str:
+            grid = pv.StructuredGrid(np.array(x), np.array(y), np.array(z)).extract_surface()
             filename = f"coil_{coil_id:02d}_{suffix}.ply"
             path = os.path.join(base_path, filename)
             grid.save(path)
@@ -166,7 +246,9 @@ class ToroidalCoil3D:
 
         inner_file = _save_structured(self.X_inner, self.Y_inner, self.Z_inner, "inner")
         outer_file = _save_structured(self.X_outer, self.Y_outer, self.Z_outer, "outer")
-        cap_start_file = _save_structured(self.X_cap_start, self.Y_cap_start, self.Z_cap_start, "cap_start")
+        cap_start_file = _save_structured(
+            self.X_cap_start, self.Y_cap_start, self.Z_cap_start, "cap_start"
+        )
         cap_end_file = _save_structured(self.X_cap_end, self.Y_cap_end, self.Z_cap_end, "cap_end")
 
         meta = {

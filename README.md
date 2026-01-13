@@ -1,6 +1,6 @@
 # Nuclear Fusion Simulation
 
-Work in progress - next milestones: PINNs \& FEM
+Work in progress. Parametrizable & differentiable geometry for Tokamak fusion reacotrs. Implemented using JAX.
 
 ## Table of Contents
 - [Poloidal Plasma Boundary Definition](#poloidal-plasma-boundary-definition)
