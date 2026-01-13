@@ -13,6 +13,11 @@ from src.lib.geometry_config import (
     PlasmaGeometry,
     PlasmaState,
 )
+from src.lib.logger import get_logger
+
+logger = get_logger(
+    name="Network",
+)
 
 
 # --- A. Configuration ---
@@ -22,13 +27,13 @@ class HyperParams:
 
     input_dim: int = 10  # 2 (RZ) + 8 (Params)
     output_dim: int = 1
-    hidden_dims: tuple[int, ...] = (256, 256, 256)
+    hidden_dims: tuple[int, ...] = (256, 256, 256, 256)
     learning_rate_max: float = 5e-4
     learning_rate_min: float = 5e-7
     batch_size: int = 32
     n_rz_inner_samples: int = 1792
     n_rz_boundary_samples: int = 256
-    n_train: int = 512
+    n_train: int = 128
     n_test: int = 32
     n_val: int = 64
     warmup_steps: int = 200
@@ -160,6 +165,7 @@ class Sampler:
         self,
         seed: int,
         n_samples: int,
+        n_boundary_samples: int,
         plasma_configs: jnp.ndarray,
     ) -> FluxInput:
         """Sample interior and boundary points for a batch of plasma configurations."""
@@ -168,8 +174,9 @@ class Sampler:
         theta_int = samples[:, 0] * 2 * jnp.pi
         rho_int = samples[:, 1]
 
-        # Use linear spacing for boundary to ensure smooth contour
-        theta_b = jnp.linspace(0, 2 * jnp.pi, n_samples)
+        # Use Sobol sampling for boundary points
+        sampler_b = qmc.Sobol(d=1, scramble=True, seed=seed + 9999)
+        theta_b = jnp.array(sampler_b.random(n_boundary_samples)).flatten() * 2 * jnp.pi
 
         def compute_single_config(
             plasma_config: jnp.ndarray,
@@ -275,7 +282,7 @@ class PINNTrainer:
     def train(self) -> None:
         """Train the model for specified number of epochs."""
         epochs = self.config.decay_steps + self.config.warmup_steps
-        print(f"Starting training for {epochs} epochs...")
+        logger.info(f"Starting training for {epochs} epochs...")
         for epoch in range(epochs):
             for i in range(0, len(self.train_set), self.config.batch_size):
                 train_batch = self.train_set[i : i + self.config.batch_size]
@@ -283,12 +290,13 @@ class PINNTrainer:
                 inputs = self.sampler.sample_flux_input(
                     seed=epoch + i,
                     n_samples=self.config.n_rz_inner_samples,
+                    n_boundary_samples=self.config.n_rz_boundary_samples,
                     plasma_configs=train_batch,
                 )
                 self.state, loss = self.train_step(state=self.state, inputs=inputs)
 
-            if epoch % 10 == 0:
-                print(f"Epoch {epoch}: Loss = {loss:.6f}")
+            if epoch % 1 == 0 and epoch > 0:
+                logger.info(f"Epoch {epoch:5d} | Loss: [bold magenta]{loss:.2f}[/bold magenta] | ")
 
     def predict(self, inputs: FluxInput) -> jnp.ndarray:
         """Generate predictions for given inputs."""
