@@ -127,7 +127,7 @@ def plot_plasma(
             style="wireframe",
             color="cyan",
             line_width=1,
-            opacity=0.2,
+            opacity=0.3,
             name=f"{name_prefix}_wireframe",
         )
 
