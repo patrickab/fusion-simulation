@@ -52,10 +52,17 @@ class FluxPINN(nn.Module):
         psi_hat = nn.Dense(features=1)(x)
         return psi_hat
 
-    def to_disk(params, filepath: str) -> None:
+    @staticmethod
+    def to_disk(params: jnp.ndarray) -> None:
         """Save Flax model parameters to disk."""
-        with open(filepath, "wb") as f:
+        with open(Filepaths.PINN_PATH, "wb") as f:
             f.write(flax.serialization.to_bytes(params))
+
+    @staticmethod
+    def from_disk(target) -> any:
+        """Load Flax model parameters from disk."""
+        with open(Filepaths.PINN_PATH, "rb") as f:
+            return flax.serialization.from_bytes(target, f.read())
 
 
 # --- Sampler ---
@@ -140,7 +147,7 @@ class Sampler:
 
 
 # --- Trainer ---
-class PINNTrainer:
+class NetworkManager:
     def __init__(self, config: HyperParams) -> None:
         self.config = config
         self.model = FluxPINN(hidden_dims=config.hidden_dims)
@@ -191,7 +198,7 @@ class PINNTrainer:
         """Perform a single training step using physics-informed gradients."""
 
         def loss_fn(params: any) -> jnp.ndarray:
-            # Rematerialization trades compute for memory by recomputing activations during backprop.
+            # Rematerialization trades compute for memory by recomputing activations during backprop
             # In PINNs, high-order PDE residuals create massive graphs; remat keeps memory footprint
             # near-constant relative to depth, enabling larger networks and point batches.
             @jax.checkpoint
@@ -232,7 +239,7 @@ class PINNTrainer:
             if epoch % 1 == 0 and epoch > 0:
                 logger.info(f"Epoch {epoch:5d} | Loss: [bold magenta]{loss:.2f}[/bold magenta] | ")
 
-        self.model.to_disk(params=self.state.params, filepath=Filepaths.PINN_PATH)
+        self.model.to_disk(params=self.state.params)
 
     def predict(self, inputs: FluxInput) -> jnp.ndarray:
         """Generate predictions for given inputs."""
@@ -244,5 +251,7 @@ class PINNTrainer:
 
 if __name__ == "__main__":
     config = HyperParams()
-    trainer = PINNTrainer(config)
-    trainer.train()
+    manager = NetworkManager(config)
+    manager.train()
+    # params = FluxPINN.from_disk(manager.state.params)
+    # manager.state = manager.state.replace(params=params)
