@@ -213,7 +213,9 @@ class PINNTrainer:
 
     def train(self) -> None:
         """Train the model for specified number of epochs."""
-        epochs = self.config.decay_steps + self.config.warmup_steps
+        epochs = (self.config.decay_steps + self.config.warmup_steps) // (
+            self.config.n_train // self.config.batch_size
+        )
         logger.info(f"Starting training for {epochs} epochs...")
         for epoch in range(epochs):
             for i in range(0, len(self.train_set), self.config.batch_size):
