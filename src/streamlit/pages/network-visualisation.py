@@ -4,9 +4,15 @@ import jax.numpy as jnp
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 
-from src.engine.network import Sampler
-from src.lib.geometry_config import PlasmaGeometry, PlasmaState
-from src.lib.network_config import HyperParams
+from src.engine.network import FluxPINN, NetworkManager, Sampler
+from src.engine.plasma import calculate_poloidal_boundary, is_point_in_plasma
+from src.lib.geometry_config import (
+    CylindricalCoordinates,
+    PlasmaConfig,
+    PlasmaGeometry,
+    PlasmaState,
+)
+from src.lib.network_config import FluxInput, HyperParams
 import streamlit as st
 
 st.set_page_config(layout="wide", page_title="Plasma Geometry Lab")
@@ -97,7 +103,7 @@ data = get_data(n_geoms, n_int, n_bound, seed)
 
 # --- UI Layout ---
 st.title("Network Visualization")
-tab1, tab2 = st.tabs(["Geometry Sampling", "Model Training"])
+tab1, tab2, tab3 = st.tabs(["Geometry Sampling", "Model Training", "Predictions"])
 
 with tab1:
     view_option = st.selectbox(
@@ -183,3 +189,67 @@ with tab1:
 
 with tab2:
     st.info("Model Training metrics and loss curves will appear here.")
+
+with tab3:
+    st.header("Flux Prediction")
+
+    # Load Model
+    config = HyperParams()
+    manager = NetworkManager(config)
+    try:
+        params = FluxPINN.from_disk(manager.state.params)
+        manager.state = manager.state.replace(params=params)
+    except FileNotFoundError:
+        st.warning("Model not found. Please train the model first.")
+        st.stop()
+
+    # Configuration
+    col1, col2 = st.columns(2)
+    with col1:
+        idx = st.slider("Select Training Sample", 0, len(manager.train_set) - 1, 0)
+    with col2:
+        res = st.slider("Grid Resolution", 20, 200, 50)
+
+    # Reconstruct Plasma Config
+    p = manager.train_set[idx]
+    geom = PlasmaGeometry(R0=p[0], a=p[1], kappa=p[2], delta=p[3])
+    state = PlasmaState(p0=p[4], F_axis=p[5], pressure_alpha=p[6], field_exponent=p[7])
+    boundary = calculate_poloidal_boundary(jnp.linspace(0, 2 * jnp.pi, 128), geom)
+
+    # Generate Grid
+    R = jnp.linspace(geom.R0 - geom.a * 1.2, geom.R0 + geom.a * 1.2, res)
+    Z = jnp.linspace(-geom.kappa * geom.a * 1.2, geom.kappa * geom.a * 1.2, res)
+    R_grid, Z_grid = jnp.meshgrid(R, Z)
+
+    # Filter Points
+    coords = CylindricalCoordinates(R=R_grid.flatten(), Z=Z_grid.flatten(), phi=jnp.zeros(res**2))
+    mask = is_point_in_plasma(coords, boundary)
+
+    if mask.any():
+        # Predict
+        inputs = FluxInput(
+            R_sample=coords.R[mask],
+            Z_sample=coords.Z[mask],
+            config=PlasmaConfig(Geometry=geom, Boundary=boundary, State=state),
+        )
+        psi = manager.predict(inputs)
+
+        # Visualize
+        psi_grid = jnp.full(mask.shape, jnp.nan).at[mask].set(psi.flatten()).reshape(res, res)
+
+        fig = go.Figure(
+            go.Heatmap(x=R, y=Z, z=psi_grid, colorscale="Viridis", colorbar_title="Psi")
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=boundary.R,
+                y=boundary.Z,
+                mode="lines",
+                line_color="white",
+                name="Boundary",
+            )
+        )
+        fig.update_layout(yaxis_scaleanchor="x", height=600)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("No points found inside the plasma boundary.")
