@@ -76,4 +76,12 @@ with st.spinner("Calculating geometry..."):
     plotter.view_isometric()
 
     # Display in Streamlit
-    stpyvista(plotter=plotter, key="fusion_plot")
+    # Create a container for the plot
+    plot_container = st.empty()
+
+    # Clear and render the plot in the container
+    with plot_container:
+        stpyvista(
+            plotter=plotter,
+            key=f"fusion_plot_{R0}_{a}_{kappa}_{delta}_{dist}_{r_thick}_{v_thick}_{span}_{n_coils}",
+        )
