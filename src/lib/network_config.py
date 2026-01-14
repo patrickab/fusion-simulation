@@ -23,20 +23,20 @@ class HyperParams(BaseModel):
     n_train: int = N_TRAIN
     n_test: int = 32
     n_val: int = 64
-    warmup_steps: int = 100 * (N_TRAIN // BATCH_SIZE)
-    decay_steps: int = 600 * (N_TRAIN // BATCH_SIZE)
+    warmup_steps: int = 50 * (N_TRAIN // BATCH_SIZE)
+    decay_steps: int = 300 * (N_TRAIN // BATCH_SIZE)
 
 
 @struct.dataclass
 class DomainBounds(BaseModel):
     """Define physical hypercube of domain for the network."""
 
-    R0: tuple[float, float] = (1.0, 8.0)  # Major radius (m)
-    a: tuple[float, float] = (0.3, 3.0)  # Minor radius (m)
+    R0: tuple[float, float] = (5.0, 7.0)  # Major radius (m)
+    a: tuple[float, float] = (3.0, 4.0)  # Minor radius (m)
     kappa: tuple[float, float] = (1.0, 2.0)  # Elongation factor
-    delta: tuple[float, float] = (0.0, 0.6)  # Triangularity factor
+    delta: tuple[float, float] = (0.2, 0.6)  # Triangularity factor
     p0: tuple[float, float] = (1e4, 1e6)  # Central pressure (Pa)
-    F_axis: tuple[float, float] = (1.0, 50.0)  # Toroidal field function at axis (T*m)
+    F_axis: tuple[float, float] = (20.0, 60.0)  # Toroidal field function at axis (T*m)
 
     # Exponent from 1.01 for numerical stability
     alpha: tuple[float, float] = (1.01, 2.0)  # Pressure profile shape
