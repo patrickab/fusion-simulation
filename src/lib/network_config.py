@@ -72,16 +72,39 @@ class FluxInput(BaseModel):
     Z_sample: jnp.ndarray  # Shape (B, N)
     config: PlasmaConfig
 
-    def get_norm_params(self) -> dict[str, jnp.ndarray]:
-        """Normalize plasma parameters for network input."""
-        normed = normalize_plasma_config(self.config)
-        return {k: jnp.atleast_1d(v)[:, jnp.newaxis] for k, v in normed.items()}
+    def normalize_plasma_params(self) -> dict[str, jnp.ndarray]:
+        """Normalize plasma parameters and expand for broadcasting.
 
-    def normalize_coords(self, R: jnp.ndarray, Z: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """Map physical (R, Z) coordinates to normalized (r, z) space."""
-        R0_phys = jnp.atleast_1d(self.config.Geometry.R0)[:, jnp.newaxis]
-        a_phys = jnp.atleast_1d(self.config.Geometry.a)[:, jnp.newaxis]
-        return (R - R0_phys) / a_phys, Z / a_phys
+        Returns:
+            Dictionary of normalized parameters expanded to (B, 1)
+        """
+        norm_params = normalize_plasma_config(self.config)
+        # Expand each parameter to (B, 1) for broadcasting against (B, N) coordinates
+        return {k: jnp.expand_dims(v, -1) for k, v in norm_params.items()}
+
+    def normalize_coordinates(self) -> tuple[jnp.ndarray, jnp.ndarray]:
+        """Normalize R-Z coordinates to dimensionless units.
+
+        Returns:
+            Tuple of (normalized_R, normalized_Z)
+        """
+        R0_phys = jnp.expand_dims(self.config.Geometry.R0, -1)
+        a_phys = jnp.expand_dims(self.config.Geometry.a, -1)
+
+        r_n = (self.R_sample - R0_phys) / a_phys
+        z_n = self.Z_sample / a_phys
+
+        return r_n, z_n
+
+    def normalize(self) -> tuple[dict[str, jnp.ndarray], jnp.ndarray, jnp.ndarray]:
+        """Normalize both plasma parameters and coordinates.
+
+        Returns:
+            Tuple of (normalized_params_dict, normalized_R, normalized_Z)
+        """
+        norm_params = self.normalize_plasma_params()
+        r_n, z_n = self.normalize_coordinates()
+        return norm_params, r_n, z_n
 
     def get_physical_scale(self) -> jnp.ndarray:
         """Denormalization factor to map network outputs to physical psi units."""

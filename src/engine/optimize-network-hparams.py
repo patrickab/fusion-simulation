@@ -13,7 +13,7 @@ from torch.quasirandom import SobolEngine
 
 from src.engine.network import NetworkManager
 from src.lib.logger import get_logger
-from src.lib.network_config import FluxInput, HyperParams
+from src.lib.network_config import HyperParams
 
 logger = get_logger(name="HPO", log_dir="logs/hpo")
 
