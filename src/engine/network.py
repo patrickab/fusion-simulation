@@ -1,5 +1,3 @@
-from typing import Callable, Optional
-
 from flax import linen as nn
 import flax.serialization
 from flax.training import train_state
@@ -151,7 +149,7 @@ class NetworkManager:
         self.state = self._init_state()
 
         self.train_set = self.sampler._get_sobol_sample(
-            n_samples=config.n_train,
+            n_samples=self.config.n_train,
             seed=BASE_SEED,
         )
 
@@ -183,15 +181,21 @@ class NetworkManager:
         norm_params, r_n, z_n = dummy_input.normalize()
         params = self.model.init(key, r=r_n, z=z_n, **norm_params)
 
+        steps_per_epoch = self.config.n_train // self.config.batch_size
         schedule = optax.warmup_cosine_decay_schedule(
             init_value=0.0,
             peak_value=self.config.learning_rate_max,
-            warmup_steps=self.config.warmup_steps,
-            decay_steps=self.config.decay_steps,
+            warmup_steps=self.config.warmup_epochs * steps_per_epoch,
+            decay_steps=self.config.decay_epochs * steps_per_epoch,
             end_value=self.config.learning_rate_min,
         )
         tx = optax.adam(learning_rate=schedule)
         return train_state.TrainState.create(apply_fn=self.model.apply, params=params, tx=tx)
+
+    @property
+    def epochs(self) -> int:
+        """Calculate total epochs."""
+        return self.config.warmup_epochs + self.config.decay_epochs
 
     @staticmethod
     @jax.jit
@@ -222,68 +226,64 @@ class NetworkManager:
         loss, grads = jax.value_and_grad(loss_fn)(state.params)
         return state.apply_gradients(grads=grads), loss
 
+    def calculate_loss(self, inputs: FluxInput) -> float:
+        """Calculate loss for given inputs without updating state."""
+        _, loss = self.train_step(self.state, inputs)
+        return float(loss)
+
+    def train_epoch(self, epoch: int) -> float:
+        """Run one training epoch."""
+        loss = 0.0
+        for i in range(0, len(self.train_set), self.config.batch_size):
+            train_batch = self.train_set[i : i + self.config.batch_size]
+            inputs = self.sampler.sample_flux_input(
+                seed=epoch + i,
+                n_samples=self.config.n_rz_inner_samples,
+                n_boundary_samples=self.config.n_rz_boundary_samples,
+                plasma_configs=train_batch,
+            )
+            self.state, loss = self.train_step(state=self.state, inputs=inputs)
+
+        # Periodic dataset resampling
+        if epoch % 10 == 0 and epoch > 0:
+            self.train_set = self.sampler._get_sobol_sample(
+                n_samples=self.config.n_train,
+                seed=BASE_SEED + epoch,
+            )
+        return float(loss)
+
     def train(
         self,
-        validation_inputs: Optional[FluxInput] = None,
-        callback: Optional[Callable[[int, float], bool]] = None,
         save_to_disk: bool = True,
     ) -> float:
         """
         Train the model.
 
         Args:
-            validation_inputs: Optional inputs for validation loss calculation at end
-            callback: Enables early stop criterion for network hyperparameter optimization
             save_to_disk: Whether to save model params to disk after training
 
         Returns:
-            Final loss (Validation loss if inputs provided, else Training loss)
+            Final training loss
         """
-        epochs = (self.config.decay_steps + self.config.warmup_steps) // (
-            self.config.n_train // self.config.batch_size
-        )
-        logger.info(f"Starting training for {epochs} epochs...")
+        logger.info(f"Starting training for {self.epochs} epochs...")
+
         loss = 0.0
-
-        for epoch in range(epochs):
-            for i in range(0, len(self.train_set), self.config.batch_size):
-                train_batch = self.train_set[i : i + self.config.batch_size]
-                # Sample RZ points for each plasma configuration in the batch
-                inputs = self.sampler.sample_flux_input(
-                    seed=epoch + i,
-                    n_samples=self.config.n_rz_inner_samples,
-                    n_boundary_samples=self.config.n_rz_boundary_samples,
-                    plasma_configs=train_batch,
-                )
-                self.state, loss = self.train_step(state=self.state, inputs=inputs)
-
+        for epoch in range(self.epochs):
+            loss = self.train_epoch(epoch)
             if epoch % 10 == 0 and epoch > 0:
-                logger.info(f"Epoch {epoch:5d} | Loss: [bold magenta]{loss:.2f}[/bold magenta] | ")
-                self.train_set = self.sampler._get_sobol_sample(
-                    n_samples=config.n_train,
-                    seed=BASE_SEED + epoch,
-                )
-
-            if callback and callback(epoch, float(loss)):
-                logger.info(f"Training interrupted by callback at epoch {epoch}")
-                break
-
-        final_loss = float(loss)
-
-        if validation_inputs:
-            _, val_loss = self.train_step(self.state, validation_inputs)
-            final_loss = float(val_loss)
+                logger.info(f"Epoch {epoch:5d} | Loss: [bold magenta]{loss:.2f}[/bold magenta]")
 
         if save_to_disk:
             self.to_disk(params=self.state.params)
 
-        return final_loss
+        return loss
 
     def predict(self, inputs: FluxInput) -> jnp.ndarray:
         """Generate predictions for given inputs."""
         norm_params, r_n, z_n = inputs.normalize()
         psi_norm = self.model.apply(self.state.params, r=r_n, z=z_n, **norm_params)
         return psi_norm * inputs.get_physical_scale()
+
 
 if __name__ == "__main__":
     config = HyperParams()
