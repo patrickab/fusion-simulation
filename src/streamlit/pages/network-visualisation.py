@@ -197,7 +197,7 @@ with tab3:
     config = HyperParams()
     manager = NetworkManager(config)
     try:
-        params = FluxPINN.from_disk(manager.state.params)
+        params = NetworkManager.from_disk(manager.state.params)
         manager.state = manager.state.replace(params=params)
     except FileNotFoundError:
         st.warning("Model not found. Please train the model first.")
