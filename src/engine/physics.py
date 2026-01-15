@@ -41,7 +41,9 @@ def toroidal_field_flux_function(
     flux_depth = jnp.maximum(jnp.abs(PSI_EDGE - psi_axis), 1.0)
 
     psi_norm = (psi - psi_axis) / flux_depth
-    base = jnp.maximum(0.0, jnp.minimum(1.0, psi_norm))
+    # Use softplus for C-infinity continuity (smooth gradients for Shafranov operator)
+    # approximates clamp(psi_norm, 0, 1)
+    base = jax.nn.softplus(psi_norm) - jax.nn.softplus(psi_norm - 1.0)
     return F_axis * (1.0 - (base + 1e-8) ** exponent)
 
 
@@ -68,7 +70,8 @@ def pressure_profile(
     flux_depth = jnp.maximum(jnp.abs(PSI_EDGE - psi_axis), 1.0)
 
     psi_norm = (psi - psi_axis) / flux_depth
-    base = jnp.maximum(0.0, jnp.minimum(1.0, psi_norm))
+    # Use softplus for C-infinity continuity
+    base = jax.nn.softplus(psi_norm) - jax.nn.softplus(psi_norm - 1.0)
     return p0 * (1.0 - (base + 1e-8) ** alpha)
 
 
