@@ -75,10 +75,13 @@ class Sampler:
         self,
         n_samples: int,
         seed: int,
-        lower_bounds: jnp.ndarray,
-        upper_bounds: jnp.ndarray,
+        lower_bounds: jnp.ndarray | None = None,
+        upper_bounds: jnp.ndarray | None = None,
     ) -> jnp.ndarray:
         """Generate Sobol sequence samples within specified bounds."""
+        if lower_bounds is None and upper_bounds is None:
+            lower_bounds, upper_bounds = self._build_domain_bounds()
+
         sampler = qmc.Sobol(d=len(lower_bounds), scramble=True, seed=seed)
         sample_unit = jnp.array(sampler.random(n_samples), dtype=jnp.bfloat16)
         return sample_unit * (upper_bounds - lower_bounds) + lower_bounds
@@ -136,21 +139,22 @@ class Sampler:
 
         return FluxInput(R_sample=R_int, Z_sample=Z_int, config=configs)
 
-
 # --- Trainer ---
 class NetworkManager:
     def __init__(self, config: HyperParams) -> None:
         self.config = config
-        self.model = FluxPINN(hidden_dims=config.hidden_dims)
+        self.model = FluxPINN(
+            hidden_dims=config.hidden_dims,
+            fourier_features=config.fourier_features,
+            fourier_sigma=config.fourier_sigma,
+            fourier_scale=config.fourier_scale
+        )
         self.sampler: Sampler = Sampler(config)
         self.state = self._init_state()
 
-        lower_bounds, upper_bounds = self.sampler._build_domain_bounds()
         self.train_set = self.sampler._get_sobol_sample(
             n_samples=config.n_train,
             seed=BASE_SEED,
-            lower_bounds=lower_bounds,
-            upper_bounds=upper_bounds,
         )
 
     @staticmethod
@@ -255,8 +259,12 @@ class NetworkManager:
                 )
                 self.state, loss = self.train_step(state=self.state, inputs=inputs)
 
-            if epoch % 1 == 0 and epoch > 0:
+            if epoch % 10 == 0 and epoch > 0:
                 logger.info(f"Epoch {epoch:5d} | Loss: [bold magenta]{loss:.2f}[/bold magenta] | ")
+                self.train_set = self.sampler._get_sobol_sample(
+                    n_samples=config.n_train,
+                    seed=BASE_SEED + epoch,
+                )
 
             if callback and callback(epoch, float(loss)):
                 logger.info(f"Training interrupted by callback at epoch {epoch}")
@@ -279,10 +287,9 @@ class NetworkManager:
         psi_norm = self.model.apply(self.state.params, r=r_n, z=z_n, **norm_params)
         return psi_norm * inputs.get_physical_scale()
 
-
 if __name__ == "__main__":
     config = HyperParams()
     manager = NetworkManager(config)
-    manager.train()
+    manager.train(save_to_disk=True)
     # params = manager.from_disk(manager.state.params)
     # manager.state = manager.state.replace(params=params)
