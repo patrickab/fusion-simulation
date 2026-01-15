@@ -20,34 +20,27 @@ st.set_page_config(layout="wide", page_title="Plasma Geometry Lab")
 # Define a type for the geometry data
 GeometryData = Dict[str, Union[PlasmaGeometry, PlasmaState, jnp.ndarray]]
 
-# --- Sidebar Configuration ---
-with st.sidebar:
-    st.header("Configuration")
-    with st.form("sim_params"):
-        n_geoms = st.slider("Number of geometries", 1, 8, 4)
-        n_int = st.number_input("Interior Points", 100, 5000, 1024)
-        n_bound = st.number_input("Boundary Points", 50, 1000, 256)
-        seed = st.number_input("Random Seed", 0, 9999, 42)
-        st.form_submit_button("Generate Geometries")
-
-
 # --- Data Sampling Logic ---
 @st.cache_data
-def get_data(n_geoms: int, n_int: int, n_bound: int, seed: int) -> List[GeometryData]:
+def get_data(seed: int) -> List[GeometryData]:
     """Generate sampled geometry data for visualization.
 
     Args:
-        n_geoms: Number of plasma geometries to generate
-        n_int: Number of interior sampling points per geometry
-        n_bound: Number of boundary sampling points per geometry
         seed: Random seed for reproducibility
 
     Returns:
         List of dictionaries containing geometry data for each configuration
     """
-    # Create sampler instance
+    # Create sampler instance with default hyperparameters
     config = HyperParams()  # Use default hyperparameters
     sampler = Sampler(config)
+
+    # Always generate 4 geometries
+    n_geoms = 4
+
+    # Use default values from config for interior and boundary points
+    n_int = config.n_rz_inner_samples
+    n_bound = config.n_rz_boundary_samples
 
     # Get domain bounds and sample plasma configurations
     lower_bounds, upper_bounds = sampler._build_domain_bounds()
@@ -98,18 +91,22 @@ def get_data(n_geoms: int, n_int: int, n_bound: int, seed: int) -> List[Geometry
 
     return results
 
-
-data = get_data(n_geoms, n_int, n_bound, seed)
-
 # --- UI Layout ---
 st.title("Network Visualization")
 tab1, tab2, tab3 = st.tabs(["Geometry Sampling", "Model Training", "Predictions"])
 
 with tab1:
-    view_option = st.selectbox(
-        "Select Geometry View", ["Show All"] + [f"Geometry {i + 1}" for i in range(n_geoms)]
-    )
-    indices = range(n_geoms) if view_option == "Show All" else [int(view_option.split()[-1]) - 1]
+    col1, col2, col3 = st.columns([1, 1, 4])
+    with col1:
+        view_option = st.selectbox(
+            "Select Geometry View", ["Show All"] + [f"Geometry {i + 1}" for i in range(4)]
+        )
+    with col2:
+        seed = st.number_input("Random Seed", 0, 9999, 42, key="seed_input")
+
+    data = get_data(seed)
+
+    indices = range(4) if view_option == "Show All" else [int(view_option.split()[-1]) - 1]
 
     # Display Metrics for the first selected geometry
     m_cols = st.columns(6)
@@ -132,7 +129,10 @@ with tab1:
 
     # Adjust row height: Single column views need more height to match the wider container
     # while maintaining the 1:1 aspect ratio.
-    row_height = 1200 if cols == 1 else 450
+    if view_option == "Show All":
+        row_height = 600  # Increased for stretched view
+    else:
+        row_height = 1200 if cols == 1 else 450
 
     fig = make_subplots(
         rows=rows,
@@ -185,7 +185,10 @@ with tab1:
         showlegend=False,
         margin={"t": 40, "b": 40, "l": 10, "r": 10},  # Reduce margins
     )
-    st.plotly_chart(fig, width="content")
+    if view_option == "Show All":
+        st.plotly_chart(fig, width="stretch")
+    else:
+        st.plotly_chart(fig, width="content")
 
 with tab2:
     st.info("Model Training metrics and loss curves will appear here.")
