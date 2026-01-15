@@ -250,6 +250,6 @@ with tab3:
             )
         )
         fig.update_layout(yaxis_scaleanchor="x", height=600)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
     else:
         st.warning("No points found inside the plasma boundary.")
