@@ -54,20 +54,10 @@ class FluxPINN(nn.Module):
         psi_hat = nn.Dense(features=1)(x)
         return psi_hat
 
-    @staticmethod
-    def to_disk(params: jnp.ndarray) -> None:
-        """Save Flax model parameters to disk."""
-        with open(Filepaths.PINN_PATH, "wb") as f:
-            f.write(flax.serialization.to_bytes(params))
-
-    @staticmethod
-    def from_disk(target) -> any:  # noqa
-        """Load Flax model parameters from disk."""
-        with open(Filepaths.PINN_PATH, "rb") as f:
-            return flax.serialization.from_bytes(target, f.read())
 
 # --- Sampler ---
 BASE_SEED = 42
+
 
 class Sampler:
     def __init__(self, config: HyperParams) -> None:
@@ -162,6 +152,18 @@ class NetworkManager:
             lower_bounds=lower_bounds,
             upper_bounds=upper_bounds,
         )
+
+    @staticmethod
+    def to_disk(params: jnp.ndarray) -> None:
+        """Save Flax model parameters to disk."""
+        with open(Filepaths.PINN_PATH, "wb") as f:
+            f.write(flax.serialization.to_bytes(params))
+
+    @staticmethod
+    def from_disk(target) -> any:  # noqa
+        """Load Flax model parameters from disk."""
+        with open(Filepaths.PINN_PATH, "rb") as f:
+            return flax.serialization.from_bytes(target, f.read())
 
     def _init_state(self) -> train_state.TrainState:
         """Initialize the training state with dummy data."""
@@ -267,7 +269,7 @@ class NetworkManager:
             final_loss = float(val_loss)
 
         if save_to_disk:
-            self.model.to_disk(params=self.state.params)
+            self.to_disk(params=self.state.params)
 
         return final_loss
 
@@ -282,5 +284,5 @@ if __name__ == "__main__":
     config = HyperParams()
     manager = NetworkManager(config)
     manager.train()
-    # params = FluxPINN.from_disk(manager.state.params)
+    # params = manager.from_disk(manager.state.params)
     # manager.state = manager.state.replace(params=params)
