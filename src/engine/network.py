@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 import optax
 from scipy.stats import qmc
+from typing import Callable, Optional
 
 from src.engine.physics import pinn_loss_function
 from src.engine.plasma import calculate_poloidal_boundary, get_poloidal_points
@@ -218,12 +219,29 @@ class NetworkManager:
         loss, grads = jax.value_and_grad(loss_fn)(state.params)
         return state.apply_gradients(grads=grads), loss
 
-    def train(self) -> None:
-        """Train the model for specified number of epochs."""
+    def train(
+        self,
+        validation_inputs: Optional[FluxInput] = None,
+        callback: Optional[Callable[[int, float], bool]] = None,
+        save_to_disk: bool = True,
+    ) -> float:
+        """
+        Train the model.
+
+        Args:
+            validation_inputs: Optional inputs for validation loss calculation at end
+            callback: Optional function called each epoch: callback(epoch, loss) -> should_stop
+            save_to_disk: Whether to save model params to disk after training
+
+        Returns:
+            Final loss (Validation loss if inputs provided, else Training loss)
+        """
         epochs = (self.config.decay_steps + self.config.warmup_steps) // (
             self.config.n_train // self.config.batch_size
         )
         logger.info(f"Starting training for {epochs} epochs...")
+        loss = 0.0
+
         for epoch in range(epochs):
             for i in range(0, len(self.train_set), self.config.batch_size):
                 train_batch = self.train_set[i : i + self.config.batch_size]
@@ -239,7 +257,20 @@ class NetworkManager:
             if epoch % 1 == 0 and epoch > 0:
                 logger.info(f"Epoch {epoch:5d} | Loss: [bold magenta]{loss:.2f}[/bold magenta] | ")
 
-        self.model.to_disk(params=self.state.params)
+            if callback and callback(epoch, float(loss)):
+                logger.info(f"Training interrupted by callback at epoch {epoch}")
+                break
+
+        final_loss = float(loss)
+
+        if validation_inputs:
+            _, val_loss = self.train_step(self.state, validation_inputs)
+            final_loss = float(val_loss)
+
+        if save_to_disk:
+            self.model.to_disk(params=self.state.params)
+
+        return final_loss
 
     def predict(self, inputs: FluxInput) -> jnp.ndarray:
         """Generate predictions for given inputs."""
