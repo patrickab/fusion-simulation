@@ -1,5 +1,6 @@
 """Configuration module for this repository."""
 
+import pathlib
 from pathlib import Path
 from typing import Iterator, Self
 
@@ -14,11 +15,16 @@ class Filepaths:
     """
 
     ROOT = Path.cwd()
-    OUTPUT_DIR = Path(ROOT) / "data"
-    PLASMA_SURFACE = OUTPUT_DIR / "plasma_surface.ply"
-    TOROIDAL_COILS = OUTPUT_DIR / "toroidal_field_coils.ply"
-    TOROIDAL_COIL_3D_DIR = OUTPUT_DIR / "toroidal_coils_3d"
-    PINN_PATH = OUTPUT_DIR / "pinn_model"
+    DATA = Path(ROOT) / "data"
+
+    if not DATA.exists():
+        print(f"Creating output directory at {DATA}")
+        pathlib.Path.mkdir(DATA, parents=True, exist_ok=True)
+
+    PLASMA_SURFACE = DATA / "plasma_surface.ply"
+    TOROIDAL_COILS = DATA / "toroidal_field_coils.ply"
+    TOROIDAL_COIL_3D_DIR = DATA / "toroidal_coils_3d"
+    PINN_PATH = DATA / "pinn_model"
 
 
 class BaseModel:

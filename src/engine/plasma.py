@@ -157,11 +157,24 @@ def is_point_in_plasma(
 
     # 4. Interpolate Boundary Radius
     # We find the radius of the boundary at the exact angle of the test point.
+
+    # Compute boundary polar coordinates relative to magnetic axis
+    dR_boundary = boundary.R - boundary.R_center
+    dZ_boundary = boundary.Z - boundary.Z_center
+
+    r_geom = jnp.sqrt(dR_boundary**2 + dZ_boundary**2)
+    alpha_geom = jnp.arctan2(dZ_boundary, dR_boundary)
+
+    # Sort by angle to ensure valid interpolation input
+    sort_indices = jnp.argsort(alpha_geom)
+    alpha_geom = alpha_geom[sort_indices]
+    r_geom = r_geom[sort_indices]
+
     # period=2pi ensures correct wrapping for angles near -pi/pi.
     r_boundary = jnp.interp(
         alpha_test,
-        boundary.alpha_geom,
-        boundary.r_geom,
+        alpha_geom,
+        r_geom,
         period=2 * jnp.pi,
     )
 

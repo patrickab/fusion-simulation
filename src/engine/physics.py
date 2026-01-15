@@ -41,7 +41,9 @@ def toroidal_field_flux_function(
     flux_depth = jnp.maximum(jnp.abs(PSI_EDGE - psi_axis), 1.0)
 
     psi_norm = (psi - psi_axis) / flux_depth
-    base = jnp.maximum(0.0, jnp.minimum(1.0, psi_norm))
+    # Use softplus for C-infinity continuity (smooth gradients for Shafranov operator)
+    # approximates clamp(psi_norm, 0, 1)
+    base = jax.nn.softplus(psi_norm) - jax.nn.softplus(psi_norm - 1.0)
     return F_axis * (1.0 - (base + 1e-8) ** exponent)
 
 
@@ -68,7 +70,8 @@ def pressure_profile(
     flux_depth = jnp.maximum(jnp.abs(PSI_EDGE - psi_axis), 1.0)
 
     psi_norm = (psi - psi_axis) / flux_depth
-    base = jnp.maximum(0.0, jnp.minimum(1.0, psi_norm))
+    # Use softplus for C-infinity continuity
+    base = jax.nn.softplus(psi_norm) - jax.nn.softplus(psi_norm - 1.0)
     return p0 * (1.0 - (base + 1e-8) ** alpha)
 
 
@@ -101,6 +104,10 @@ def shafranov_operator(
     return d2psi_dR2 - (1.0 / R_stable) * dpsi_dR + d2psi_dZ2
 
 
+# Rematerialization trades compute for memory by recomputing activations during backprop.
+# In PINNs, high-order PDE residuals create massive graphs; remat keeps memory footprint
+# near-constant relative to depth, enabling larger networks and point batches.
+@partial(jax.checkpoint, static_argnums=0)
 def grad_shafranov_residual(
     psi_fn: callable,
     params: any,

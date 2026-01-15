@@ -27,8 +27,6 @@ def get_logger(name: str, log_dir: Optional[str] = None, level: int = logging.IN
         console=console,
         level=level,
         markup=True,
-        rich_tracebacks=True,
-        tracebacks_show_locals=True,
         show_time=False,
         show_path=False,
     )
@@ -48,6 +46,9 @@ def get_logger(name: str, log_dir: Optional[str] = None, level: int = logging.IN
         file_formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
         file_handler.setFormatter(file_formatter)
         logger.addHandler(file_handler)
+
+    # Make logger callable to prevent crashes if called directly
+    setattr(logger, "__call__", logger.info)
 
     return logger
 

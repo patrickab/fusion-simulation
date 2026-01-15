@@ -1,3 +1,5 @@
+from typing import Callable, Optional
+
 from flax import linen as nn
 import flax.serialization
 from flax.training import train_state
@@ -15,7 +17,7 @@ from src.lib.geometry_config import (
     PlasmaState,
 )
 from src.lib.logger import get_logger
-from src.lib.network_config import DomainBounds, FluxInput, HyperParams, normalize_plasma_config
+from src.lib.network_config import DomainBounds, FluxInput, HyperParams
 
 logger = get_logger(
     name="Network",
@@ -47,15 +49,10 @@ class FluxPINN(nn.Module):
 
         for dim in self.hidden_dims:
             x = nn.Dense(features=dim, dtype=jnp.bfloat16)(x)
-            x = nn.tanh(x)
+            x = nn.swish(x)
 
         psi_hat = nn.Dense(features=1)(x)
         return psi_hat
-
-    def to_disk(params, filepath: str) -> None:
-        """Save Flax model parameters to disk."""
-        with open(filepath, "wb") as f:
-            f.write(flax.serialization.to_bytes(params))
 
 
 # --- Sampler ---
@@ -68,7 +65,8 @@ class Sampler:
 
     def _build_domain_bounds(self) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Create lower and upper bounds arrays for parameter sampling."""
-        bound_names = ("R0", "a", "kappa", "delta", "p0", "F_axis", "alpha", "exponent")
+        # Get all field names from DomainBounds dataclass
+        bound_names = list(DomainBounds.__dataclass_fields__.keys())
         l_bounds = jnp.array([getattr(DomainBounds, name)[0] for name in bound_names])
         u_bounds = jnp.array([getattr(DomainBounds, name)[1] for name in bound_names])
         return l_bounds, u_bounds
@@ -77,10 +75,13 @@ class Sampler:
         self,
         n_samples: int,
         seed: int,
-        lower_bounds: jnp.ndarray,
-        upper_bounds: jnp.ndarray,
+        lower_bounds: jnp.ndarray | None = None,
+        upper_bounds: jnp.ndarray | None = None,
     ) -> jnp.ndarray:
         """Generate Sobol sequence samples within specified bounds."""
+        if lower_bounds is None and upper_bounds is None:
+            lower_bounds, upper_bounds = self._build_domain_bounds()
+
         sampler = qmc.Sobol(d=len(lower_bounds), scramble=True, seed=seed)
         sample_unit = jnp.array(sampler.random(n_samples), dtype=jnp.bfloat16)
         return sample_unit * (upper_bounds - lower_bounds) + lower_bounds
@@ -140,20 +141,31 @@ class Sampler:
 
 
 # --- Trainer ---
-class PINNTrainer:
+class NetworkManager:
     def __init__(self, config: HyperParams) -> None:
         self.config = config
-        self.model = FluxPINN(hidden_dims=config.hidden_dims)
+        self.model = FluxPINN(
+            hidden_dims=config.hidden_dims,
+        )
         self.sampler: Sampler = Sampler(config)
         self.state = self._init_state()
 
-        lower_bounds, upper_bounds = self.sampler._build_domain_bounds()
         self.train_set = self.sampler._get_sobol_sample(
             n_samples=config.n_train,
             seed=BASE_SEED,
-            lower_bounds=lower_bounds,
-            upper_bounds=upper_bounds,
         )
+
+    @staticmethod
+    def to_disk(params: jnp.ndarray) -> None:
+        """Save Flax model parameters to disk."""
+        with open(Filepaths.PINN_PATH, "wb") as f:
+            f.write(flax.serialization.to_bytes(params))
+
+    @staticmethod
+    def from_disk(target) -> any:  # noqa
+        """Load Flax model parameters from disk."""
+        with open(Filepaths.PINN_PATH, "rb") as f:
+            return flax.serialization.from_bytes(target, f.read())
 
     def _init_state(self) -> train_state.TrainState:
         """Initialize the training state with dummy data."""
@@ -168,8 +180,7 @@ class PINNTrainer:
         dummy_config = PlasmaConfig(Geometry=geom, Boundary=boundary, State=state)
         dummy_input = FluxInput(R_sample=d_rz, Z_sample=d_rz, config=dummy_config)
 
-        norm_params = dummy_input.get_norm_params()
-        r_n, z_n = dummy_input.normalize_coords(dummy_input.R_sample, dummy_input.Z_sample)
+        norm_params, r_n, z_n = dummy_input.normalize()
         params = self.model.init(key, r=r_n, z=z_n, **norm_params)
 
         schedule = optax.warmup_cosine_decay_schedule(
@@ -191,10 +202,14 @@ class PINNTrainer:
         """Perform a single training step using physics-informed gradients."""
 
         def loss_fn(params: any) -> jnp.ndarray:
+            # Rematerialization trades compute for memory by recomputing activations during backprop
+            # In PINNs, high-order PDE residuals create massive graphs; remat keeps memory footprint
+            # near-constant relative to depth, enabling larger networks and point batches.
+            @jax.checkpoint
             def psi_fn(p: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
-                # Map physical (R, Z) to normalized network input
-                r_n, z_n = (R - cfg.Geometry.R0) / cfg.Geometry.a, Z / cfg.Geometry.a
-                p_n = normalize_plasma_config(cfg)
+                # Map physical (R, Z) to normalized network input using FluxInput
+                inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
+                p_n, r_n, z_n = inp.normalize()
                 psi_n = state.apply_fn(p, r=r_n, z=z_n, **p_n)
 
                 # Denormalize output: psi = psi_net * (F_axis * a)
@@ -207,10 +222,29 @@ class PINNTrainer:
         loss, grads = jax.value_and_grad(loss_fn)(state.params)
         return state.apply_gradients(grads=grads), loss
 
-    def train(self) -> None:
-        """Train the model for specified number of epochs."""
-        epochs = self.config.decay_steps + self.config.warmup_steps
+    def train(
+        self,
+        validation_inputs: Optional[FluxInput] = None,
+        callback: Optional[Callable[[int, float], bool]] = None,
+        save_to_disk: bool = True,
+    ) -> float:
+        """
+        Train the model.
+
+        Args:
+            validation_inputs: Optional inputs for validation loss calculation at end
+            callback: Enables early stop criterion for network hyperparameter optimization
+            save_to_disk: Whether to save model params to disk after training
+
+        Returns:
+            Final loss (Validation loss if inputs provided, else Training loss)
+        """
+        epochs = (self.config.decay_steps + self.config.warmup_steps) // (
+            self.config.n_train // self.config.batch_size
+        )
         logger.info(f"Starting training for {epochs} epochs...")
+        loss = 0.0
+
         for epoch in range(epochs):
             for i in range(0, len(self.train_set), self.config.batch_size):
                 train_batch = self.train_set[i : i + self.config.batch_size]
@@ -223,20 +257,37 @@ class PINNTrainer:
                 )
                 self.state, loss = self.train_step(state=self.state, inputs=inputs)
 
-            if epoch % 1 == 0 and epoch > 0:
+            if epoch % 10 == 0 and epoch > 0:
                 logger.info(f"Epoch {epoch:5d} | Loss: [bold magenta]{loss:.2f}[/bold magenta] | ")
+                self.train_set = self.sampler._get_sobol_sample(
+                    n_samples=config.n_train,
+                    seed=BASE_SEED + epoch,
+                )
 
-        self.model.to_disk(params=self.state.params, filepath=Filepaths.PINN_PATH)
+            if callback and callback(epoch, float(loss)):
+                logger.info(f"Training interrupted by callback at epoch {epoch}")
+                break
+
+        final_loss = float(loss)
+
+        if validation_inputs:
+            _, val_loss = self.train_step(self.state, validation_inputs)
+            final_loss = float(val_loss)
+
+        if save_to_disk:
+            self.to_disk(params=self.state.params)
+
+        return final_loss
 
     def predict(self, inputs: FluxInput) -> jnp.ndarray:
         """Generate predictions for given inputs."""
-        norm_params = inputs.get_norm_params()
-        r_n, z_n = inputs.normalize_coords(inputs.R_sample, inputs.Z_sample)
+        norm_params, r_n, z_n = inputs.normalize()
         psi_norm = self.model.apply(self.state.params, r=r_n, z=z_n, **norm_params)
         return psi_norm * inputs.get_physical_scale()
 
-
 if __name__ == "__main__":
     config = HyperParams()
-    trainer = PINNTrainer(config)
-    trainer.train()
+    manager = NetworkManager(config)
+    manager.train(save_to_disk=True)
+    # params = manager.from_disk(manager.state.params)
+    # manager.state = manager.state.replace(params=params)
