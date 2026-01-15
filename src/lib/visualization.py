@@ -171,39 +171,33 @@ def render_plasma_boundary(
     """
     plotter.add_title("2D Poloidal Cross-Section", font_size=16, color="white")
 
-    ROTATION_ANGLE = np.deg2rad(90.0)
     COIL_BOUNDARIES = [
         (toroidal_coil_2d.R_inner, toroidal_coil_2d.Z_inner, "Inner"),
         (toroidal_coil_2d.R_outer, toroidal_coil_2d.Z_outer, "Outer"),
         (toroidal_coil_2d.R_center, toroidal_coil_2d.Z_center, "Center"),
     ]
 
-    plasma_points_3d = convert_rz_to_xyz(
-        R=plasma_boundary.R,
-        Z=plasma_boundary.Z,
-        phi=ROTATION_ANGLE,
-    )
-
-    # Add plasma boundary (2D poloidal cross-section)
+    # Plot plasma boundary directly in 2D (R-Z plane)
     plotter.add_lines(
-        np.column_stack(plasma_points_3d),
+        np.column_stack((plasma_boundary.R, plasma_boundary.Z, np.zeros_like(plasma_boundary.R))),
         color="cyan",
         width=2,
         label="Plasma Boundary",
     )
 
-    # Add all toroidal coil boundaries
+    # Add all toroidal coil boundaries in 2D
     for R_coil, Z_coil, boundary_type in COIL_BOUNDARIES:
-        coil_points_3d = convert_rz_to_xyz(R=R_coil, Z=Z_coil, phi=ROTATION_ANGLE)
         plotter.add_lines(
-            np.column_stack(coil_points_3d),
+            np.column_stack((R_coil, Z_coil, np.zeros_like(R_coil))),
             color="purple",
             width=2,
             label=f"Toroidal Coil {boundary_type} Boundary",
         )
 
-    plotter.camera_position = "iso"
-
+    # Set up 2D view
+    plotter.camera_position = "xy"
+    plotter.show_grid()
+    plotter.add_axes(line_width=2, xlabel="R (m)", ylabel="Z (m)")
 
 def render_fusion_plasma(
     fusion_plasma: Path | FusionPlasma | pv.PolyData,
