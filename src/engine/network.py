@@ -66,10 +66,8 @@ class FluxPINN(nn.Module):
         with open(Filepaths.PINN_PATH, "rb") as f:
             return flax.serialization.from_bytes(target, f.read())
 
-
 # --- Sampler ---
 BASE_SEED = 42
-
 
 class Sampler:
     def __init__(self, config: HyperParams) -> None:
@@ -77,7 +75,8 @@ class Sampler:
 
     def _build_domain_bounds(self) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Create lower and upper bounds arrays for parameter sampling."""
-        bound_names = ("R0", "a", "kappa", "delta", "p0", "F_axis", "alpha", "exponent")
+        # Get all field names from DomainBounds dataclass
+        bound_names = list(DomainBounds.__dataclass_fields__.keys())
         l_bounds = jnp.array([getattr(DomainBounds, name)[0] for name in bound_names])
         u_bounds = jnp.array([getattr(DomainBounds, name)[1] for name in bound_names])
         return l_bounds, u_bounds
