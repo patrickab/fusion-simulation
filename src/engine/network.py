@@ -1,3 +1,5 @@
+from typing import Callable, Optional
+
 from flax import linen as nn
 import flax.serialization
 from flax.training import train_state
@@ -5,7 +7,6 @@ import jax
 import jax.numpy as jnp
 import optax
 from scipy.stats import qmc
-from typing import Callable, Optional
 
 from src.engine.physics import pinn_loss_function
 from src.engine.plasma import calculate_poloidal_boundary, get_poloidal_points
@@ -16,7 +17,7 @@ from src.lib.geometry_config import (
     PlasmaState,
 )
 from src.lib.logger import get_logger
-from src.lib.network_config import DomainBounds, FluxInput, HyperParams, normalize_plasma_config
+from src.lib.network_config import DomainBounds, FluxInput, HyperParams
 
 logger = get_logger(
     name="Network",
@@ -60,7 +61,7 @@ class FluxPINN(nn.Module):
             f.write(flax.serialization.to_bytes(params))
 
     @staticmethod
-    def from_disk(target) -> any:
+    def from_disk(target) -> any:  # noqa
         """Load Flax model parameters from disk."""
         with open(Filepaths.PINN_PATH, "rb") as f:
             return flax.serialization.from_bytes(target, f.read())
@@ -176,8 +177,7 @@ class NetworkManager:
         dummy_config = PlasmaConfig(Geometry=geom, Boundary=boundary, State=state)
         dummy_input = FluxInput(R_sample=d_rz, Z_sample=d_rz, config=dummy_config)
 
-        norm_params = dummy_input.get_norm_params()
-        r_n, z_n = dummy_input.normalize_coords(dummy_input.R_sample, dummy_input.Z_sample)
+        norm_params, r_n, z_n = dummy_input.normalize()
         params = self.model.init(key, r=r_n, z=z_n, **norm_params)
 
         schedule = optax.warmup_cosine_decay_schedule(
@@ -204,9 +204,9 @@ class NetworkManager:
             # near-constant relative to depth, enabling larger networks and point batches.
             @jax.checkpoint
             def psi_fn(p: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
-                # Map physical (R, Z) to normalized network input
-                r_n, z_n = (R - cfg.Geometry.R0) / cfg.Geometry.a, Z / cfg.Geometry.a
-                p_n = normalize_plasma_config(cfg)
+                # Map physical (R, Z) to normalized network input using FluxInput
+                inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
+                p_n, r_n, z_n = inp.normalize()
                 psi_n = state.apply_fn(p, r=r_n, z=z_n, **p_n)
 
                 # Denormalize output: psi = psi_net * (F_axis * a)
@@ -230,7 +230,7 @@ class NetworkManager:
 
         Args:
             validation_inputs: Optional inputs for validation loss calculation at end
-            callback: Optional function called each epoch: callback(epoch, loss) -> should_stop
+            callback: Enables early stop criterion for network hyperparameter optimization
             save_to_disk: Whether to save model params to disk after training
 
         Returns:
@@ -274,8 +274,7 @@ class NetworkManager:
 
     def predict(self, inputs: FluxInput) -> jnp.ndarray:
         """Generate predictions for given inputs."""
-        norm_params = inputs.get_norm_params()
-        r_n, z_n = inputs.normalize_coords(inputs.R_sample, inputs.Z_sample)
+        norm_params, r_n, z_n = inputs.normalize()
         psi_norm = self.model.apply(self.state.params, r=r_n, z=z_n, **norm_params)
         return psi_norm * inputs.get_physical_scale()
 
