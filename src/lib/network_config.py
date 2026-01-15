@@ -23,8 +23,8 @@ class HyperParams(BaseModel):
     n_train: int = N_TRAIN
     n_test: int = 32
     n_val: int = 64
-    warmup_steps: int = 100 * (N_TRAIN // BATCH_SIZE)
-    decay_steps: int = 500 * (N_TRAIN // BATCH_SIZE)
+    warmup_epochs: int = 100
+    decay_epochs: int = 500
 
 
 @struct.dataclass

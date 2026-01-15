@@ -1,3 +1,8 @@
+import os
+
+# Set JAX memory preallocation to false to allow co-existence with PyTorch
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+
 import sys
 
 from botorch.acquisition import qMaxValueEntropy
@@ -13,12 +18,13 @@ from torch.quasirandom import SobolEngine
 
 from src.engine.network import NetworkManager
 from src.lib.logger import get_logger
-from src.lib.network_config import HyperParams
+from src.lib.network_config import BATCH_SIZE, N_TRAIN, HyperParams
 
 logger = get_logger(name="HPO", log_dir="logs/hpo")
 
 # Registry for early stopping: {epoch_milestone: best_loss_at_milestone}
 EARLY_STOP_THRESHOLD = 2.0  # N times worse
+N_INIT_SAMPLES = 1
 
 
 class SearchSpace:
@@ -56,19 +62,20 @@ class SearchSpace:
         )
         width = int(torch.round(10 ** (log_w_min + x[1] * (log_w_max - log_w_min))).item())
 
-        # 2. Learning Rate (Linear interpolation on original scale as requested)
-        lr = (
-            cls.learning_rate_max[0] + x[2] * (cls.learning_rate_max[1] - cls.learning_rate_max[0])
-        ).item()
+        log_lr_min, log_lr_max = (
+            np.log10(cls.learning_rate_max[0]),
+            np.log10(cls.learning_rate_max[1]),
+        )
+        lr = float(10 ** (log_lr_min + x[2].item() * (log_lr_max - log_lr_min)))
 
         return HyperParams(
             hidden_dims=tuple([width] * depth),
             learning_rate_max=lr,
             learning_rate_min=lr * 0.01,
-            warmup_steps=100,
-            decay_steps=500,
-            n_train=1024,
-            batch_size=128,
+            warmup_epochs=10,
+            decay_epochs=50,
+            n_train=N_TRAIN,
+            batch_size=BATCH_SIZE,
         )
 
 
@@ -80,7 +87,9 @@ def check_max_capacity(ss: SearchSpace) -> None:
     logger.info("Executing capacity check (largest architecture)...")
     try:
         # Use upper bounds to generate max configuration
-        max_config = ss.to_hyperparams(ss.bounds[1])
+        # Convert PyTorch tensor to numpy array to avoid JAX tracing issues
+        max_bounds = ss.bounds[1].cpu().numpy()
+        max_config = ss.to_hyperparams(torch.tensor(max_bounds, dtype=torch.double))
 
         manager = NetworkManager(max_config)
         train_batch = manager.train_set[0 : max_config.batch_size]
@@ -97,8 +106,8 @@ def check_max_capacity(ss: SearchSpace) -> None:
         logger.info(
             f"Capacity check passed for: {len(max_config.hidden_dims)}x{max_config.hidden_dims[0]}"
         )
-    except Exception as e:
-        logger.error(f"CRITICAL: Capacity check failed for max architecture. Error: {e}")
+    except Exception:
+        logger.exception("CRITICAL: Capacity check failed for max architecture.")
         sys.exit(1)
 
 
@@ -108,26 +117,11 @@ def optimize_hyperparameters() -> HyperParams:
     # 1. Capacity Check
     check_max_capacity(ss)
 
-    # 2. Setup fixed validation set
-    dummy_manager = NetworkManager(HyperParams())
-    l_bounds, u_bounds = dummy_manager.sampler._build_domain_bounds()
-    val_configs = dummy_manager.sampler._get_sobol_sample(
-        n_samples=128, seed=42, lower_bounds=l_bounds, upper_bounds=u_bounds
-    )
-    val_inputs = dummy_manager.sampler.sample_flux_input(
-        seed=123,
-        n_samples=HyperParams().n_rz_inner_samples,
-        n_boundary_samples=HyperParams().n_rz_boundary_samples,
-        plasma_configs=val_configs,
-    )
-    del dummy_manager
-    jax.clear_caches()
-
     # Local state for pruning
-    milestone_best_loss = {}
+    best_loss = []
 
     def eval_trial(x: torch.Tensor) -> torch.Tensor:
-        """Trains the network and returns negative validation loss."""
+        """Trains the network and returns negative final loss."""
         config = ss.to_hyperparams(x)
         logger.info(
             f"Evaluating: depth={len(config.hidden_dims)}, width={config.hidden_dims[0]}, "
@@ -136,63 +130,51 @@ def optimize_hyperparameters() -> HyperParams:
 
         try:
             manager = NetworkManager(config)
-            epochs = config.decay_steps + config.warmup_steps
-
-            def prune_callback(epoch: int, loss: float) -> bool:
-                # Intermediate Reporting & Early Stop logic
-                if epoch % 50 == 0:
-                    milestone = epoch
-                    logger.info(f"Epoch {milestone} | Train Loss: {loss:.2f}")
-
-                    if milestone not in milestone_best_loss:
-                        milestone_best_loss[milestone] = loss
-                    else:
-                        best_seen = milestone_best_loss[milestone]
-                        halfway = max(1, epochs // 2)
-                        if (
-                            loss > EARLY_STOP_THRESHOLD * best_seen
-                            and epoch % halfway != 0
-                            and epoch != 0
-                        ):
-                            logger.warning(
-                                f"Early stopping trial at epoch {milestone}. "
-                                f"Loss {loss:.4f} is > {EARLY_STOP_THRESHOLD}x "
-                                f"best seen {best_seen:.4f}"
-                            )
-                            return True  # Stop training
-
-                        if loss < best_seen:
-                            milestone_best_loss[milestone] = loss
-                return False
+            epochs = manager.epochs
+            halfway = max(1, epochs // 2)
 
             logger.info(f"Starting trial training for {epochs} epochs...")
 
-            # Train and get final loss (validation loss because we pass val_inputs)
-            val_loss = manager.train(
-                validation_inputs=val_inputs,
-                callback=prune_callback,
-                save_to_disk=False,
-            )
+            for epoch in range(epochs):
+                loss = manager.train_epoch(epoch)
+
+                if best_loss == []:
+                    best_loss.append(loss)
+
+                # Early Stop / Pruning Logic
+                if epoch % 10 == 0:
+                    logger.info(f"Epoch {epoch} | Train Loss: {loss:.2f}")
+
+                if epoch == halfway and loss > EARLY_STOP_THRESHOLD * best_loss[0]:
+                    logger.warning(
+                        f"Early stopping trial at halfway ({halfway}). "
+                        f"Loss {loss:.4f} is > {EARLY_STOP_THRESHOLD}x "
+                        f"best seen {best_loss[0]:.4f}"
+                    )
+                    # Return early with current (potentially bad) loss
+                    return -torch.tensor([float(loss)], dtype=torch.double)
 
             jax.clear_caches()
-            return -torch.tensor([float(val_loss)], dtype=torch.double)
+            if loss < best_loss[0]:
+                best_loss[0] = loss
+            return -torch.tensor([float(loss)], dtype=torch.double)
 
         except Exception:
             logger.exception("Trial failed due to an unexpected error")
-            return torch.tensor([-10.0], dtype=torch.double)
+            raise
 
     # 3. Initial Sampling
-    n_init = 5
     sobol = SobolEngine(dimension=ss.bounds.shape[1], scramble=True, seed=0)
-    train_x = ss.bounds[0] + sobol.draw(n_init).to(torch.double) * (ss.bounds[1] - ss.bounds[0])
+    train_x = ss.bounds[0] + sobol.draw(N_INIT_SAMPLES).to(torch.double) * (
+        ss.bounds[1] - ss.bounds[0]
+    )
 
-    logger.info(f"Running {n_init} initial trials...")
+    logger.info(f"Running {N_INIT_SAMPLES} initial trials...")
     train_y = torch.cat([eval_trial(x) for x in train_x]).unsqueeze(-1)
 
     # 4. BO Loop
-    n_iterations = 15
-    for i in range(n_iterations):
-        logger.info(f"\n--- BO Iteration {i + 1}/{n_iterations} ---")
+    for i in range(N_OPTIMIZATION_STEPS):
+        logger.info(f"\n--- BO Iteration {i + 1}/{N_OPTIMIZATION_STEPS} ---")
 
         # Standardize outcomes internally for GP numerical stability and better prior matching
         model = SingleTaskGP(train_x, train_y, outcome_transform=Standardize(m=1))
@@ -231,10 +213,10 @@ if __name__ == "__main__":
             learning_rate_max=optimal_hparams.learning_rate_max,
             learning_rate_min=optimal_hparams.learning_rate_min,
             hidden_dims=optimal_hparams.hidden_dims,
-            warmup_steps=200,
-            decay_steps=1000,
+            warmup_epochs=200,
+            decay_epochs=1000,
         )
-        nn_manager = NetworkManager(optimal_hparams)
+        nn_manager = NetworkManager(hyperparams)
         nn_manager.train()
     except KeyboardInterrupt:
         logger.info("\n[bold red]Optimization interrupted by user. Cleaning up...[/bold red]")
