@@ -139,15 +139,13 @@ class Sampler:
 
         return FluxInput(R_sample=R_int, Z_sample=Z_int, config=configs)
 
+
 # --- Trainer ---
 class NetworkManager:
     def __init__(self, config: HyperParams) -> None:
         self.config = config
         self.model = FluxPINN(
             hidden_dims=config.hidden_dims,
-            fourier_features=config.fourier_features,
-            fourier_sigma=config.fourier_sigma,
-            fourier_scale=config.fourier_scale
         )
         self.sampler: Sampler = Sampler(config)
         self.state = self._init_state()

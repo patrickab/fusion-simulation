@@ -23,8 +23,8 @@ class HyperParams(BaseModel):
     n_train: int = N_TRAIN
     n_test: int = 32
     n_val: int = 64
-    warmup_steps: int = 200 * (N_TRAIN // BATCH_SIZE)
-    decay_steps: int = 1000 * (N_TRAIN // BATCH_SIZE)
+    warmup_steps: int = 100 * (N_TRAIN // BATCH_SIZE)
+    decay_steps: int = 500 * (N_TRAIN // BATCH_SIZE)
 
 
 @struct.dataclass
@@ -49,20 +49,6 @@ def min_max_scale(val: jnp.ndarray, bounds: tuple[float, float]) -> jnp.ndarray:
     return 2.0 * (val - min_v) / (max_v - min_v) - 1.0
 
 
-def normalize_plasma_config(config: PlasmaConfig) -> dict[str, jnp.ndarray]:
-    """Normalize plasma parameters for network input."""
-    return {
-        "r0": min_max_scale(config.Geometry.R0, DomainBounds.R0),
-        "a": min_max_scale(config.Geometry.a, DomainBounds.a),
-        "kappa": min_max_scale(config.Geometry.kappa, DomainBounds.kappa),
-        "delta": min_max_scale(config.Geometry.delta, DomainBounds.delta),
-        "p0": min_max_scale(config.State.p0, DomainBounds.p0),
-        "f_axis": min_max_scale(config.State.F_axis, DomainBounds.F_axis),
-        "alpha": min_max_scale(config.State.pressure_alpha, DomainBounds.alpha),
-        "exponent": min_max_scale(config.State.field_exponent, DomainBounds.exponent),
-    }
-
-
 # --- B. Physics Containers (JAX Pytrees) ---
 @struct.dataclass
 class FluxInput(BaseModel):
@@ -78,7 +64,17 @@ class FluxInput(BaseModel):
         Returns:
             Dictionary of normalized parameters expanded to (B, 1)
         """
-        norm_params = normalize_plasma_config(self.config)
+        norm_params = {
+            "r0": min_max_scale(self.config.Geometry.R0, DomainBounds.R0),
+            "a": min_max_scale(self.config.Geometry.a, DomainBounds.a),
+            "kappa": min_max_scale(self.config.Geometry.kappa, DomainBounds.kappa),
+            "delta": min_max_scale(self.config.Geometry.delta, DomainBounds.delta),
+            "p0": min_max_scale(self.config.State.p0, DomainBounds.p0),
+            "f_axis": min_max_scale(self.config.State.F_axis, DomainBounds.F_axis),
+            "alpha": min_max_scale(self.config.State.pressure_alpha, DomainBounds.alpha),
+            "exponent": min_max_scale(self.config.State.field_exponent, DomainBounds.exponent),
+        }
+
         # Expand each parameter to (B, 1) for broadcasting against (B, N) coordinates
         return {k: jnp.expand_dims(v, -1) for k, v in norm_params.items()}
 
