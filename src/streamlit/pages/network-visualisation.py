@@ -3,9 +3,14 @@ from typing import Dict, List, Union
 import jax.numpy as jnp
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from stpyvista import stpyvista
 
-from src.engine.network import FluxPINN, NetworkManager, Sampler
-from src.engine.plasma import calculate_poloidal_boundary, is_point_in_plasma
+from src.engine.network import NetworkManager, Sampler
+from src.engine.plasma import (
+    calculate_fusion_plasma,
+    calculate_poloidal_boundary,
+    is_point_in_plasma,
+)
 from src.lib.geometry_config import (
     CylindricalCoordinates,
     PlasmaConfig,
@@ -13,12 +18,26 @@ from src.lib.geometry_config import (
     PlasmaState,
 )
 from src.lib.network_config import FluxInput, HyperParams
+from src.lib.utils import _plasma_to_polydata
+from src.lib.visualization import (
+    initialize_plotter,
+    render_fusion_plasma,
+)
+from src.streamlit.utils import generate_field_lines, reactor_config_sidebar
+from src.toroidal_geometry import (
+    calculate_toroidal_coil_boundary,
+    generate_toroidal_coils_3d,
+)
 import streamlit as st
 
 st.set_page_config(layout="wide", page_title="Plasma Geometry Lab")
 
+# Get custom geometry from sidebar
+custom_geom, custom_coil_config = reactor_config_sidebar()
+
 # Define a type for the geometry data
 GeometryData = Dict[str, Union[PlasmaGeometry, PlasmaState, jnp.ndarray]]
+
 
 # --- Data Sampling Logic ---
 @st.cache_data
@@ -91,9 +110,12 @@ def get_data(seed: int) -> List[GeometryData]:
 
     return results
 
+
 # --- UI Layout ---
 st.title("Network Visualization")
-tab1, tab2, tab3 = st.tabs(["Geometry Sampling", "Model Training", "Predictions"])
+tab1, tab2, tab3, tab4 = st.tabs(
+    ["Geometry Sampling", "Model Training", "Predictions", "3D Visualization"]
+)
 
 with tab1:
     col1, col2, col3 = st.columns([1, 1, 4])
@@ -256,3 +278,90 @@ with tab3:
         st.plotly_chart(fig, width="stretch")
     else:
         st.warning("No points found inside the plasma boundary.")
+
+with tab4:
+    st.header("3D Magnetic Field Visualization (PyVista)")
+
+    # Load Model
+    config_params = HyperParams()
+    manager = NetworkManager(config_params)
+    try:
+        params = NetworkManager.from_disk(manager.state.params)
+        manager.state = manager.state.replace(params=params)
+    except FileNotFoundError:
+        st.warning("Model not found. Please train the model first.")
+        st.stop()
+
+    # Configuration
+    col1, col2 = st.columns(2)
+    with col1:
+        use_custom = st.checkbox("Use Custom Geometry from Sidebar", value=False)
+        idx_pv = st.slider(
+            "Select Sample",
+            0,
+            len(manager.train_set) - 1,
+            0,
+            key="idx_pv_slider",
+            disabled=use_custom,
+        )
+    with col2:
+        n_lines_pv = st.slider("Number of Field Lines", 1, 30, 10, key="n_lines_pv_slider")
+
+    # Reconstruct Plasma Config
+    if use_custom:
+        geom_pv = custom_geom
+        state_pv = PlasmaState(p0=1e5, F_axis=5.0, pressure_alpha=2.0, field_exponent=1.0)
+        coil_config = custom_coil_config
+    else:
+        p_pv = manager.train_set[idx_pv]
+        geom_pv = PlasmaGeometry(R0=p_pv[0], a=p_pv[1], kappa=p_pv[2], delta=p_pv[3])
+        state_pv = PlasmaState(
+            p0=p_pv[4],
+            F_axis=p_pv[5],
+            pressure_alpha=p_pv[6],
+            field_exponent=p_pv[7],
+        )
+        coil_config = custom_coil_config
+
+    boundary_pv = calculate_poloidal_boundary(jnp.linspace(0, 2 * jnp.pi, 128), geom_pv)
+    plasma_config_pv = PlasmaConfig(Geometry=geom_pv, Boundary=boundary_pv, State=state_pv)
+
+    # 1. Create Fusion Plasma Surface
+    fusion_plasma = calculate_fusion_plasma(boundary_pv)
+    plasma_mesh = _plasma_to_polydata(fusion_plasma)
+
+    # 2. Generate Field Lines from PINN - Use Cartesian method directly
+    pts = plasma_mesh.points  # Already in Cartesian (X, Y, Z)
+    X_mesh = jnp.array(pts[:, 0])
+    Y_mesh = jnp.array(pts[:, 1])
+    Z_mesh = jnp.array(pts[:, 2])
+
+    # Get B-field directly in Cartesian coordinates
+    B_cartesian = manager.get_b_field_cartesian(
+        X=X_mesh, Y=Y_mesh, Z=Z_mesh, config=plasma_config_pv
+    )
+
+    streamlines = generate_field_lines(plasma_mesh, n_lines_pv, B_field=B_cartesian)
+
+    # 3. Generate Toroidal Coils
+    coil_2d = calculate_toroidal_coil_boundary(
+        jnp.linspace(0, 2 * jnp.pi, 64), geom_pv, coil_config
+    )
+    coils_3d = generate_toroidal_coils_3d(coil_2d, coil_config)
+
+    # 4. Plotting with PyVista
+    plotter = initialize_plotter()
+
+    render_fusion_plasma(
+        plotter=plotter,
+        fusion_plasma=fusion_plasma,
+        toroidal_coils=coils_3d,
+        show_wireframe=False,
+    )
+
+    # Add field lines
+    plotter.add_mesh(streamlines, color="white", line_width=2, name="field_lines")
+    plotter.view_isometric()
+
+    # Render in Streamlit
+    stpyvista(plotter, key=f"pv_reactor_{idx_pv}_{n_lines_pv}_{use_custom}")

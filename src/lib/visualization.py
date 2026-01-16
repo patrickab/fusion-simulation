@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import Optional
 
+import jax.numpy as jnp
 import numpy as np
 import pyvista as pv
 
@@ -11,6 +12,7 @@ from src.lib.config import Filepaths
 from src.lib.geometry_config import (
     FusionPlasma,
     PlasmaBoundary,
+    PlasmaConfig,
     PlasmaGeometry,
     RotationalAngles,
     ToroidalCoil2D,
@@ -198,6 +200,73 @@ def render_plasma_boundary(
     plotter.camera_position = "xy"
     plotter.show_grid()
     plotter.add_axes(line_width=2, xlabel="R (m)", ylabel="Z (m)")
+
+
+def render_magnetic_field_lines(
+    plotter: pv.Plotter,
+    network_manager: any,  # Typed as 'any' to avoid circular import with engine
+    config: PlasmaConfig,
+    n_lines: int = 50,
+) -> None:
+    """Trace and visualize 3D magnetic field lines using the neural network."""
+
+    # 1. Define a sampling volume around the plasma
+    # We use a structured grid to sample the B-field for the integrator
+    R0 = float(config.Geometry.R0)
+    a = float(config.Geometry.a)
+    kappa = float(config.Geometry.kappa)
+
+    # Bounds: X/Y within major radius + minor radius, Z within elongation
+    extent = R0 + a + 1.0
+    z_extent = (a * kappa) + 1.0
+
+    # Create a coarse grid for the vector field (VTK will interpolate)
+    grid = pv.ImageData(
+        dimensions=(30, 30, 30),
+        spacing=(2 * extent / 29, 2 * extent / 29, 2 * z_extent / 29),
+        origin=(-extent, -extent, -z_extent),
+    )
+
+    # 2. Calculate B-field at grid points
+    points = grid.points
+    X, Y, Z = points[:, 0], points[:, 1], points[:, 2]
+
+    # Convert to JAX arrays
+    X_j, Y_j, Z_j = jnp.array(X), jnp.array(Y), jnp.array(Z)
+
+    # Query network for Cartesian B-vectors
+    vectors = network_manager.get_b_field_cartesian(X_j, Y_j, Z_j, config)
+
+    # Assign vectors to grid
+    grid["B_field"] = np.array(vectors)
+    grid.set_active_vectors("B_field")
+
+    # 3. Generate Seed Points for Streamlines
+    # We seed points along the midplane major radius to catch nested flux surfaces
+    seed_line = pv.Line(
+        pointa=(R0 - a * 0.9, 0, 0), pointb=(R0 + a * 0.9, 0, 0), resolution=n_lines
+    )
+
+    # 4. Integrate Streamlines
+    streamlines = grid.streamlines_from_source(
+        seed_line,
+        integration_direction="both",
+        max_time=1000.0,  # Allow long lines to wrap around torus
+        n_points=2000,
+        integrator_type=45,  # Runge-Kutta 45
+    )
+
+    # 5. Plot
+    plotter.add_mesh(
+        streamlines,
+        render_lines_as_tubes=True,
+        line_width=2,
+        cmap="plasma",
+        opacity=0.8,
+        name="Magnetic Field Lines",
+        lighting=False,
+    )
+
 
 def render_fusion_plasma(
     fusion_plasma: Path | FusionPlasma | pv.PolyData,

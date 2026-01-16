@@ -284,6 +284,92 @@ class NetworkManager:
         psi_norm = self.model.apply(self.state.params, r=r_n, z=z_n, **norm_params)
         return psi_norm * inputs.get_physical_scale()
 
+    def get_b_field(self, R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig) -> jnp.ndarray:
+        """Calculate magnetic field from flux function via Grad-Shafranov equilibrium.
+
+        Theory: B = ∇ψ * ∇φ + F(ψ)∇φ in axisymmetric geometry
+        Yields: B_R = -(1/R)∂ψ/∂Z, B_Z = (1/R)∂ψ/∂R, B_φ = F(ψ)/R
+
+        Args:
+            R: Major radial coordinates [m]
+            Z: Vertical coordinates [m]
+            config: Plasma geometry and state parameters
+
+        Returns:
+            (N, 3) array of [B_R, B_Z, B_φ] in Tesla
+        """
+        params = self.state.params
+
+        # Normalize inputs: r_n = (R-R0)/a, z_n = Z/a
+        inputs = FluxInput(R_sample=jnp.atleast_2d(R), Z_sample=jnp.atleast_2d(Z), config=config)
+        norm_params, r_n, z_n = inputs.normalize()
+        scale = inputs.get_physical_scale().squeeze()  # ψ_physical = ψ_net * (F_axis * a)
+        a = config.Geometry.a
+
+        def psi_normalized(r_norm, z_norm):
+            """Physical ψ from normalized coordinates."""
+            # Ensure inputs are arrays
+            r_in = jnp.atleast_2d(r_norm).reshape(1, 1)
+            z_in = jnp.atleast_2d(z_norm).reshape(1, 1)
+            psi_n = self.model.apply(params, r=r_in, z=z_in, **norm_params)
+            return (psi_n * scale).squeeze()
+
+        # Compute ∂ψ/∂(r_n, z_n), then chain rule: ∂ψ/∂R = (∂ψ/∂r_n) * (1/a)
+        grad_fn = jax.vmap(jax.grad(psi_normalized, argnums=(0, 1)))
+        dpsi_drn, dpsi_dzn = grad_fn(r_n.squeeze(), z_n.squeeze())
+
+        dpsi_dR = dpsi_drn / a  # Chain rule: ∂r_n/∂R = 1/a
+        dpsi_dZ = dpsi_dzn / a  # Chain rule: ∂z_n/∂Z = 1/a
+
+        # Poloidal field from flux gradient
+        BR = -dpsi_dZ / R
+        BZ = dpsi_dR / R
+
+        # Toroidal field from flux function F(ψ)
+        psi_vals = jax.vmap(psi_normalized)(r_n.squeeze(), z_n.squeeze())
+        psi_axis = psi_normalized(0.0, 0.0)  # At (R0, 0): r_n = (R0-R0)/a = 0
+
+        from src.engine.physics import toroidal_field_flux_function
+
+        F_val = toroidal_field_flux_function(
+            psi_vals, psi_axis, config.State.F_axis, config.State.field_exponent
+        )
+        Bphi = F_val / R
+
+        return jnp.column_stack([BR, BZ, Bphi])
+
+    def get_b_field_cartesian(
+        self, X: jnp.ndarray, Y: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig
+    ) -> jnp.ndarray:
+        """Transform cylindrical B-field to Cartesian coordinates.
+
+        Coordinate transform: (R, φ, Z) → (X, Y, Z) where R = √(X²+Y²), φ = atan2(Y,X)
+        Basis transform: e_R = cos(φ)e_X + sin(φ)e_Y, e_φ = -sin(φ)e_X + cos(φ)e_Y
+
+        Args:
+            X, Y, Z: Cartesian coordinates [m]
+            config: Plasma parameters
+
+        Returns:
+            (N, 3) array of [B_X, B_Y, B_Z] in Tesla
+        """
+        # Ensure inputs are arrays
+        X = jnp.asarray(X)
+        Y = jnp.asarray(Y)
+        Z = jnp.asarray(Z)
+
+        R = jnp.sqrt(X**2 + Y**2)
+        phi = jnp.arctan2(Y, X)
+
+        B_cyl = self.get_b_field(R, Z, config)
+        BR, BZ_cyl, Bphi = B_cyl[:, 0], B_cyl[:, 1], B_cyl[:, 2]
+
+        # Rotate cylindrical components to Cartesian basis
+        BX = BR * jnp.cos(phi) - Bphi * jnp.sin(phi)
+        BY = BR * jnp.sin(phi) + Bphi * jnp.cos(phi)
+
+        return jnp.column_stack([BX, BY, BZ_cyl])
+
 
 if __name__ == "__main__":
     config = HyperParams()
