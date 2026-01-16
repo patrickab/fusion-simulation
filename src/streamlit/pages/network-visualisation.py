@@ -1,8 +1,10 @@
 from typing import Dict, List, Union
 
 import jax.numpy as jnp
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import pyvista as pv
 from stpyvista import stpyvista
 
 from src.engine.network import NetworkManager, Sampler
@@ -16,14 +18,15 @@ from src.lib.geometry_config import (
     PlasmaConfig,
     PlasmaGeometry,
     PlasmaState,
+    RotationalAngles,
 )
 from src.lib.network_config import FluxInput, HyperParams
-from src.lib.utils import _plasma_to_polydata
 from src.lib.visualization import (
     initialize_plotter,
     render_fusion_plasma,
+    render_magnetic_field_lines,
 )
-from src.streamlit.utils import generate_field_lines, reactor_config_sidebar
+from src.streamlit.utils import reactor_config_sidebar
 from src.toroidal_geometry import (
     calculate_toroidal_coil_boundary,
     generate_toroidal_coils_3d,
@@ -184,7 +187,9 @@ with tab3:
 
     all_psi, predictions = [], []
     for d in data:
-        boundary = calculate_poloidal_boundary(jnp.linspace(0, 2 * jnp.pi, 128), d["geom"])
+        boundary = calculate_poloidal_boundary(
+            jnp.linspace(0, 2 * jnp.pi, RotationalAngles.n_theta), d["geom"]
+        )
         R, Z = jnp.linspace(*r_lims, res), jnp.linspace(*z_lims, res)
         R_grid, Z_grid = jnp.meshgrid(R, Z)
 
@@ -266,6 +271,8 @@ with tab4:
         st.warning("Model not found. Please train the model first.")
         st.stop()
 
+    st.write("Starting 3D visualization...")
+
     col1, col2 = st.columns(2)
     use_custom = col1.checkbox("Use Custom Geometry from Sidebar", value=False)
     idx_pv = col1.slider(
@@ -276,28 +283,27 @@ with tab4:
         key="idx_pv_slider",
         disabled=use_custom,
     )
-    n_lines_pv = col2.slider("Number of Field Lines", 1, 30, 10, key="n_lines_pv_slider")
+    n_lines_pv = col2.slider("Number of Field Lines", 1, 50, 20, key="n_lines_pv_slider")
 
     if use_custom:
         geom_pv = custom_geom
-        state_pv = PlasmaState(p0=1e5, F_axis=5.0, pressure_alpha=2.0, field_exponent=1.0)
+        # Use a physically sensible F_axis within training range for better PINN accuracy
+        state_pv = PlasmaState(p0=1e5, F_axis=40.0, pressure_alpha=2.0, field_exponent=1.0)
     else:
         p = manager.train_set[idx_pv]
         geom_pv = PlasmaGeometry(R0=p[0], a=p[1], kappa=p[2], delta=p[3])
         state_pv = PlasmaState(p0=p[4], F_axis=p[5], pressure_alpha=p[6], field_exponent=p[7])
 
-    boundary_pv = calculate_poloidal_boundary(jnp.linspace(0, 2 * jnp.pi, 128), geom_pv)
-    fusion_plasma = calculate_fusion_plasma(boundary_pv)
-    plasma_mesh = _plasma_to_polydata(fusion_plasma)
-
-    B_cartesian = manager.get_b_field_cartesian(
-        X=jnp.array(plasma_mesh.points[:, 0]),
-        Y=jnp.array(plasma_mesh.points[:, 1]),
-        Z=jnp.array(plasma_mesh.points[:, 2]),
-        config=PlasmaConfig(Geometry=geom_pv, Boundary=boundary_pv, State=state_pv),
+    boundary_pv = calculate_poloidal_boundary(
+        jnp.linspace(0, 2 * jnp.pi, RotationalAngles.n_theta), geom_pv
     )
+    plasma_config = PlasmaConfig(Geometry=geom_pv, Boundary=boundary_pv, State=state_pv)
+    fusion_plasma = calculate_fusion_plasma(boundary_pv)
 
+    # Initialize plotter
     plotter = initialize_plotter()
+
+    # 1. Render Plasma and Coils using the standard library orchestrator
     render_fusion_plasma(
         plotter=plotter,
         fusion_plasma=fusion_plasma,
@@ -307,12 +313,17 @@ with tab4:
             ),
             custom_coil_config,
         ),
-        show_wireframe=False,
+        show_wireframe=True,
     )
-    plotter.add_mesh(
-        generate_field_lines(plasma_mesh, n_lines_pv, B_field=B_cartesian),
-        color="white",
-        line_width=2,
-    )
+
+    # 2. Add Magnetic Field Lines via optimized PINN tracing
+    with st.spinner("Tracing field lines..."):
+        render_magnetic_field_lines(
+            plotter=plotter,
+            network_manager=manager,
+            config=plasma_config,
+            n_lines=n_lines_pv,
+        )
+
     plotter.view_isometric()
     stpyvista(plotter, key=f"pv_reactor_{idx_pv}_{n_lines_pv}_{use_custom}")
