@@ -307,6 +307,9 @@ with tab4:
     render_fusion_plasma(
         plotter=plotter,
         fusion_plasma=fusion_plasma,
+        network_manager=manager,
+        config=plasma_config,
+        show_slice=True,
         toroidal_coils=generate_toroidal_coils_3d(
             calculate_toroidal_coil_boundary(
                 jnp.linspace(0, 2 * jnp.pi, 64), geom_pv, custom_coil_config

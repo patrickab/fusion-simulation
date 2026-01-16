@@ -284,6 +284,41 @@ class NetworkManager:
         psi_norm = self.model.apply(self.state.params, r=r_n, z=z_n, **norm_params)
         return psi_norm * inputs.get_physical_scale()
 
+    def get_psi(self, R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig) -> jnp.ndarray:
+        """Calculate physical magnetic flux ψ at given coordinates.
+
+        Args:
+            R: Major radial coordinates [m]
+            Z: Vertical coordinates [m]
+            config: Plasma geometry and state parameters
+
+        Returns:
+            (N,) array of ψ in Weber
+        """
+        R_arr = jnp.atleast_1d(R).flatten()
+        Z_arr = jnp.atleast_1d(Z).flatten()
+
+        inputs = FluxInput(
+            R_sample=jnp.atleast_2d(R_arr), Z_sample=jnp.atleast_2d(Z_arr), config=config
+        )
+        norm_params, r_n, z_n = inputs.normalize()
+
+        # Extract normalized coordinates and parameters
+        r_n_vec = r_n.squeeze()
+        z_n_vec = z_n.squeeze()
+        norm_params_single = {k: v.squeeze() for k, v in norm_params.items()}
+
+        scale = inputs.get_physical_scale().squeeze()
+        params = self.state.params
+        apply_fn = self.model.apply
+
+        @jax.jit
+        def _calculate_psi_jit(rn, zn):
+            psi_n = apply_fn(params, rn, zn, **norm_params_single)
+            return (psi_n * scale).squeeze()
+
+        return _calculate_psi_jit(r_n_vec, z_n_vec)
+
     def get_b_field(self, R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig) -> jnp.ndarray:
         """Calculate magnetic field from flux function via Grad-Shafranov equilibrium.
 
