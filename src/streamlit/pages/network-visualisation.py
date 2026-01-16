@@ -108,20 +108,6 @@ with tab1:
 
     indices = range(4) if view_option == "Show All" else [int(view_option.split()[-1]) - 1]
 
-    # Display Metrics for the first selected geometry
-    m_cols = st.columns(6)
-    target = data[indices[0]]
-    metrics = [
-        ("R0", target["geom"].R0),
-        ("a", target["geom"].a),
-        ("κ", target["geom"].kappa),
-        ("δ", target["geom"].delta),
-        ("p0", target["state"].p0),
-        ("F_axis", target["state"].F_axis),
-    ]
-    for col, (label, val) in zip(m_cols, metrics, strict=True):
-        col.metric(label, f"{val:.2e}" if val > 100 else f"{val:.2f}")
-
     # Plotting
     n_plots = len(indices)
     cols = n_plots
