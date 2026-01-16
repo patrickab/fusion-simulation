@@ -1,15 +1,21 @@
 """Utility functions for visualizing fusion simulation geometry."""
 
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional, Union
 
 import jax.numpy as jnp
 import numpy as np
+import plotly.graph_objects as go
 import pyvista as pv
 
-from src.engine.plasma import calculate_fusion_plasma, calculate_poloidal_boundary
+from src.engine.plasma import (
+    calculate_fusion_plasma,
+    calculate_poloidal_boundary,
+    is_point_in_plasma,
+)
 from src.lib.config import Filepaths
 from src.lib.geometry_config import (
+    CylindricalCoordinates,
     FusionPlasma,
     PlasmaBoundary,
     PlasmaConfig,
@@ -20,6 +26,7 @@ from src.lib.geometry_config import (
     ToroidalCoilConfig,
 )
 from src.lib.linalg_utils import convert_rz_to_xyz
+from src.lib.network_config import FluxInput
 from src.lib.utils import _coils_to_polydata, _plasma_to_polydata
 from src.toroidal_geometry import calculate_toroidal_coil_boundary, generate_toroidal_coils_3d
 
@@ -265,6 +272,112 @@ def render_magnetic_field_lines(
         name="Magnetic Field Lines",
         lighting=False,
     )
+
+
+def plot_flux_heatmap(
+    manager: any,
+    configs: list[PlasmaConfig],
+    backend: Literal["plotly", "pyvista"] = "plotly",
+    plotter: Optional[pv.Plotter] = None,
+    resolution: int = 50,
+    phi: float = 0.0,
+) -> Optional[go.Figure]:
+    """Unified function to render magnetic flux heatmaps using Plotly or PyVista."""
+
+    if backend == "plotly":
+        from plotly.subplots import make_subplots
+
+        def setup_physics_subplots(geoms: list[PlasmaGeometry]):
+            r_min = min(g.R0 - g.a * 1.2 for g in geoms)
+            r_max = max(g.R0 + g.a * 1.2 for g in geoms)
+            z_max = max(g.kappa * g.a * 1.2 for g in geoms)
+            r_mid, extent = (r_min + r_max) / 2, max(r_max - r_min, 2 * z_max)
+            r_lims, z_lims = [r_mid - extent / 2, r_mid + extent / 2], [-extent / 2, extent / 2]
+            fig = make_subplots(rows=1, cols=len(geoms), shared_yaxes=True)
+            return fig, r_lims, z_lims
+
+        fig, r_lims, z_lims = setup_physics_subplots([c.Geometry for c in configs])
+        R, Z = jnp.linspace(*r_lims, resolution), jnp.linspace(*z_lims, resolution)
+        R_grid, Z_grid = jnp.meshgrid(R, Z)
+        coords_flat = CylindricalCoordinates(
+            R=R_grid.flatten(), Z=Z_grid.flatten(), phi=jnp.zeros_like(R_grid.flatten())
+        )
+
+        all_psi = []
+        for cfg in configs:
+            mask = is_point_in_plasma(coords_flat, cfg.Boundary)
+            psi = jnp.full(mask.shape, jnp.nan)
+            if mask.any():
+                val = manager.predict(
+                    FluxInput(
+                        R_sample=coords_flat.R[mask], Z_sample=coords_flat.Z[mask], config=cfg
+                    )
+                )
+                psi = psi.at[mask].set(val.flatten())
+                all_psi.append(val.flatten())
+
+            idx = configs.index(cfg) + 1
+            fig.add_trace(
+                go.Heatmap(
+                    x=R,
+                    y=Z,
+                    z=np.array(psi).reshape(resolution, resolution),
+                    colorscale="Viridis",
+                    showscale=(idx == len(configs)),
+                ),
+                1,
+                idx,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=cfg.Boundary.R,
+                    y=cfg.Boundary.Z,
+                    mode="lines",
+                    line={"color": "white", "width": 2},
+                    showlegend=False,
+                ),
+                1,
+                idx,
+            )
+
+        fig.update_layout(template="plotly_dark", margin=dict(l=20, r=20, t=20, b=20))
+        return fig
+
+    elif backend == "pyvista":
+        if plotter is None:
+            return None
+
+        for cfg in configs:
+            R0, a, kappa = cfg.Geometry.R0, cfg.Geometry.a, cfg.Geometry.kappa
+            r_range = np.linspace(R0 - a * 1.1, R0 + a * 1.1, resolution)
+            z_range = np.linspace(-a * kappa * 1.1, a * kappa * 1.1, resolution)
+            R_grid, Z_grid = np.meshgrid(r_range, z_range)
+
+            X = R_grid * np.cos(phi)
+            Y = R_grid * np.sin(phi)
+            Z = Z_grid
+
+            psi = manager.get_psi(jnp.array(R_grid.flatten()), jnp.array(Z_grid.flatten()), cfg)
+
+            coords = CylindricalCoordinates(
+                R=R_grid.flatten(), Z=Z_grid.flatten(), phi=np.full_like(X.flatten(), phi)
+            )
+            mask = np.array(is_point_in_plasma(coords, cfg.Boundary))
+
+            slice_mesh = pv.StructuredGrid(X, Y, Z)
+            slice_mesh.point_data["Psi"] = np.array(psi).flatten()
+            slice_mesh.point_data["mask"] = mask.astype(float)
+
+            clipped = slice_mesh.threshold(0.5, scalars="mask")
+            plotter.add_mesh(
+                clipped,
+                scalars="Psi",
+                cmap="viridis",
+                opacity=0.9,
+                name=f"PoloidalSlice_{configs.index(cfg)}",
+            )
+
+        return None
 
 
 def render_fusion_plasma(
