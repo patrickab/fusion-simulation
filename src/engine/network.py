@@ -6,7 +6,7 @@ import jax.numpy as jnp
 import optax
 from scipy.stats import qmc
 
-from src.engine.physics import pinn_loss_function
+from src.engine.physics import pinn_loss_function, toroidal_field_flux_function
 from src.engine.plasma import calculate_poloidal_boundary, get_poloidal_points
 from src.lib.config import Filepaths
 from src.lib.geometry_config import (
@@ -298,45 +298,60 @@ class NetworkManager:
         Returns:
             (N, 3) array of [B_R, B_Z, B_φ] in Tesla
         """
-        params = self.state.params
+        # Ensure inputs are 1D arrays for vectorization
+        R_arr = jnp.atleast_1d(R).flatten()
+        Z_arr = jnp.atleast_1d(Z).flatten()
 
-        # Normalize inputs: r_n = (R-R0)/a, z_n = Z/a
-        inputs = FluxInput(R_sample=jnp.atleast_2d(R), Z_sample=jnp.atleast_2d(Z), config=config)
-        norm_params, r_n, z_n = inputs.normalize()
-        scale = inputs.get_physical_scale().squeeze()  # ψ_physical = ψ_net * (F_axis * a)
-        a = config.Geometry.a
-
-        def psi_normalized(r_norm, z_norm):
-            """Physical ψ from normalized coordinates."""
-            # Ensure inputs are arrays
-            r_in = jnp.atleast_2d(r_norm).reshape(1, 1)
-            z_in = jnp.atleast_2d(z_norm).reshape(1, 1)
-            psi_n = self.model.apply(params, r=r_in, z=z_in, **norm_params)
-            return (psi_n * scale).squeeze()
-
-        # Compute ∂ψ/∂(r_n, z_n), then chain rule: ∂ψ/∂R = (∂ψ/∂r_n) * (1/a)
-        grad_fn = jax.vmap(jax.grad(psi_normalized, argnums=(0, 1)))
-        dpsi_drn, dpsi_dzn = grad_fn(r_n.squeeze(), z_n.squeeze())
-
-        dpsi_dR = dpsi_drn / a  # Chain rule: ∂r_n/∂R = 1/a
-        dpsi_dZ = dpsi_dzn / a  # Chain rule: ∂z_n/∂Z = 1/a
-
-        # Poloidal field from flux gradient
-        BR = -dpsi_dZ / R
-        BZ = dpsi_dR / R
-
-        # Toroidal field from flux function F(ψ)
-        psi_vals = jax.vmap(psi_normalized)(r_n.squeeze(), z_n.squeeze())
-        psi_axis = psi_normalized(0.0, 0.0)  # At (R0, 0): r_n = (R0-R0)/a = 0
-
-        from src.engine.physics import toroidal_field_flux_function
-
-        F_val = toroidal_field_flux_function(
-            psi_vals, psi_axis, config.State.F_axis, config.State.field_exponent
+        # Prepare inputs for normalization
+        inputs = FluxInput(
+            R_sample=jnp.atleast_2d(R_arr), Z_sample=jnp.atleast_2d(Z_arr), config=config
         )
-        Bphi = F_val / R
+        norm_params, r_n, z_n = inputs.normalize()
 
-        return jnp.column_stack([BR, BZ, Bphi])
+        # Extract normalized coordinates and parameters
+        r_n_vec = r_n.squeeze()
+        z_n_vec = z_n.squeeze()
+        norm_params_single = {k: v.squeeze() for k, v in norm_params.items()}
+
+        scale = inputs.get_physical_scale().squeeze()
+        a = config.Geometry.a
+        params = self.state.params
+        apply_fn = self.model.apply
+
+        @jax.jit
+        def _calculate_b_jit(r_vec, z_vec, R_phys):
+            def psi_phys(rn, zn):
+                """Scalar physical psi for differentiation."""
+                # Ensure inputs are JAX arrays for .shape access in model
+                rn_arr = jnp.asarray(rn)
+                zn_arr = jnp.asarray(zn)
+                psi_n = apply_fn(params, rn_arr, zn_arr, **norm_params_single)
+                return (psi_n * scale).squeeze()
+
+            # Compute derivatives w.r.t normalized coordinates
+            grad_psi_fn = jax.vmap(jax.grad(psi_phys, argnums=(0, 1)))
+            dpsi_drn, dpsi_dzn = grad_psi_fn(r_vec, z_vec)
+
+            # Chain rule for physical coordinates: ∂ψ/∂R = (∂ψ/∂r_n) * (1/a)
+            dpsi_dR = dpsi_drn / a
+            dpsi_dZ = dpsi_dzn / a
+
+            # Poloidal field components
+            BR = -dpsi_dZ / R_phys
+            BZ = dpsi_dR / R_phys
+
+            # Toroidal field component F(ψ)/R
+            psi_vals = jax.vmap(psi_phys)(r_vec, z_vec)
+            psi_axis = psi_phys(0.0, 0.0)
+
+            F_val = toroidal_field_flux_function(
+                psi_vals, psi_axis, config.State.F_axis, config.State.field_exponent
+            )
+            Bphi = F_val / R_phys
+
+            return jnp.column_stack([BR, BZ, Bphi])
+
+        return _calculate_b_jit(r_n_vec, z_n_vec, R_arr)
 
     def get_b_field_cartesian(
         self, X: jnp.ndarray, Y: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig

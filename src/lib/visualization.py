@@ -251,8 +251,8 @@ def render_magnetic_field_lines(
     streamlines = grid.streamlines_from_source(
         seed_line,
         integration_direction="both",
-        max_time=1000.0,  # Allow long lines to wrap around torus
-        n_points=2000,
+        max_length=1000.0,  # Allow long lines to wrap around torus
+        max_steps=2000,
         integrator_type=45,  # Runge-Kutta 45
     )
 
