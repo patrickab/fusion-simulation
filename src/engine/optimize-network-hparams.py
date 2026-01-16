@@ -25,6 +25,7 @@ logger = get_logger(name="HPO", log_dir="logs/hpo")
 # Registry for early stopping: {epoch_milestone: best_loss_at_milestone}
 EARLY_STOP_THRESHOLD = 2.0  # N times worse
 N_INIT_SAMPLES = 1
+N_OPTIMIZATION_STEPS = 20
 
 
 class SearchSpace:
