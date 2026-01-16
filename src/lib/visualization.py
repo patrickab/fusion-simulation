@@ -79,7 +79,7 @@ def plot_plasma(
     plasma: FusionPlasma | pv.PolyData | Path,
     show_wireframe: bool = False,
     opacity: float = 0.4,
-    cmap: str = "plasma",
+    color: Optional[str] = "lightgrey",
     name_prefix: str = "plasma",
 ) -> None:
     """Add plasma surface and optional wireframe to plotter.
@@ -89,7 +89,7 @@ def plot_plasma(
         plasma: plasma data or path
         show_wireframe: toggle sparse grid
         opacity: transparency
-        cmap: colormap
+        color: surface color (set to None for wireframe only)
         name_prefix: label prefix
     """
 
@@ -108,19 +108,18 @@ def plot_plasma(
     plasma_mesh = _plasma_to_polydata(plasma)
     plasma_mesh.compute_normals(inplace=True)
 
-    plotter.add_mesh(
-        plasma_mesh,
-        color=None,
-        scalars=plasma_mesh.points[:, 2],
-        cmap=cmap,
-        smooth_shading=True,
-        opacity=opacity,
-        show_edges=False,
-        lighting=True,
-        specular=0.4,
-        specular_power=15,
-        name=f"{name_prefix}_surface",
-    )
+    if color is not None:
+        plotter.add_mesh(
+            plasma_mesh,
+            color=color,
+            smooth_shading=True,
+            opacity=opacity,
+            show_edges=False,
+            lighting=True,
+            specular=0.4,
+            specular_power=15,
+            name=f"{name_prefix}_surface",
+        )
 
     if show_wireframe:
         sparse_wireframe = get_sparse_wireframe(plasma_mesh=plasma_mesh)
@@ -268,6 +267,64 @@ def render_magnetic_field_lines(
     )
 
 
+def render_poloidal_slice(
+    plotter: pv.Plotter,
+    network_manager: any,
+    config: PlasmaConfig,
+    phi: float = 0.0,
+    resolution: int = 100,
+) -> None:
+    """Render a 2D poloidal slice with psi heatmap in the 3D plotter.
+
+    Args:
+        plotter: target plotter
+        network_manager: manager for flux calculation
+        config: plasma configuration
+        phi: toroidal angle of the slice
+        resolution: grid resolution for the slice
+    """
+    # 1. Generate R-Z grid for the slice
+    R0, a, kappa = config.Geometry.R0, config.Geometry.a, config.Geometry.kappa
+    r_range = np.linspace(R0 - a * 1.1, R0 + a * 1.1, resolution)
+    z_range = np.linspace(-a * kappa * 1.1, a * kappa * 1.1, resolution)
+    R_grid, Z_grid = np.meshgrid(r_range, z_range)
+
+    # 2. Convert to Cartesian X, Y, Z for the given phi
+    X = R_grid * np.cos(phi)
+    Y = R_grid * np.sin(phi)
+    Z = Z_grid
+
+    # 3. Calculate psi for all points
+    psi = network_manager.get_psi(jnp.array(R_grid.flatten()), jnp.array(Z_grid.flatten()), config)
+    psi_reshaped = np.array(psi).reshape(resolution, resolution)
+
+    # 4. Mask points outside the boundary
+    slice_mesh = pv.StructuredGrid(X, Y, Z)
+    slice_mesh.point_data["Psi"] = psi_reshaped.flatten()
+
+    from src.engine.plasma import is_point_in_plasma
+    from src.lib.geometry_config import CylindricalCoordinates
+
+    coords = CylindricalCoordinates(
+        R=R_grid.flatten(), Z=Z_grid.flatten(), phi=np.full_like(X.flatten(), phi)
+    )
+    mask = np.array(is_point_in_plasma(coords, config.Boundary))
+
+    # Clip the mesh to only show inside the plasma
+    slice_mesh.point_data["mask"] = mask.astype(float)
+    clipped_slice = slice_mesh.threshold(0.5, scalars="mask")
+
+    plotter.add_mesh(
+        clipped_slice,
+        scalars="Psi",
+        cmap="viridis",
+        opacity=0.9,
+        show_scalar_bar=True,
+        scalar_bar_args={"title": "Flux (Psi)"},
+        name="Poloidal Slice",
+    )
+
+
 def render_fusion_plasma(
     fusion_plasma: Path | FusionPlasma | pv.PolyData,
     toroidal_coils: list[ToroidalCoil3D]
@@ -277,6 +334,9 @@ def render_fusion_plasma(
     show_cylindrical_angles: bool = True,
     show_wireframe: bool = True,
     plotter: pv.Plotter | None = None,
+    network_manager: Optional[any] = None,
+    config: Optional[PlasmaConfig] = None,
+    show_slice: bool = False,
 ) -> None:
     """Orchestrate 3D rendering of plasma and coils.
 
@@ -286,6 +346,9 @@ def render_fusion_plasma(
         show_cylindrical_angles: toggle guides
         show_wireframe: toggle wireframe
         plotter: optional existing plotter
+        network_manager: optional manager for flux calculation
+        config: optional config for flux calculation
+        show_slice: toggle poloidal flux slice
     """
 
     # Early return if no valid plasma data
@@ -299,15 +362,19 @@ def render_fusion_plasma(
     # Convert plasma to mesh format
     plasma_mesh = _plasma_to_polydata(fusion_plasma)
 
-    # Plot plasma surface
+    # Plot plasma surface - Colorless (None) with wireframe
     plot_plasma(
         plotter=plotter,
         plasma=fusion_plasma,
         show_wireframe=show_wireframe,
-        opacity=0.8,
-        cmap="plasma",
+        opacity=0.1,
+        color=None,
         name_prefix="plasma",
     )
+
+    # Add poloidal slice if requested
+    if show_slice and network_manager is not None and config is not None:
+        render_poloidal_slice(plotter=plotter, network_manager=network_manager, config=config)
 
     # Add toroidal coils if provided
     if toroidal_coils:
