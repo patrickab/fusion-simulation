@@ -31,9 +31,9 @@ from src.lib.utils import _coils_to_polydata, _plasma_to_polydata
 from src.toroidal_geometry import calculate_toroidal_coil_boundary, generate_toroidal_coils_3d
 
 
-def initialize_plotter(shape: tuple[int, int] = (1, 1)) -> pv.Plotter:
+def initialize_plotter(shape: tuple[int, int] = (1, 1), **kwargs) -> pv.Plotter:
     """Create PyVista plotter with standard theme."""
-    plotter = pv.Plotter(shape=shape, border=True, border_color="white")
+    plotter = pv.Plotter(shape=shape, border=True, border_color="white", **kwargs)
     plotter.set_background("black")
     return plotter
 
@@ -323,6 +323,8 @@ def plot_flux_heatmap(
                     y=Z,
                     z=np.array(psi).reshape(resolution, resolution),
                     colorscale="Viridis",
+                    zmin=0,
+                    zmax=90,
                     showscale=(idx == len(configs)),
                 ),
                 1,
@@ -373,6 +375,7 @@ def plot_flux_heatmap(
                 clipped,
                 scalars="Psi",
                 cmap="viridis",
+                clim=[0, 90],
                 opacity=0.9,
                 name=f"PoloidalSlice_{configs.index(cfg)}",
             )

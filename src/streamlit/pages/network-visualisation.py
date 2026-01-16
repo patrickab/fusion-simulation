@@ -1,26 +1,22 @@
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Union
 
 import jax.numpy as jnp
-import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import pyvista as pv
 from stpyvista import stpyvista
 
 from src.engine.network import NetworkManager, Sampler
 from src.engine.plasma import (
     calculate_fusion_plasma,
     calculate_poloidal_boundary,
-    is_point_in_plasma,
 )
 from src.lib.geometry_config import (
-    CylindricalCoordinates,
     PlasmaConfig,
     PlasmaGeometry,
     PlasmaState,
     RotationalAngles,
 )
-from src.lib.network_config import FluxInput, HyperParams
+from src.lib.network_config import HyperParams
 from src.lib.visualization import (
     initialize_plotter,
     plot_flux_heatmap,
@@ -36,7 +32,6 @@ import streamlit as st
 
 st.set_page_config(layout="wide", page_title="Plasma Geometry Lab")
 
-# Get custom geometry from sidebar
 custom_geom, custom_coil_config = reactor_config_sidebar()
 
 # Define a type for the geometry data
@@ -83,6 +78,9 @@ def load_network_manager() -> NetworkManager | None:
         return None
 
 
+manager = load_network_manager()
+
+
 def setup_physics_subplots(
     geoms: List[PlasmaGeometry], titles: List[str]
 ) -> tuple[go.Figure, List[float], List[float]]:
@@ -110,26 +108,22 @@ def setup_physics_subplots(
     return fig, r_lims, z_lims
 
 
-# --- UI Layout ---
-st.title("Network Visualization")
-tab1, tab2, tab3, tab4 = st.tabs(
-    ["Geometry Sampling", "Model Training", "Predictions", "3D Visualization"]
-)
-
-with tab1:
-    col1, col2, col3 = st.columns([1, 1, 4])
+# --- UI Components ---
+def render_geometry_sampling_tab(seed: int):
+    """Render the geometry sampling visualization tab."""
+    col1, col2, _ = st.columns([1, 1, 4])
     with col1:
         view_option = st.selectbox(
-            "Select Geometry View", ["Show All"] + [f"Geometry {i + 1}" for i in range(4)]
+            "Select Geometry View",
+            ["Show All"] + [f"Geometry {i + 1}" for i in range(4)],
+            key="geom_view",
         )
     with col2:
-        seed = st.number_input("Random Seed", 0, 9999, 42, key="seed_input")
+        tab_seed = st.number_input("Random Seed", 0, 9999, seed, key="sampling_seed_input")
 
-    data = get_data(seed)
-
+    data = get_data(tab_seed)
     indices = range(4) if view_option == "Show All" else [int(view_option.split()[-1]) - 1]
 
-    # Initialize subplots
     geoms = [data[idx]["geom"] for idx in indices]
     titles = [f"Geometry {idx + 1}" for idx in indices]
     fig, _, _ = setup_physics_subplots(geoms, titles)
@@ -161,38 +155,16 @@ with tab1:
             col,
         )
 
-    if view_option == "Show All":
-        st.plotly_chart(fig, width="stretch")
-    else:
-        st.plotly_chart(fig, width="content")
+    st.plotly_chart(fig, use_container_width=True)
 
-with tab2:
-    st.info("Model Training metrics and loss curves will appear here.")
-    manager = load_network_manager()
-    if manager:
-        st.subheader("Current Model Flux Preview")
-        p = manager.train_set[0]
-        geom = PlasmaGeometry(R0=p[0], a=p[1], kappa=p[2], delta=p[3])
-        state = PlasmaState(p0=p[4], F_axis=p[5], pressure_alpha=p[6], field_exponent=p[7])
-        boundary = calculate_poloidal_boundary(
-            jnp.linspace(0, 2 * jnp.pi, RotationalAngles.n_theta), geom
-        )
-        config = PlasmaConfig(Geometry=geom, Boundary=boundary, State=state)
-        fig = plot_flux_heatmap(manager, [config], backend="plotly", resolution=50)
-        st.plotly_chart(fig, use_container_width=True)
 
-with tab3:
-    st.header("Flux Prediction")
-    manager = load_network_manager()
-    if not manager:
-        st.warning("Model not found. Please train the model first.")
-        st.stop()
+def render_flux_predictions_tab(manager: NetworkManager, seed: int):
+    """Render the magnetic flux prediction heatmap tab."""
+    col1, col2, _ = st.columns([1, 1, 4])
+    res = col1.slider("Grid Resolution", 20, 200, 50, key="prediction_res")
+    tab_seed = col2.number_input("Random Seed", 0, 9999, seed, key="prediction_seed")
 
-    col1, col2 = st.columns(2)
-    seed = col1.number_input("Random Seed", 0, 9999, 42, key="prediction_seed")
-    res = col2.slider("Grid Resolution", 20, 200, 50, key="prediction_res")
-
-    data = get_data(seed)
+    data = get_data(tab_seed)
     configs = []
     for d in data:
         boundary = calculate_poloidal_boundary(
@@ -200,38 +172,23 @@ with tab3:
         )
         configs.append(PlasmaConfig(Geometry=d["geom"], Boundary=boundary, State=d["state"]))
 
-    fig = plot_flux_heatmap(manager, configs, backend="plotly", resolution=res)
-    fig.update_layout(height=500)
-    st.plotly_chart(fig, use_container_width=True)
+    if manager:
+        fig = plot_flux_heatmap(manager, configs, backend="plotly", resolution=res)
+        fig.update_layout(height=500)
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.error("Network parameters not found on disk. Please train the network first.")
 
-with tab4:
-    st.header("3D Magnetic Field Visualization (PyVista)")
-    manager = load_network_manager()
-    if not manager:
-        st.warning("Model not found. Please train the model first.")
-        st.stop()
 
-    st.write("Starting 3D visualization...")
-
-    col1, col2 = st.columns(2)
-    use_custom = col1.checkbox("Use Custom Geometry from Sidebar", value=False)
-    idx_pv = col1.slider(
-        "Select Sample",
-        0,
-        len(manager.train_set) - 1,
-        0,
-        key="idx_pv_slider",
-        disabled=use_custom,
-    )
+def render_3d_topology_tab(manager: NetworkManager, custom_coil_config):
+    """Render the 3D topology and field line tracing tab."""
+    col1, col2, _ = st.columns([1, 1, 4])
+    idx_pv = col1.slider("Select Sample", 0, len(manager.train_set) - 1, 0, key="idx_pv_slider")
     n_lines_pv = col2.slider("Number of Field Lines", 1, 50, 20, key="n_lines_pv_slider")
 
-    if use_custom:
-        geom_pv = custom_geom
-        state_pv = PlasmaState(p0=1e5, F_axis=40.0, pressure_alpha=2.0, field_exponent=1.0)
-    else:
-        p = manager.train_set[idx_pv]
-        geom_pv = PlasmaGeometry(R0=p[0], a=p[1], kappa=p[2], delta=p[3])
-        state_pv = PlasmaState(p0=p[4], F_axis=p[5], pressure_alpha=p[6], field_exponent=p[7])
+    p = manager.train_set[idx_pv]
+    geom_pv = PlasmaGeometry(R0=p[0], a=p[1], kappa=p[2], delta=p[3])
+    state_pv = PlasmaState(p0=p[4], F_axis=p[5], pressure_alpha=p[6], field_exponent=p[7])
 
     boundary_pv = calculate_poloidal_boundary(
         jnp.linspace(0, 2 * jnp.pi, RotationalAngles.n_theta), geom_pv
@@ -239,13 +196,9 @@ with tab4:
     plasma_config = PlasmaConfig(Geometry=geom_pv, Boundary=boundary_pv, State=state_pv)
     fusion_plasma = calculate_fusion_plasma(boundary_pv)
 
-    # Unified Plotter
-    plotter = initialize_plotter()
+    st.subheader("3D Topology")
+    plotter = initialize_plotter(window_size=(800, 1000))
 
-    # 1. Render 2D Poloidal Slice inside the 3D scene
-    plot_flux_heatmap(manager, [plasma_config], backend="pyvista", plotter=plotter, resolution=100)
-
-    # 2. Render Plasma and Coils
     render_fusion_plasma(
         plotter=plotter,
         fusion_plasma=fusion_plasma,
@@ -258,7 +211,6 @@ with tab4:
         show_wireframe=True,
     )
 
-    # 3. Add Magnetic Field Lines
     with st.spinner("Tracing field lines..."):
         render_magnetic_field_lines(
             plotter=plotter,
@@ -266,6 +218,21 @@ with tab4:
             config=plasma_config,
             n_lines=n_lines_pv,
         )
+        plotter.view_isometric()
+        stpyvista(plotter, key=f"pv_reactor_{idx_pv}_{n_lines_pv}")
 
-    plotter.view_isometric()
-    stpyvista(plotter, key=f"pv_reactor_{idx_pv}_{n_lines_pv}_{use_custom}")
+
+# --- Main Application ---
+tab1, tab2, tab3 = st.tabs(["Geometry Sampling", "Flux Predictions", "3D Magnetic Field Lines"])
+
+with tab1:
+    render_geometry_sampling_tab(seed=42)
+
+with tab2:
+    render_flux_predictions_tab(manager, seed=42)
+
+with tab3:
+    if manager:
+        render_3d_topology_tab(manager, custom_coil_config)
+    else:
+        st.error("Network manager not initialized.")
