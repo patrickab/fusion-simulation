@@ -4,7 +4,7 @@ import jax.numpy as jnp
 from src.lib.config import BaseModel
 from src.lib.geometry_config import PlasmaConfig
 
-BATCH_SIZE = 128
+BATCH_SIZE = 64
 N_TRAIN = 1024
 
 
@@ -15,8 +15,8 @@ class HyperParams(BaseModel):
     input_dim: int = 10  # 2 (RZ) + 8 (Params)
     output_dim: int = 1
     hidden_dims: tuple[int, ...] = (128, 128, 128, 128)
-    learning_rate_max: float = 2e-3
-    learning_rate_min: float = 2e-5
+    learning_rate_max: float = 4e-3
+    learning_rate_min: float = 6e-6
     batch_size: int = BATCH_SIZE
     n_rz_inner_samples: int = 2048
     n_rz_boundary_samples: int = 256

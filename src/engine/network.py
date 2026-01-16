@@ -46,7 +46,7 @@ class FluxPINN(nn.Module):
         x = jnp.stack([jnp.broadcast_to(p, target_shape) for p in params], axis=-1)
 
         for dim in self.hidden_dims:
-            x = nn.Dense(features=dim, dtype=jnp.bfloat16)(x)
+            x = nn.Dense(features=dim, dtype=jnp.float32)(x)
             x = nn.swish(x)
 
         psi_hat = nn.Dense(features=1)(x)
