@@ -1,5 +1,3 @@
-from typing import Callable, Optional
-
 from flax import linen as nn
 import flax.serialization
 from flax.training import train_state
@@ -8,7 +6,7 @@ import jax.numpy as jnp
 import optax
 from scipy.stats import qmc
 
-from src.engine.physics import pinn_loss_function
+from src.engine.physics import pinn_loss_function, toroidal_field_flux_function
 from src.engine.plasma import calculate_poloidal_boundary, get_poloidal_points
 from src.lib.config import Filepaths
 from src.lib.geometry_config import (
@@ -48,7 +46,7 @@ class FluxPINN(nn.Module):
         x = jnp.stack([jnp.broadcast_to(p, target_shape) for p in params], axis=-1)
 
         for dim in self.hidden_dims:
-            x = nn.Dense(features=dim, dtype=jnp.bfloat16)(x)
+            x = nn.Dense(features=dim, dtype=jnp.float32)(x)
             x = nn.swish(x)
 
         psi_hat = nn.Dense(features=1)(x)
@@ -151,7 +149,7 @@ class NetworkManager:
         self.state = self._init_state()
 
         self.train_set = self.sampler._get_sobol_sample(
-            n_samples=config.n_train,
+            n_samples=self.config.n_train,
             seed=BASE_SEED,
         )
 
@@ -183,15 +181,21 @@ class NetworkManager:
         norm_params, r_n, z_n = dummy_input.normalize()
         params = self.model.init(key, r=r_n, z=z_n, **norm_params)
 
+        steps_per_epoch = self.config.n_train // self.config.batch_size
         schedule = optax.warmup_cosine_decay_schedule(
             init_value=0.0,
             peak_value=self.config.learning_rate_max,
-            warmup_steps=self.config.warmup_steps,
-            decay_steps=self.config.decay_steps,
+            warmup_steps=self.config.warmup_epochs * steps_per_epoch,
+            decay_steps=self.config.decay_epochs * steps_per_epoch,
             end_value=self.config.learning_rate_min,
         )
         tx = optax.adam(learning_rate=schedule)
         return train_state.TrainState.create(apply_fn=self.model.apply, params=params, tx=tx)
+
+    @property
+    def epochs(self) -> int:
+        """Calculate total epochs."""
+        return self.config.warmup_epochs + self.config.decay_epochs
 
     @staticmethod
     @jax.jit
@@ -222,68 +226,200 @@ class NetworkManager:
         loss, grads = jax.value_and_grad(loss_fn)(state.params)
         return state.apply_gradients(grads=grads), loss
 
+    def calculate_loss(self, inputs: FluxInput) -> float:
+        """Calculate loss for given inputs without updating state."""
+        _, loss = self.train_step(self.state, inputs)
+        return float(loss)
+
+    def train_epoch(self, epoch: int) -> float:
+        """Run one training epoch."""
+        loss = 0.0
+        for i in range(0, len(self.train_set), self.config.batch_size):
+            train_batch = self.train_set[i : i + self.config.batch_size]
+            inputs = self.sampler.sample_flux_input(
+                seed=epoch + i,
+                n_samples=self.config.n_rz_inner_samples,
+                n_boundary_samples=self.config.n_rz_boundary_samples,
+                plasma_configs=train_batch,
+            )
+            self.state, loss = self.train_step(state=self.state, inputs=inputs)
+
+        # Periodic dataset resampling
+        if epoch % 10 == 0 and epoch > 0:
+            self.train_set = self.sampler._get_sobol_sample(
+                n_samples=self.config.n_train,
+                seed=BASE_SEED + epoch,
+            )
+        return float(loss)
+
     def train(
         self,
-        validation_inputs: Optional[FluxInput] = None,
-        callback: Optional[Callable[[int, float], bool]] = None,
         save_to_disk: bool = True,
     ) -> float:
         """
         Train the model.
 
         Args:
-            validation_inputs: Optional inputs for validation loss calculation at end
-            callback: Enables early stop criterion for network hyperparameter optimization
             save_to_disk: Whether to save model params to disk after training
 
         Returns:
-            Final loss (Validation loss if inputs provided, else Training loss)
+            Final training loss
         """
-        epochs = (self.config.decay_steps + self.config.warmup_steps) // (
-            self.config.n_train // self.config.batch_size
-        )
-        logger.info(f"Starting training for {epochs} epochs...")
+        logger.info(f"Starting training for {self.epochs} epochs...")
+
         loss = 0.0
-
-        for epoch in range(epochs):
-            for i in range(0, len(self.train_set), self.config.batch_size):
-                train_batch = self.train_set[i : i + self.config.batch_size]
-                # Sample RZ points for each plasma configuration in the batch
-                inputs = self.sampler.sample_flux_input(
-                    seed=epoch + i,
-                    n_samples=self.config.n_rz_inner_samples,
-                    n_boundary_samples=self.config.n_rz_boundary_samples,
-                    plasma_configs=train_batch,
-                )
-                self.state, loss = self.train_step(state=self.state, inputs=inputs)
-
+        for epoch in range(self.epochs):
+            loss = self.train_epoch(epoch)
             if epoch % 10 == 0 and epoch > 0:
-                logger.info(f"Epoch {epoch:5d} | Loss: [bold magenta]{loss:.2f}[/bold magenta] | ")
-                self.train_set = self.sampler._get_sobol_sample(
-                    n_samples=config.n_train,
-                    seed=BASE_SEED + epoch,
-                )
-
-            if callback and callback(epoch, float(loss)):
-                logger.info(f"Training interrupted by callback at epoch {epoch}")
-                break
-
-        final_loss = float(loss)
-
-        if validation_inputs:
-            _, val_loss = self.train_step(self.state, validation_inputs)
-            final_loss = float(val_loss)
+                logger.info(f"Epoch {epoch:5d} | Loss: [bold magenta]{loss:.2f}[/bold magenta]")
 
         if save_to_disk:
             self.to_disk(params=self.state.params)
 
-        return final_loss
+        return loss
 
     def predict(self, inputs: FluxInput) -> jnp.ndarray:
         """Generate predictions for given inputs."""
         norm_params, r_n, z_n = inputs.normalize()
         psi_norm = self.model.apply(self.state.params, r=r_n, z=z_n, **norm_params)
         return psi_norm * inputs.get_physical_scale()
+
+    def get_psi(self, R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig) -> jnp.ndarray:
+        """Calculate physical magnetic flux ψ at given coordinates.
+
+        Args:
+            R: Major radial coordinates [m]
+            Z: Vertical coordinates [m]
+            config: Plasma geometry and state parameters
+
+        Returns:
+            (N,) array of ψ in Weber
+        """
+        R_arr = jnp.atleast_1d(R).flatten()
+        Z_arr = jnp.atleast_1d(Z).flatten()
+
+        inputs = FluxInput(
+            R_sample=jnp.atleast_2d(R_arr), Z_sample=jnp.atleast_2d(Z_arr), config=config
+        )
+        norm_params, r_n, z_n = inputs.normalize()
+
+        # Extract normalized coordinates and parameters
+        r_n_vec = r_n.squeeze()
+        z_n_vec = z_n.squeeze()
+        norm_params_single = {k: v.squeeze() for k, v in norm_params.items()}
+
+        scale = inputs.get_physical_scale().squeeze()
+        params = self.state.params
+        apply_fn = self.model.apply
+
+        @jax.jit
+        def _calculate_psi_jit(rn, zn):
+            psi_n = apply_fn(params, rn, zn, **norm_params_single)
+            return (psi_n * scale).squeeze()
+
+        return _calculate_psi_jit(r_n_vec, z_n_vec)
+
+    def get_b_field(self, R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig) -> jnp.ndarray:
+        """Calculate magnetic field from flux function via Grad-Shafranov equilibrium.
+
+        Theory: B = ∇ψ * ∇φ + F(ψ)∇φ in axisymmetric geometry
+        Yields: B_R = -(1/R)∂ψ/∂Z, B_Z = (1/R)∂ψ/∂R, B_φ = F(ψ)/R
+
+        Args:
+            R: Major radial coordinates [m]
+            Z: Vertical coordinates [m]
+            config: Plasma geometry and state parameters
+
+        Returns:
+            (N, 3) array of [B_R, B_Z, B_φ] in Tesla
+        """
+        # Ensure inputs are 1D arrays for vectorization
+        R_arr = jnp.atleast_1d(R).flatten()
+        Z_arr = jnp.atleast_1d(Z).flatten()
+
+        # Prepare inputs for normalization
+        inputs = FluxInput(
+            R_sample=jnp.atleast_2d(R_arr), Z_sample=jnp.atleast_2d(Z_arr), config=config
+        )
+        norm_params, r_n, z_n = inputs.normalize()
+
+        # Extract normalized coordinates and parameters
+        r_n_vec = r_n.squeeze()
+        z_n_vec = z_n.squeeze()
+        norm_params_single = {k: v.squeeze() for k, v in norm_params.items()}
+
+        scale = inputs.get_physical_scale().squeeze()
+        a = config.Geometry.a
+        params = self.state.params
+        apply_fn = self.model.apply
+
+        @jax.jit
+        def _calculate_b_jit(r_vec, z_vec, R_phys):
+            def psi_phys(rn, zn):
+                """Scalar physical psi for differentiation."""
+                # Ensure inputs are JAX arrays for .shape access in model
+                rn_arr = jnp.asarray(rn)
+                zn_arr = jnp.asarray(zn)
+                psi_n = apply_fn(params, rn_arr, zn_arr, **norm_params_single)
+                return (psi_n * scale).squeeze()
+
+            # Compute derivatives w.r.t normalized coordinates
+            grad_psi_fn = jax.vmap(jax.grad(psi_phys, argnums=(0, 1)))
+            dpsi_drn, dpsi_dzn = grad_psi_fn(r_vec, z_vec)
+
+            # Chain rule for physical coordinates: ∂ψ/∂R = (∂ψ/∂r_n) * (1/a)
+            dpsi_dR = dpsi_drn / a
+            dpsi_dZ = dpsi_dzn / a
+
+            # Poloidal field components
+            BR = -dpsi_dZ / R_phys
+            BZ = dpsi_dR / R_phys
+
+            # Toroidal field component F(ψ)/R
+            psi_vals = jax.vmap(psi_phys)(r_vec, z_vec)
+            psi_axis = psi_phys(0.0, 0.0)
+
+            F_val = toroidal_field_flux_function(
+                psi_vals, psi_axis, config.State.F_axis, config.State.field_exponent
+            )
+            Bphi = F_val / R_phys
+
+            return jnp.column_stack([BR, BZ, Bphi])
+
+        return _calculate_b_jit(r_n_vec, z_n_vec, R_arr)
+
+    def get_b_field_cartesian(
+        self, X: jnp.ndarray, Y: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig
+    ) -> jnp.ndarray:
+        """Transform cylindrical B-field to Cartesian coordinates.
+
+        Coordinate transform: (R, φ, Z) → (X, Y, Z) where R = √(X²+Y²), φ = atan2(Y,X)
+        Basis transform: e_R = cos(φ)e_X + sin(φ)e_Y, e_φ = -sin(φ)e_X + cos(φ)e_Y
+
+        Args:
+            X, Y, Z: Cartesian coordinates [m]
+            config: Plasma parameters
+
+        Returns:
+            (N, 3) array of [B_X, B_Y, B_Z] in Tesla
+        """
+        # Ensure inputs are arrays
+        X = jnp.asarray(X)
+        Y = jnp.asarray(Y)
+        Z = jnp.asarray(Z)
+
+        R = jnp.sqrt(X**2 + Y**2)
+        phi = jnp.arctan2(Y, X)
+
+        B_cyl = self.get_b_field(R, Z, config)
+        BR, BZ_cyl, Bphi = B_cyl[:, 0], B_cyl[:, 1], B_cyl[:, 2]
+
+        # Rotate cylindrical components to Cartesian basis
+        BX = BR * jnp.cos(phi) - Bphi * jnp.sin(phi)
+        BY = BR * jnp.sin(phi) + Bphi * jnp.cos(phi)
+
+        return jnp.column_stack([BX, BY, BZ_cyl])
+
 
 if __name__ == "__main__":
     config = HyperParams()

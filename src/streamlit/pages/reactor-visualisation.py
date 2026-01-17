@@ -9,35 +9,26 @@ from src.lib.visualization import (
     render_plasma_boundary,
 )
 from src.toroidal_geometry import generate_toroidal_coils_3d
+from src.streamlit.utils import reactor_config_sidebar
 import streamlit as st
 
 st.title("Reactor Geometry")
 
-with st.sidebar, st.form("geometry_coil_form"):
-    st.header("Plasma Geometry")
-    R0 = st.slider("Major Radius (R0) [m]", 3.0, 10.0, 6.2, 0.1)
-    a = st.slider("Minor Radius (a) [m]", 1.0, 5.0, 3.2, 0.1)
-    kappa = st.slider("Elongation (kappa)", 1.0, 3.0, 1.7, 0.1)
-    delta = st.slider("Triangularity (delta)", 0.0, 1.0, 0.33, 0.01)
+# Get geometry from sidebar
+plasma_geometry, toroid_coil_config = reactor_config_sidebar()
 
-    st.header("Coil Configuration")
-    dist = st.slider("Distance from Plasma [m]", 0.5, 3.0, 1.5, 0.1)
-    r_thick = st.slider("Radial Thickness [m]", 0.1, 2.0, 0.8, 0.1)
-    v_thick = st.slider("Vertical Thickness [m]", 0.1, 2.0, 0.2, 0.1)
-    span = st.slider("Angular Span [deg]", 1, 20, 6, 1)
-    n_coils = st.slider("Number of Coils", 4, 24, 8, 1)
-
-    submitted = st.form_submit_button("Apply")
-
-# Construct configuration objects
-plasma_geometry = PlasmaGeometry(R0=R0, a=a, kappa=kappa, delta=delta)
-toroid_coil_config = ToroidalCoilConfig(
-    distance_from_plasma=dist,
-    radial_thickness=r_thick,
-    vertical_thickness=v_thick,
-    angular_span=span,
-    n_field_coils=n_coils,
+# Extract parameters for the key
+R0, a, kappa, delta = (
+    plasma_geometry.R0,
+    plasma_geometry.a,
+    plasma_geometry.kappa,
+    plasma_geometry.delta,
 )
+dist = toroid_coil_config.distance_from_plasma
+r_thick = toroid_coil_config.radial_thickness
+v_thick = toroid_coil_config.vertical_thickness
+span = toroid_coil_config.angular_span
+n_coils = toroid_coil_config.n_field_coils
 
 # Generate and display the plot
 with st.spinner("Calculating geometry..."):

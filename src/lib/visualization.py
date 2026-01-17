@@ -1,16 +1,24 @@
 """Utility functions for visualizing fusion simulation geometry."""
 
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional, Union
 
+import jax.numpy as jnp
 import numpy as np
+import plotly.graph_objects as go
 import pyvista as pv
 
-from src.engine.plasma import calculate_fusion_plasma, calculate_poloidal_boundary
+from src.engine.plasma import (
+    calculate_fusion_plasma,
+    calculate_poloidal_boundary,
+    is_point_in_plasma,
+)
 from src.lib.config import Filepaths
 from src.lib.geometry_config import (
+    CylindricalCoordinates,
     FusionPlasma,
     PlasmaBoundary,
+    PlasmaConfig,
     PlasmaGeometry,
     RotationalAngles,
     ToroidalCoil2D,
@@ -18,13 +26,14 @@ from src.lib.geometry_config import (
     ToroidalCoilConfig,
 )
 from src.lib.linalg_utils import convert_rz_to_xyz
+from src.lib.network_config import FluxInput
 from src.lib.utils import _coils_to_polydata, _plasma_to_polydata
 from src.toroidal_geometry import calculate_toroidal_coil_boundary, generate_toroidal_coils_3d
 
 
-def initialize_plotter(shape: tuple[int, int] = (1, 1)) -> pv.Plotter:
+def initialize_plotter(shape: tuple[int, int] = (1, 1), **kwargs) -> pv.Plotter:
     """Create PyVista plotter with standard theme."""
-    plotter = pv.Plotter(shape=shape, border=True, border_color="white")
+    plotter = pv.Plotter(shape=shape, border=True, border_color="white", **kwargs)
     plotter.set_background("black")
     return plotter
 
@@ -77,7 +86,7 @@ def plot_plasma(
     plasma: FusionPlasma | pv.PolyData | Path,
     show_wireframe: bool = False,
     opacity: float = 0.4,
-    cmap: str = "plasma",
+    color: Optional[str] = "lightgrey",
     name_prefix: str = "plasma",
 ) -> None:
     """Add plasma surface and optional wireframe to plotter.
@@ -87,7 +96,7 @@ def plot_plasma(
         plasma: plasma data or path
         show_wireframe: toggle sparse grid
         opacity: transparency
-        cmap: colormap
+        color: surface color (set to None for wireframe only)
         name_prefix: label prefix
     """
 
@@ -106,19 +115,18 @@ def plot_plasma(
     plasma_mesh = _plasma_to_polydata(plasma)
     plasma_mesh.compute_normals(inplace=True)
 
-    plotter.add_mesh(
-        plasma_mesh,
-        color=None,
-        scalars=plasma_mesh.points[:, 2],
-        cmap=cmap,
-        smooth_shading=True,
-        opacity=opacity,
-        show_edges=False,
-        lighting=True,
-        specular=0.4,
-        specular_power=15,
-        name=f"{name_prefix}_surface",
-    )
+    if color is not None:
+        plotter.add_mesh(
+            plasma_mesh,
+            color=color,
+            smooth_shading=True,
+            opacity=opacity,
+            show_edges=False,
+            lighting=True,
+            specular=0.4,
+            specular_power=15,
+            name=f"{name_prefix}_surface",
+        )
 
     if show_wireframe:
         sparse_wireframe = get_sparse_wireframe(plasma_mesh=plasma_mesh)
@@ -199,6 +207,182 @@ def render_plasma_boundary(
     plotter.show_grid()
     plotter.add_axes(line_width=2, xlabel="R (m)", ylabel="Z (m)")
 
+
+def render_magnetic_field_lines(
+    plotter: pv.Plotter,
+    network_manager: any,  # Typed as 'any' to avoid circular import with engine
+    config: PlasmaConfig,
+    n_lines: int = 50,
+) -> None:
+    """Trace and visualize 3D magnetic field lines using the neural network."""
+
+    # 1. Define a sampling volume around the plasma
+    # We use a structured grid to sample the B-field for the integrator
+    R0 = float(config.Geometry.R0)
+    a = float(config.Geometry.a)
+    kappa = float(config.Geometry.kappa)
+
+    # Bounds: X/Y within major radius + minor radius, Z within elongation
+    extent = R0 + a + 1.0
+    z_extent = (a * kappa) + 1.0
+
+    # Create a coarse grid for the vector field (VTK will interpolate)
+    grid = pv.ImageData(
+        dimensions=(30, 30, 30),
+        spacing=(2 * extent / 29, 2 * extent / 29, 2 * z_extent / 29),
+        origin=(-extent, -extent, -z_extent),
+    )
+
+    # 2. Calculate B-field at grid points
+    points = grid.points
+    X, Y, Z = points[:, 0], points[:, 1], points[:, 2]
+
+    # Convert to JAX arrays
+    X_j, Y_j, Z_j = jnp.array(X), jnp.array(Y), jnp.array(Z)
+
+    # Query network for Cartesian B-vectors
+    vectors = network_manager.get_b_field_cartesian(X_j, Y_j, Z_j, config)
+
+    # Assign vectors to grid
+    grid["B_field"] = np.array(vectors)
+    grid.set_active_vectors("B_field")
+
+    # 3. Generate Seed Points for Streamlines
+    # We seed points along the midplane major radius to catch nested flux surfaces
+    seed_line = pv.Line(
+        pointa=(R0 - a * 0.9, 0, 0), pointb=(R0 + a * 0.9, 0, 0), resolution=n_lines
+    )
+
+    # 4. Integrate Streamlines
+    streamlines = grid.streamlines_from_source(
+        seed_line,
+        integration_direction="both",
+        max_length=1000.0,  # Allow long lines to wrap around torus
+        max_steps=2000,
+        integrator_type=45,  # Runge-Kutta 45
+    )
+
+    # 5. Plot
+    plotter.add_mesh(
+        streamlines,
+        render_lines_as_tubes=True,
+        line_width=2,
+        cmap="plasma",
+        opacity=0.8,
+        name="Magnetic Field Lines",
+        lighting=False,
+    )
+
+
+def plot_flux_heatmap(
+    manager: any,
+    configs: list[PlasmaConfig],
+    backend: Literal["plotly", "pyvista"] = "plotly",
+    plotter: Optional[pv.Plotter] = None,
+    resolution: int = 50,
+    phi: float = 0.0,
+) -> Optional[go.Figure]:
+    """Unified function to render magnetic flux heatmaps using Plotly or PyVista."""
+
+    if backend == "plotly":
+        from plotly.subplots import make_subplots
+
+        def setup_physics_subplots(geoms: list[PlasmaGeometry]):
+            r_min = min(g.R0 - g.a * 1.2 for g in geoms)
+            r_max = max(g.R0 + g.a * 1.2 for g in geoms)
+            z_max = max(g.kappa * g.a * 1.2 for g in geoms)
+            r_mid, extent = (r_min + r_max) / 2, max(r_max - r_min, 2 * z_max)
+            r_lims, z_lims = [r_mid - extent / 2, r_mid + extent / 2], [-extent / 2, extent / 2]
+            fig = make_subplots(rows=1, cols=len(geoms), shared_yaxes=True)
+            return fig, r_lims, z_lims
+
+        fig, r_lims, z_lims = setup_physics_subplots([c.Geometry for c in configs])
+        R, Z = jnp.linspace(*r_lims, resolution), jnp.linspace(*z_lims, resolution)
+        R_grid, Z_grid = jnp.meshgrid(R, Z)
+        coords_flat = CylindricalCoordinates(
+            R=R_grid.flatten(), Z=Z_grid.flatten(), phi=jnp.zeros_like(R_grid.flatten())
+        )
+
+        all_psi = []
+        for cfg in configs:
+            mask = is_point_in_plasma(coords_flat, cfg.Boundary)
+            psi = jnp.full(mask.shape, jnp.nan)
+            if mask.any():
+                val = manager.predict(
+                    FluxInput(
+                        R_sample=coords_flat.R[mask], Z_sample=coords_flat.Z[mask], config=cfg
+                    )
+                )
+                psi = psi.at[mask].set(val.flatten())
+                all_psi.append(val.flatten())
+
+            idx = configs.index(cfg) + 1
+            fig.add_trace(
+                go.Heatmap(
+                    x=R,
+                    y=Z,
+                    z=np.array(psi).reshape(resolution, resolution),
+                    colorscale="Viridis",
+                    zmin=0,
+                    zmax=90,
+                    showscale=(idx == len(configs)),
+                ),
+                1,
+                idx,
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=cfg.Boundary.R,
+                    y=cfg.Boundary.Z,
+                    mode="lines",
+                    line={"color": "white", "width": 2},
+                    showlegend=False,
+                ),
+                1,
+                idx,
+            )
+
+        fig.update_layout(template="plotly_dark", margin=dict(l=20, r=20, t=20, b=20))
+        return fig
+
+    elif backend == "pyvista":
+        if plotter is None:
+            return None
+
+        for cfg in configs:
+            R0, a, kappa = cfg.Geometry.R0, cfg.Geometry.a, cfg.Geometry.kappa
+            r_range = np.linspace(R0 - a * 1.1, R0 + a * 1.1, resolution)
+            z_range = np.linspace(-a * kappa * 1.1, a * kappa * 1.1, resolution)
+            R_grid, Z_grid = np.meshgrid(r_range, z_range)
+
+            X = R_grid * np.cos(phi)
+            Y = R_grid * np.sin(phi)
+            Z = Z_grid
+
+            psi = manager.get_psi(jnp.array(R_grid.flatten()), jnp.array(Z_grid.flatten()), cfg)
+
+            coords = CylindricalCoordinates(
+                R=R_grid.flatten(), Z=Z_grid.flatten(), phi=np.full_like(X.flatten(), phi)
+            )
+            mask = np.array(is_point_in_plasma(coords, cfg.Boundary))
+
+            slice_mesh = pv.StructuredGrid(X, Y, Z)
+            slice_mesh.point_data["Psi"] = np.array(psi).flatten()
+            slice_mesh.point_data["mask"] = mask.astype(float)
+
+            clipped = slice_mesh.threshold(0.5, scalars="mask")
+            plotter.add_mesh(
+                clipped,
+                scalars="Psi",
+                cmap="viridis",
+                clim=[0, 90],
+                opacity=0.9,
+                name=f"PoloidalSlice_{configs.index(cfg)}",
+            )
+
+        return None
+
+
 def render_fusion_plasma(
     fusion_plasma: Path | FusionPlasma | pv.PolyData,
     toroidal_coils: list[ToroidalCoil3D]
@@ -230,13 +414,13 @@ def render_fusion_plasma(
     # Convert plasma to mesh format
     plasma_mesh = _plasma_to_polydata(fusion_plasma)
 
-    # Plot plasma surface
+    # Plot plasma surface - Colorless (None) with wireframe
     plot_plasma(
         plotter=plotter,
         plasma=fusion_plasma,
         show_wireframe=show_wireframe,
-        opacity=0.8,
-        cmap="plasma",
+        opacity=0.1,
+        color=None,
         name_prefix="plasma",
     )
 
