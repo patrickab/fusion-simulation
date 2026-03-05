@@ -30,7 +30,7 @@ from src.lib.utils import _coils_to_polydata, _plasma_to_polydata
 from src.toroidal_geometry import calculate_toroidal_coil_boundary, generate_toroidal_coils_3d
 
 
-def initialize_plotter(shape: tuple[int, int] = (1, 1), **kwargs) -> pv.Plotter:
+def initialize_plotter(shape: tuple[int, int] = (1, 1), **kwargs: dict) -> pv.Plotter:
     """Create PyVista plotter with standard theme."""
     plotter = pv.Plotter(shape=shape, border=True, border_color="white", **kwargs)
     plotter.set_background("black")
