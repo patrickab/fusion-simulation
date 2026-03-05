@@ -1,18 +1,23 @@
 from stpyvista import stpyvista
 
-from src.engine.plasma import calculate_fusion_plasma, calculate_poloidal_boundary
-from src.lib.geometry_config import PlasmaGeometry, RotationalAngles, ToroidalCoilConfig
+from src.engine.plasma import calculate_fusion_plasma
 from src.lib.visualization import (
     calculate_2d_geometry,
     initialize_plotter,
     render_fusion_plasma,
     render_plasma_boundary,
 )
-from src.toroidal_geometry import generate_toroidal_coils_3d
 from src.streamlit.utils import reactor_config_sidebar
+from src.toroidal_geometry import generate_toroidal_coils_3d
 import streamlit as st
 
+st.set_page_config(layout="wide", page_title="Fusion Geometry Lab")
 st.title("Reactor Geometry")
+
+# Layout for view controls
+with st.sidebar:
+    view_option = st.selectbox("View Mode", ["2D Geometry", "3D Geometry", "Both"], index=2)
+    show_coils = st.checkbox("Show Coils", value=True)
 
 # Get geometry from sidebar
 plasma_geometry, toroid_coil_config = reactor_config_sidebar()
@@ -32,12 +37,10 @@ n_coils = toroid_coil_config.n_field_coils
 
 # Generate and display the plot
 with st.spinner("Calculating geometry..."):
-    # Calculate 2D geometry
-    theta = RotationalAngles.THETA
-    plasma_boundary = calculate_poloidal_boundary(theta=theta, plasma_geometry=plasma_geometry)
-    toroidal_coil_2d = calculate_2d_geometry(
+    # Calculate geometry
+    plasma_boundary, toroidal_coil_2d = calculate_2d_geometry(
         plasma_geometry=plasma_geometry, toroid_coil_config=toroid_coil_config
-    )[1]  # Get only the coil 2D
+    )
 
     # Calculate 3D geometry
     fusion_plasma = calculate_fusion_plasma(plasma_boundary=plasma_boundary)
@@ -45,26 +48,35 @@ with st.spinner("Calculating geometry..."):
         toroidal_coil_2d=toroidal_coil_2d, toroid_coil_config=toroid_coil_config
     )
 
-    # Create plotter with vertical layout (2 rows, 1 column)
-    plotter = initialize_plotter(shape=(1, 2))
-    plotter.window_size = (1000, 1000)
+    # Create plotter based on view option
+    if view_option == "Both":
+        plotter = initialize_plotter(shape=(1, 2))
+        plotter.window_size = (1000, 800)
+    else:
+        plotter = initialize_plotter(shape=(1, 1))
+        plotter.window_size = (1000, 800)
 
-    # First row: 2D boundary
-    plotter.subplot(0, 0)
-    render_plasma_boundary(
-        plotter=plotter, plasma_boundary=plasma_boundary, toroidal_coil_2d=toroidal_coil_2d
-    )
+    # Render based on selection
+    if view_option in ["2D Geometry", "Both"]:
+        if view_option == "Both":
+            plotter.subplot(0, 0)
+        render_plasma_boundary(
+            plotter=plotter,
+            plasma_boundary=plasma_boundary,
+            toroidal_coil_2d=toroidal_coil_2d if show_coils else None,
+        )
 
-    # Second row: 3D geometry - use existing function
-    plotter.subplot(0, 1)
-    render_fusion_plasma(
-        plotter=plotter,
-        fusion_plasma=fusion_plasma,
-        toroidal_coils=toroidal_coils_3d,
-        show_cylindrical_angles=True,
-        show_wireframe=True,
-    )
-    plotter.view_isometric()
+    if view_option in ["3D Geometry", "Both"]:
+        if view_option == "Both":
+            plotter.subplot(0, 1)
+        render_fusion_plasma(
+            plotter=plotter,
+            fusion_plasma=fusion_plasma,
+            toroidal_coils=toroidal_coils_3d if show_coils else [],
+            show_cylindrical_angles=True,
+            show_wireframe=True,
+        )
+        plotter.view_isometric()
 
     # Display in Streamlit
     # Create a container for the plot
@@ -74,5 +86,5 @@ with st.spinner("Calculating geometry..."):
     with plot_container:
         stpyvista(
             plotter=plotter,
-            key=f"fusion_plot_{R0}_{a}_{kappa}_{delta}_{dist}_{r_thick}_{v_thick}_{span}_{n_coils}",
+            key=f"fusion_plot_{R0}_{a}_{kappa}_{delta}_{dist}_{r_thick}_{v_thick}_{span}_{n_coils}_{view_option}_{show_coils}",
         )
