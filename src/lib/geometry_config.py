@@ -51,8 +51,8 @@ class RotationalAngles(BaseModel):
     n_phi = 256  # Number of points in toroidal direction
     n_theta = 256  # Number of points in poloidal direction
 
-    PHI = jnp.linspace(0, 2 * jnp.pi, n_phi)  # Azimuthal angle in radians
-    THETA = jnp.linspace(0, 2 * jnp.pi, n_theta)  # Polar angle in radians
+    PHI = jnp.linspace(0, 2 * jnp.pi, n_phi, endpoint=False)  # Azimuthal angle in radians
+    THETA = jnp.linspace(0, 2 * jnp.pi, n_theta, endpoint=False)  # Polar angle in radians
 
 
 @dataclass
