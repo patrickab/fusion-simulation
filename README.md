@@ -1,13 +1,13 @@
 # Nuclear Fusion Simulation
 
-Work in progress. Implemented using JAX. Simulation of magnetic forces in a Tokamak Fusion Reactor using Physics Informed Neural Network (PINN).
+Simulation of magnetic forces in a Tokamak Fusion Reactor using a Physics Informed Neural Network (PINN). Implemented using JAX.
 
 ## Milestones
 - ✅ Define parametrizable Reactor Geometry &rarr; (numpy)
 - ✅ Migrate to differentiable geometry &rarr; (JAX)
 - ✅ Train Physics Informed Neural Network &rarr; (PINN)
 - ✅ Predict magnetic flux &rarr; (output of PINN)
-- ✅ Predict magnetic field lines &rarr; (spatial derivatives of PINN)
+- ✅ Predict magnetic field lines &rarr;
 - ✅ Visualize magnetic field lines in 3D
 - [ ] Finite Element Methods (FEM) validation
 - [ ] Kolmogorov Arnold Netwerk (KAN) with physics loss 
@@ -111,3 +111,4 @@ By conditioning on plasma parameters as network inputs — rather than training 
 - Toroidal field profile $F(\psi) = F_\text{axis}(1 - \psi_\text{norm}^\gamma)$ — monotone decrease from axis to edge
 - Fixed edge flux $\psi_\text{edge} = 0$ — plasma boundary is a single flux surface
 - Axis flux $\psi_\text{axis}$ estimated per-batch as $\min \psi$ over interior samples
+
