@@ -25,13 +25,12 @@ from src.lib.geometry_config import (
     ToroidalCoil3D,
     ToroidalCoilConfig,
 )
-from src.lib.linalg_utils import convert_rz_to_xyz
 from src.lib.network_config import FluxInput
 from src.lib.utils import _coils_to_polydata, _plasma_to_polydata
 from src.toroidal_geometry import calculate_toroidal_coil_boundary, generate_toroidal_coils_3d
 
 
-def initialize_plotter(shape: tuple[int, int] = (1, 1), **kwargs) -> pv.Plotter:
+def initialize_plotter(shape: tuple[int, int] = (1, 1), **kwargs: dict) -> pv.Plotter:
     """Create PyVista plotter with standard theme."""
     plotter = pv.Plotter(shape=shape, border=True, border_color="white", **kwargs)
     plotter.set_background("black")
@@ -108,6 +107,10 @@ def plot_plasma(
         # Create sparse sampling
         sparse_points = points[::step, ::step, :]
 
+        # Close the surface by appending the first row/column to wrap around
+        sparse_points = np.concatenate([sparse_points, sparse_points[:1, :, :]], axis=0)  # Close toroidal
+        sparse_points = np.concatenate([sparse_points, sparse_points[:, :1, :]], axis=1)  # Close poloidal
+
         # Extract coordinate arrays for structured grid
         x, y, z = sparse_points[:, :, 0], sparse_points[:, :, 1], sparse_points[:, :, 2]
         return pv.StructuredGrid(x, y, z).extract_surface()
@@ -168,22 +171,18 @@ def display_cylindrical_angles(
 
 
 def render_plasma_boundary(
-    plotter: pv.Plotter, plasma_boundary: PlasmaBoundary, toroidal_coil_2d: ToroidalCoil2D
+    plotter: pv.Plotter,
+    plasma_boundary: PlasmaBoundary,
+    toroidal_coil_2d: Optional[ToroidalCoil2D] = None,
 ) -> None:
     """Plot 2D cross-section of plasma and coils.
 
     Args:
         plotter: target plotter
         plasma_boundary: 2D plasma
-        toroidal_coil_2d: 2D coil
+        toroidal_coil_2d: 2D coil (optional)
     """
     plotter.add_title("2D Poloidal Cross-Section", font_size=16, color="white")
-
-    COIL_BOUNDARIES = [
-        (toroidal_coil_2d.R_inner, toroidal_coil_2d.Z_inner, "Inner"),
-        (toroidal_coil_2d.R_outer, toroidal_coil_2d.Z_outer, "Outer"),
-        (toroidal_coil_2d.R_center, toroidal_coil_2d.Z_center, "Center"),
-    ]
 
     # Plot plasma boundary directly in 2D (R-Z plane)
     plotter.add_lines(
@@ -193,14 +192,20 @@ def render_plasma_boundary(
         label="Plasma Boundary",
     )
 
-    # Add all toroidal coil boundaries in 2D
-    for R_coil, Z_coil, boundary_type in COIL_BOUNDARIES:
-        plotter.add_lines(
-            np.column_stack((R_coil, Z_coil, np.zeros_like(R_coil))),
-            color="purple",
-            width=2,
-            label=f"Toroidal Coil {boundary_type} Boundary",
-        )
+    # Add all toroidal coil boundaries in 2D if provided
+    if toroidal_coil_2d is not None:
+        COIL_BOUNDARIES = [
+            (toroidal_coil_2d.R_inner, toroidal_coil_2d.Z_inner, "Inner"),
+            (toroidal_coil_2d.R_outer, toroidal_coil_2d.Z_outer, "Outer"),
+            (toroidal_coil_2d.R_center, toroidal_coil_2d.Z_center, "Center"),
+        ]
+        for R_coil, Z_coil, boundary_type in COIL_BOUNDARIES:
+            plotter.add_lines(
+                np.column_stack((R_coil, Z_coil, np.zeros_like(R_coil))),
+                color="purple",
+                width=2,
+                label=f"Toroidal Coil {boundary_type} Boundary",
+            )
 
     # Set up 2D view
     plotter.camera_position = "xy"
@@ -287,7 +292,9 @@ def plot_flux_heatmap(
     if backend == "plotly":
         from plotly.subplots import make_subplots
 
-        def setup_physics_subplots(geoms: list[PlasmaGeometry]):
+        def setup_physics_subplots(
+            geoms: list[PlasmaGeometry],
+        ) -> tuple[go.Figure, list[float], list[float]]:
             r_min = min(g.R0 - g.a * 1.2 for g in geoms)
             r_max = max(g.R0 + g.a * 1.2 for g in geoms)
             z_max = max(g.kappa * g.a * 1.2 for g in geoms)
@@ -342,7 +349,7 @@ def plot_flux_heatmap(
                 idx,
             )
 
-        fig.update_layout(template="plotly_dark", margin=dict(l=20, r=20, t=20, b=20))
+        fig.update_layout(template="plotly_dark", margin={"l": 20, "r": 20, "t": 20, "b": 20})
         return fig
 
     elif backend == "pyvista":
