@@ -23,16 +23,9 @@ from src.lib.visualization import (
     render_fusion_plasma,
     render_magnetic_field_lines,
 )
-from src.streamlit.utils import reactor_config_sidebar
-from src.toroidal_geometry import (
-    calculate_toroidal_coil_boundary,
-    generate_toroidal_coils_3d,
-)
 import streamlit as st
 
-st.set_page_config(layout="wide", page_title="Plasma Geometry Lab")
-
-custom_geom, custom_coil_config = reactor_config_sidebar()
+st.set_page_config(layout="wide", page_title="Fusion Simulation Lab")
 
 # Define a type for the geometry data
 GeometryData = Dict[str, Union[PlasmaGeometry, PlasmaState, jnp.ndarray]]
@@ -180,7 +173,7 @@ def render_flux_predictions_tab(manager: NetworkManager, seed: int):
         st.error("Network parameters not found on disk. Please train the network first.")
 
 
-def render_3d_topology_tab(manager: NetworkManager, custom_coil_config):
+def render_3d_topology_tab(manager: NetworkManager):
     """Render the 3D topology and field line tracing tab."""
     col1, col2, _ = st.columns([1, 1, 4])
     idx_pv = col1.slider("Select Sample", 0, len(manager.train_set) - 1, 0, key="idx_pv_slider")
@@ -197,17 +190,12 @@ def render_3d_topology_tab(manager: NetworkManager, custom_coil_config):
     fusion_plasma = calculate_fusion_plasma(boundary_pv)
 
     st.subheader("3D Topology")
-    plotter = initialize_plotter(window_size=(800, 1000))
+    plotter = initialize_plotter(window_size=(1000, 900))
 
     render_fusion_plasma(
         plotter=plotter,
         fusion_plasma=fusion_plasma,
-        toroidal_coils=generate_toroidal_coils_3d(
-            calculate_toroidal_coil_boundary(
-                jnp.linspace(0, 2 * jnp.pi, 64), geom_pv, custom_coil_config
-            ),
-            custom_coil_config,
-        ),
+        toroidal_coils=[],
         show_wireframe=True,
     )
 
@@ -233,6 +221,6 @@ with tab2:
 
 with tab3:
     if manager:
-        render_3d_topology_tab(manager, custom_coil_config)
+        render_3d_topology_tab(manager)
     else:
         st.error("Network manager not initialized.")

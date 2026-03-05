@@ -1,30 +1,26 @@
 from stpyvista import stpyvista
 
 from src.engine.plasma import calculate_fusion_plasma
-from src.lib.geometry_config import PlasmaGeometry, ToroidalCoilConfig
 from src.lib.visualization import (
     calculate_2d_geometry,
     initialize_plotter,
     render_fusion_plasma,
     render_plasma_boundary,
 )
-from src.toroidal_geometry import generate_toroidal_coils_3d
 from src.streamlit.utils import reactor_config_sidebar
+from src.toroidal_geometry import generate_toroidal_coils_3d
 import streamlit as st
 
+st.set_page_config(layout="wide", page_title="Fusion Geometry Lab")
 st.title("Reactor Geometry")
+
+# Layout for view controls
+with st.sidebar:
+    view_option = st.selectbox("View Mode", ["2D Geometry", "3D Geometry", "Both"], index=2)
+    show_coils = st.checkbox("Show Coils", value=True)
 
 # Get geometry from sidebar
 plasma_geometry, toroid_coil_config = reactor_config_sidebar()
-
-# Layout for view controls
-col1, col2, col3 = st.columns([1, 1, 4])
-with col1:
-    view_option = st.selectbox(
-        "View Mode", ["2D Geometry", "3D Geometry", "Both"], index=2
-    )
-with col2:
-    show_coils = st.checkbox("Show Coils", value=True)
 
 # Extract parameters for the key
 R0, a, kappa, delta = (
@@ -55,10 +51,10 @@ with st.spinner("Calculating geometry..."):
     # Create plotter based on view option
     if view_option == "Both":
         plotter = initialize_plotter(shape=(1, 2))
-        plotter.window_size = (1000, 500)
+        plotter.window_size = (1000, 800)
     else:
         plotter = initialize_plotter(shape=(1, 1))
-        plotter.window_size = (600, 600)
+        plotter.window_size = (1000, 800)
 
     # Render based on selection
     if view_option in ["2D Geometry", "Both"]:

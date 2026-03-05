@@ -107,6 +107,10 @@ def plot_plasma(
         # Create sparse sampling
         sparse_points = points[::step, ::step, :]
 
+        # Close the surface by appending the first row/column to wrap around
+        sparse_points = np.concatenate([sparse_points, sparse_points[:1, :, :]], axis=0)  # Close toroidal
+        sparse_points = np.concatenate([sparse_points, sparse_points[:, :1, :]], axis=1)  # Close poloidal
+
         # Extract coordinate arrays for structured grid
         x, y, z = sparse_points[:, :, 0], sparse_points[:, :, 1], sparse_points[:, :, 2]
         return pv.StructuredGrid(x, y, z).extract_surface()

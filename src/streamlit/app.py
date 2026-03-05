@@ -1,7 +1,5 @@
 import streamlit as st
 
-st.set_page_config(layout="wide", page_title="Fusion Geometry Visualizer")
-
 # Define pages for navigation
 PAGES = {
     "Visualization": [
