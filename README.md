@@ -5,12 +5,19 @@ Simulation of magnetic forces in a Tokamak Fusion Reactor using a Physics Inform
 ## Milestones
 - ✅ Define parametrizable Reactor Geometry &rarr; (numpy)
 - ✅ Migrate to differentiable geometry &rarr; (JAX)
-- ✅ Train Physics Informed Neural Network &rarr; (PINN)
-- ✅ Predict magnetic flux &rarr; (output of PINN)
-- ✅ Predict magnetic field lines &rarr;
+- ✅ Train Physics Informed Neural Network
+- ✅ Predict magnetic flux
+- ✅ Predict magnetic field lines
 - ✅ Visualize magnetic field lines in 3D
-- [ ] Finite Element Methods (FEM) validation
-- [ ] Kolmogorov Arnold Netwerk (KAN) with physics loss 
+
+---
+
+## Table of Contents
+- [Reactor Geometry](#reactor-geometry)
+- [Physics Problem & Loss Function](#physics-problem--loss-function)
+- [Prediction of 3D Magnetic Field Lines](#prediction-of-3d-magnetic-field-lines)
+- [Neural Network Architecture](#neural-network-architecture)
+- [JAX Design Considerations](#jax-specific-design-considerations-for-efficiency)
 
 ---
 
@@ -111,4 +118,12 @@ By conditioning on plasma parameters as network inputs — rather than training 
 - Toroidal field profile $F(\psi) = F_\text{axis}(1 - \psi_\text{norm}^\gamma)$ — monotone decrease from axis to edge
 - Fixed edge flux $\psi_\text{edge} = 0$ — plasma boundary is a single flux surface
 - Axis flux $\psi_\text{axis}$ estimated per-batch as $\min \psi$ over interior samples
+
+---
+
+## JAX-specific design considerations for efficiency
+
+- **2nd order derivatives with (`jax.jvp`)**: Physics loss requires 2nd-order spatial derivatives. Nested JVP computes these without materializing full Hessians — O(1) memory vs O(n²) for reverse-mode Hessians.
+- **Double vmap vectorization**: Loss computation is vectorized over both plasma configurations & spatial collocation points, saturating GPU throughput on large tensor batches.
+- **Gradient checkpointing (`jax.checkpoint`)**: PDE residuals produce massive computational graphs from nested derivatives. Remat recomputes activations during backprop, allowing to train larger networks with limited VRAM.
 
