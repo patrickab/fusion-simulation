@@ -1,8 +1,6 @@
 import logging
 from logging import Logger
 from pathlib import Path
-import signal
-import sys
 from typing import Optional
 
 from rich.console import Console
@@ -16,7 +14,6 @@ def get_logger(name: str, log_dir: Optional[str] = None, level: int = logging.IN
     Supports both console (Rich) and file output.
     """
     install_rich_tracebacks(show_locals=True)
-    signal.signal(signal.SIGINT, sys.exit(0))
 
     logger = logging.getLogger(name)
     logger.setLevel(level)
