@@ -5,9 +5,9 @@ Simulation of magnetic forces in a Tokamak Fusion Reactor using a Physics Inform
 ## Milestones
 - ✅ Define parametrizable Reactor Geometry &rarr; (numpy)
 - ✅ Migrate to differentiable geometry &rarr; (JAX)
-- ✅ Train Physics Informed Neural Network &rarr; (PINN)
-- ✅ Predict magnetic flux &rarr; (output of PINN)
-- ✅ Predict magnetic field lines &rarr;
+- ✅ Train Physics Informed Neural Network
+- ✅ Predict magnetic flux
+- ✅ Predict magnetic field lines
 - ✅ Visualize magnetic field lines in 3D
 
 ---
@@ -126,3 +126,4 @@ By conditioning on plasma parameters as network inputs — rather than training 
 - **2nd order derivatives with (`jax.jvp`)**: Physics loss requires 2nd-order spatial derivatives. Nested JVP computes these without materializing full Hessians — O(1) memory vs O(n²) for reverse-mode Hessians.
 - **Double vmap vectorization**: Loss computation is vectorized over both plasma configurations & spatial collocation points, saturating GPU throughput on large tensor batches.
 - **Gradient checkpointing (`jax.checkpoint`)**: PDE residuals produce massive computational graphs from nested derivatives. Remat recomputes activations during backprop, allowing to train larger networks with limited VRAM.
+
