@@ -3,6 +3,7 @@
 from pathlib import Path
 from typing import Literal, Optional, Union
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import plotly.graph_objects as go
@@ -388,6 +389,114 @@ def plot_flux_heatmap(
             )
 
         return None
+
+
+def plot_gs_residual_heatmap(
+    manager: any,
+    configs: list[PlasmaConfig],
+    resolution: int = 50,
+) -> go.Figure:
+    """Render Grad-Shafranov residual heatmap showing PDE equilibrium error.
+
+    The residual measures how well the PINN solution satisfies the
+    Grad-Shafranov equation at each point in the plasma domain.
+    A residual near zero indicates the learned flux function
+    correctly satisfies the MHD force balance.
+
+    Args:
+        manager: NetworkManager with loaded PINN parameters.
+        configs: List of PlasmaConfig to evaluate.
+        resolution: Grid resolution per axis.
+
+    Returns:
+        Plotly Figure with residual heatmaps.
+    """
+    from plotly.subplots import make_subplots
+
+    from src.engine.physics import grad_shafranov_residual
+
+    geoms = [c.Geometry for c in configs]
+    r_min = min(float(g.R0 - g.a * 1.2) for g in geoms)
+    r_max = max(float(g.R0 + g.a * 1.2) for g in geoms)
+    z_max = max(float(g.kappa * g.a * 1.2) for g in geoms)
+    r_mid, extent = (r_min + r_max) / 2, max(r_max - r_min, 2 * z_max)
+    r_lims = [r_mid - extent / 2, r_mid + extent / 2]
+    z_lims = [-extent / 2, extent / 2]
+
+    fig = make_subplots(rows=1, cols=len(configs), shared_yaxes=True)
+
+    R = jnp.linspace(*r_lims, resolution)
+    Z = jnp.linspace(*z_lims, resolution)
+    R_grid, Z_grid = jnp.meshgrid(R, Z)
+    coords_flat = CylindricalCoordinates(
+        R=R_grid.flatten(), Z=Z_grid.flatten(), phi=jnp.zeros_like(R_grid.flatten())
+    )
+
+    # Build psi_fn matching the training signature for autodiff compatibility
+    apply_fn = manager.state.apply_fn
+    params = manager.state.params
+
+    def psi_fn(
+        p: any, r: jnp.ndarray, z: jnp.ndarray, cfg: PlasmaConfig
+    ) -> jnp.ndarray:
+        inp = FluxInput(R_sample=r, Z_sample=z, config=cfg)
+        p_n, r_n, z_n = inp.normalize()
+        psi_n = apply_fn(p, r=r_n, z=z_n, **p_n)
+        return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
+
+    for idx, cfg in enumerate(configs):
+        mask = is_point_in_plasma(coords_flat, cfg.Boundary)
+        residual = jnp.full(mask.shape, jnp.nan)
+
+        if mask.any():
+            R_masked = coords_flat.R[mask]
+            Z_masked = coords_flat.Z[mask]
+
+            # Estimate psi_axis from interior predictions
+            psi_vals = manager.get_psi(R_masked, Z_masked, cfg)
+            psi_axis = float(jnp.min(psi_vals))
+
+            # Compute GS residuals via vmap over interior grid points
+            compute_residual = jax.vmap(
+                lambda r, z, _pa=psi_axis, _c=cfg: grad_shafranov_residual(
+                    psi_fn, params, r, z, _pa, _c
+                )
+            )
+            res_vals = compute_residual(R_masked, Z_masked)
+            residual = residual.at[mask].set(res_vals.flatten())
+
+        col = idx + 1
+        residual_grid = np.array(residual).reshape(resolution, resolution)
+
+        fig.add_trace(
+            go.Heatmap(
+                x=np.array(R),
+                y=np.array(Z),
+                z=residual_grid,
+                colorscale="RdBu_r",
+                zmid=0,
+                zmin=-0.5,
+                zmax=0.5,
+                showscale=(col == len(configs)),
+                colorbar={"title": "Residual"} if col == len(configs) else None,
+            ),
+            1,
+            col,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=np.array(cfg.Boundary.R),
+                y=np.array(cfg.Boundary.Z),
+                mode="lines",
+                line={"color": "white", "width": 2},
+                showlegend=False,
+            ),
+            1,
+            col,
+        )
+
+    fig.update_layout(template="plotly_dark", margin={"l": 20, "r": 20, "t": 20, "b": 20})
+    return fig
 
 
 def render_fusion_plasma(

@@ -1,22 +1,27 @@
 from typing import Dict, List, Union
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from stpyvista import stpyvista
 
 from src.engine.network import NetworkManager, Sampler
+from src.engine.physics import grad_shafranov_residual
 from src.engine.plasma import (
     calculate_fusion_plasma,
     calculate_poloidal_boundary,
+    is_point_in_plasma,
 )
 from src.lib.geometry_config import (
+    CylindricalCoordinates,
     PlasmaConfig,
     PlasmaGeometry,
     PlasmaState,
     RotationalAngles,
 )
-from src.lib.network_config import HyperParams
+from src.lib.network_config import FluxInput, HyperParams
 from src.lib.visualization import (
     initialize_plotter,
     plot_flux_heatmap,
@@ -151,26 +156,181 @@ def render_geometry_sampling_tab(seed: int):
     st.plotly_chart(fig, use_container_width=True)
 
 
+def _build_psi_fn(manager: NetworkManager):
+    """Build a psi_fn(params, R, Z, config) closure matching the training-time signature.
+
+    This mirrors the closure inside ``NetworkManager.train_step`` so that
+    ``grad_shafranov_residual`` (which differentiates through *psi_fn*)
+    produces results fully consistent with the training loss.
+    """
+    apply_fn = manager.model.apply
+
+    def psi_fn(
+        params: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig
+    ) -> jnp.ndarray:
+        inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
+        p_n, r_n, z_n = inp.normalize()
+        psi_n = apply_fn(params, r=r_n, z=z_n, **p_n)
+        return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
+
+    return psi_fn
+
+
+def _compute_gs_residual_on_points(
+    manager: NetworkManager,
+    config: PlasmaConfig,
+    R_pts: jnp.ndarray,
+    Z_pts: jnp.ndarray,
+) -> jnp.ndarray:
+    """Evaluate the normalised Grad-Shafranov residual at given (R, Z) points.
+
+    Uses ``grad_shafranov_residual`` from *physics.py* — the same function
+    that the PINN training loss evaluates — so the heatmap is directly
+    comparable to the optimisation objective.
+    """
+    psi_fn = _build_psi_fn(manager)
+    params = manager.state.params
+
+    # Estimate psi_axis from the supplied points (mirrors training strategy)
+    psi_vals = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R_pts, Z_pts)
+    psi_axis = jax.lax.stop_gradient(jnp.min(psi_vals))
+
+    # Vectorised residual — identical to the inner vmap in pinn_loss_function
+    residual_fn = jax.vmap(
+        lambda r, z: grad_shafranov_residual(psi_fn, params, r, z, psi_axis, config)
+    )
+    return residual_fn(R_pts, Z_pts)
+
+
 def render_flux_predictions_tab(manager: NetworkManager, seed: int):
-    """Render the magnetic flux prediction heatmap tab."""
-    col1, col2, _ = st.columns([1, 1, 4])
-    res = col1.slider("Grid Resolution", 20, 200, 50, key="prediction_res")
+    """Render the magnetic flux prediction heatmap tab, with optional GS residual."""
+    col1, col2, col3, _ = st.columns([1, 1, 1, 3])
+    res = col1.slider("Grid Resolution", 20, 200, 100, key="prediction_res")
     tab_seed = col2.number_input("Random Seed", 0, 9999, seed, key="prediction_seed")
+    show_residual = col3.checkbox("Show GS Residual", value=False, key="show_gs_residual")
 
     data = get_data(tab_seed)
-    configs = []
+    configs: List[PlasmaConfig] = []
     for d in data:
         boundary = calculate_poloidal_boundary(
             jnp.linspace(0, 2 * jnp.pi, RotationalAngles.n_theta), d["geom"]
         )
         configs.append(PlasmaConfig(Geometry=d["geom"], Boundary=boundary, State=d["state"]))
 
-    if manager:
-        fig = plot_flux_heatmap(manager, configs, backend="plotly", resolution=res)
-        fig.update_layout(height=500)
-        st.plotly_chart(fig, use_container_width=True)
-    else:
+    if not manager:
         st.error("Network parameters not found on disk. Please train the network first.")
+        return
+
+    # --- Flux heatmap (always shown) ---
+    fig_flux = plot_flux_heatmap(manager, configs, backend="plotly", resolution=res)
+    fig_flux.update_layout(height=500)
+    st.subheader("Magnetic Flux ψ(R, Z)")
+    st.plotly_chart(fig_flux, use_container_width=True)
+
+    if not show_residual:
+        return
+
+    # --- GS Residual heatmap (displayed below the flux heatmap) ---
+    with st.spinner("Computing Grad-Shafranov residual…"):
+        # Build a common grid matching the flux-heatmap approach in visualization.py
+        geoms = [c.Geometry for c in configs]
+        r_min = min(float(g.R0 - g.a * 1.2) for g in geoms)
+        r_max = max(float(g.R0 + g.a * 1.2) for g in geoms)
+        z_max = max(float(g.kappa * g.a * 1.2) for g in geoms)
+        r_mid = (r_min + r_max) / 2
+        extent = max(r_max - r_min, 2 * z_max)
+        r_lims = [r_mid - extent / 2, r_mid + extent / 2]
+        z_lims = [-extent / 2, extent / 2]
+
+        R_lin = jnp.linspace(float(r_lims[0]), float(r_lims[1]), res)
+        Z_lin = jnp.linspace(float(z_lims[0]), float(z_lims[1]), res)
+        R_grid, Z_grid = jnp.meshgrid(R_lin, Z_lin)
+        R_flat = R_grid.flatten()
+        Z_flat = Z_grid.flatten()
+
+        coords_flat = CylindricalCoordinates(
+            R=R_flat, Z=Z_flat, phi=jnp.zeros_like(R_flat)
+        )
+
+        n_cols = len(configs)
+        fig_res = make_subplots(
+            rows=1,
+            cols=n_cols,
+            subplot_titles=[f"Config {i + 1}" for i in range(n_cols)],
+            horizontal_spacing=0.05,
+            shared_yaxes=True,
+        )
+
+        for idx, cfg in enumerate(configs):
+            mask = is_point_in_plasma(coords_flat, cfg.Boundary)
+
+            # Fill with NaN; only compute inside the plasma boundary
+            residual_full = jnp.full(R_flat.shape, jnp.nan)
+            if jnp.any(mask):
+                res_vals = _compute_gs_residual_on_points(
+                    manager, cfg, R_flat[mask], Z_flat[mask]
+                )
+                residual_full = residual_full.at[mask].set(res_vals)
+
+            residual_2d = np.array(residual_full).reshape(res, res)
+            col = idx + 1
+
+            fig_res.add_trace(
+                go.Heatmap(
+                    x=np.array(R_lin),
+                    y=np.array(Z_lin),
+                    z=residual_2d,
+                    colorscale="RdBu_r",
+                    zmid=0,
+                    zmin=-0.5,
+                    zmax=0.5,
+                    showscale=(col == n_cols),
+                    colorbar={"title": "Residual"} if col == n_cols else {},
+                ),
+                1,
+                col,
+            )
+            # Overlay plasma boundary
+            fig_res.add_trace(
+                go.Scatter(
+                    x=np.array(cfg.Boundary.R),
+                    y=np.array(cfg.Boundary.Z),
+                    mode="lines",
+                    line={"color": "white", "width": 2},
+                    showlegend=False,
+                ),
+                1,
+                col,
+            )
+
+        # Axis formatting to match the flux heatmap
+        for i in range(n_cols):
+            col = i + 1
+            fig_res.update_xaxes(title_text="R (m)", range=r_lims, row=1, col=col)
+            fig_res.update_yaxes(
+                range=z_lims,
+                scaleanchor=f"x{col if col > 1 else ''}",
+                scaleratio=1,
+                row=1,
+                col=col,
+            )
+            if i == 0:
+                fig_res.update_yaxes(title_text="Z (m)", row=1, col=col)
+
+        fig_res.update_layout(
+            height=500,
+            template="plotly_dark",
+            margin={"l": 20, "r": 20, "t": 40, "b": 20},
+            showlegend=False,
+        )
+
+    st.subheader("Grad-Shafranov Residual")
+    st.plotly_chart(fig_res, use_container_width=True)
+    st.caption(
+        "The residual shows where the PINN prediction deviates from the "
+        "Grad-Shafranov equation (delta*psi + mu_0 R^2 dp/dpsi + F dF/dpsi = 0). "
+        "Values near zero (white) indicate good physics compliance."
+    )
 
 
 def render_3d_topology_tab(manager: NetworkManager):
