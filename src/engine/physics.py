@@ -7,7 +7,7 @@ from src.lib.geometry_config import PlasmaConfig
 
 MU_0 = 4 * jnp.pi * 1e-7
 PSI_EDGE = 0.0  # Poloidal flux at plasma boundary
-WEIGHT_BOUNDARY_CONDITION = 10.0
+WEIGHT_BOUNDARY_CONDITION = 5.0
 
 
 def toroidal_field_flux_function(
@@ -168,8 +168,8 @@ def pinn_loss_function(
     R_interior: jnp.ndarray,
     Z_interior: jnp.ndarray,
     batch_config: PlasmaConfig,
-) -> jnp.ndarray:
-    """Computes the total PINN loss: L_total = L_residual + L_boundary
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Computes the total PINN loss: L_total = L_residual + w * L_boundary
 
     Uses a double-vectorization strategy.
     Processes entire tensor batches of plasma configs in parallel.
@@ -180,7 +180,9 @@ def pinn_loss_function(
     2. Inner Vmap: Iterates over the spatial samples (interior and boundary).
     """
 
-    def single_config_loss(R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig) -> jnp.ndarray:
+    def single_config_loss(
+        R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig
+    ) -> tuple[jnp.ndarray, jnp.ndarray]:
         # 1. Axis Estimation
         psi_int = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R, Z)
         psi_axis = jax.lax.stop_gradient(jnp.min(psi_int))
@@ -191,11 +193,12 @@ def pinn_loss_function(
         )
         loss_res = jnp.mean(residual_fn(R, Z) ** 2)
 
-        # 3. Boundary Condition Loss (Dirichlet & Neumann)
+        # 3. Boundary Condition Loss (Dirichlet: ψ = 0 at plasma edge)
         R_b, Z_b = config.Boundary.R, config.Boundary.Z
         psi_b = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R_b, Z_b)
         loss_dir = jnp.mean((psi_b - PSI_EDGE) ** 2)
 
+        # 4. Boundary Condition Loss (Neumann: dψ/dn = 0 at plasma edge)
         def grad_psi(r: jnp.ndarray, z: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
             return jax.grad(psi_fn, argnums=(1, 2))(params, r, z, config)
 
@@ -203,6 +206,12 @@ def pinn_loss_function(
         dpsi_dt = dR_b * config.Boundary.dR_dtheta + dZ_b * config.Boundary.dZ_dtheta
         loss_neu = jnp.mean(dpsi_dt**2)
 
-        return loss_res + WEIGHT_BOUNDARY_CONDITION * (loss_dir + loss_neu)
+        loss_boundary = loss_dir + loss_neu
 
-    return jnp.mean(jax.vmap(single_config_loss)(R_interior, Z_interior, batch_config))
+        return loss_res, loss_boundary
+
+    losses = jax.vmap(single_config_loss)(R_interior, Z_interior, batch_config)
+    loss_res = jnp.mean(losses[0])
+    loss_dir = jnp.mean(losses[1])
+    total = loss_res + WEIGHT_BOUNDARY_CONDITION * loss_dir
+    return total, loss_res, loss_dir
