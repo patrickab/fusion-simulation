@@ -16,15 +16,16 @@ class Filepaths:
 
     ROOT = Path.cwd()
     DATA = Path(ROOT) / "data"
+    NETWORKS = DATA / "networks"
 
-    if not DATA.exists():
-        print(f"Creating output directory at {DATA}")
-        pathlib.Path.mkdir(DATA, parents=True, exist_ok=True)
+    if not NETWORKS.exists():
+        print(f"Creating output directory at {NETWORKS}")
+        pathlib.Path.mkdir(DATA / "networks", parents=True)
 
     PLASMA_SURFACE = DATA / "plasma_surface.ply"
     TOROIDAL_COILS = DATA / "toroidal_field_coils.ply"
     TOROIDAL_COIL_3D_DIR = DATA / "toroidal_coils_3d"
-    PINN_PATH = DATA / "pinn_model"
+    PINN_PATH = NETWORKS / "pinn_model"
 
 
 class BaseModel:
