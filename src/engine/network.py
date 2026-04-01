@@ -159,11 +159,11 @@ class NetworkManager:
         with open(Filepaths.PINN_PATH, "wb") as f:
             f.write(flax.serialization.to_bytes(params))
 
-    @staticmethod
-    def from_disk(target) -> any:  # noqa
+    def from_disk(self, pinn_path=None) -> any:  # noqa
         """Load Flax model parameters from disk."""
-        with open(Filepaths.PINN_PATH, "rb") as f:
-            return flax.serialization.from_bytes(target, f.read())
+        pinn_path = Filepaths.PINN_PATH if pinn_path is None else pinn_path
+        with open(pinn_path, "rb") as f:
+            return flax.serialization.from_bytes(self.state.params, f.read())
 
     def _init_state(self) -> train_state.TrainState:
         """Initialize the training state with dummy data."""
