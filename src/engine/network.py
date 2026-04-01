@@ -55,6 +55,7 @@ class FluxPINN(nn.Module):
 
 # --- Sampler ---
 BASE_SEED = 42
+RESAMPLING_FREQUENCY = 10  # Resample training configs every N epochs
 
 
 class Sampler:
@@ -81,7 +82,7 @@ class Sampler:
             lower_bounds, upper_bounds = self._build_domain_bounds()
 
         sampler = qmc.Sobol(d=len(lower_bounds), scramble=True, seed=seed)
-        sample_unit = jnp.array(sampler.random(n_samples), dtype=jnp.bfloat16)
+        sample_unit = jnp.array(sampler.random(n_samples), dtype=jnp.float32)
         return sample_unit * (upper_bounds - lower_bounds) + lower_bounds
 
     def sample_flux_input(
@@ -93,14 +94,14 @@ class Sampler:
     ) -> FluxInput:
         """Sample interior and boundary points for a batch of plasma configurations."""
         sampler = qmc.Sobol(d=2, scramble=True, seed=seed)
-        samples = jnp.array(sampler.random(n_samples), dtype=jnp.bfloat16)
+        samples = jnp.array(sampler.random(n_samples), dtype=jnp.float32)
         theta_int = samples[:, 0] * 2 * jnp.pi
         rho_int = jnp.sqrt(samples[:, 1])
 
         # Use Sobol sampling for boundary points
         sampler_b = qmc.Sobol(d=1, scramble=True, seed=seed + 9999)
         theta_b = (
-            jnp.array(sampler_b.random(n_boundary_samples), dtype=jnp.bfloat16).flatten()
+            jnp.array(sampler_b.random(n_boundary_samples), dtype=jnp.float32).flatten()
             * 2
             * jnp.pi
         )
@@ -202,38 +203,42 @@ class NetworkManager:
     def train_step(
         state: train_state.TrainState,
         inputs: FluxInput,
-    ) -> tuple[train_state.TrainState, jnp.ndarray]:
-        """Perform a single training step using physics-informed gradients."""
+    ) -> tuple[train_state.TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Perform a single training step using physics-informed gradients.
 
-        def loss_fn(params: any) -> jnp.ndarray:
-            # Rematerialization trades compute for memory by recomputing activations during backprop
-            # In PINNs, high-order PDE residuals create massive graphs; remat keeps memory footprint
-            # near-constant relative to depth, enabling larger networks and point batches.
+        Returns:
+            Tuple of (updated_state, total_loss, residual_loss, boundary_loss).
+        """
+
+        def loss_fn(params: any) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
             @jax.checkpoint
             def psi_fn(p: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
-                # Map physical (R, Z) to normalized network input using FluxInput
                 inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
                 p_n, r_n, z_n = inp.normalize()
                 psi_n = state.apply_fn(p, r=r_n, z=z_n, **p_n)
-
-                # Denormalize output: psi = psi_net * (F_axis * a)
                 return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
 
-            return pinn_loss_function(
+            total, l_res, l_dir = pinn_loss_function(
                 psi_fn, params, inputs.R_sample, inputs.Z_sample, inputs.config
             )
+            # Return total for grad, carry components as aux
+            return total, (l_res, l_dir)
 
-        loss, grads = jax.value_and_grad(loss_fn)(state.params)
-        return state.apply_gradients(grads=grads), loss
+        (loss, (l_res, l_dir)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
+        return state.apply_gradients(grads=grads), loss, l_res, l_dir
 
     def calculate_loss(self, inputs: FluxInput) -> float:
         """Calculate loss for given inputs without updating state."""
-        _, loss = self.train_step(self.state, inputs)
+        _, loss, _, _ = self.train_step(self.state, inputs)
         return float(loss)
 
-    def train_epoch(self, epoch: int) -> float:
-        """Run one training epoch."""
-        loss = 0.0
+    def train_epoch(self, epoch: int) -> tuple[float, float, float]:
+        """Run one training epoch.
+
+        Returns:
+            Tuple of (total_loss, residual_loss, boundary_loss).
+        """
+        loss, l_res, l_dir = 0.0, 0.0, 0.0
         for i in range(0, len(self.train_set), self.config.batch_size):
             train_batch = self.train_set[i : i + self.config.batch_size]
             inputs = self.sampler.sample_flux_input(
@@ -242,15 +247,15 @@ class NetworkManager:
                 n_boundary_samples=self.config.n_rz_boundary_samples,
                 plasma_configs=train_batch,
             )
-            self.state, loss = self.train_step(state=self.state, inputs=inputs)
+            self.state, loss, l_res, l_dir = self.train_step(state=self.state, inputs=inputs)
 
         # Periodic dataset resampling
-        if epoch % 10 == 0 and epoch > 0:
+        if epoch % RESAMPLING_FREQUENCY == 0 and epoch > 0:
             self.train_set = self.sampler._get_sobol_sample(
                 n_samples=self.config.n_train,
                 seed=BASE_SEED + epoch,
             )
-        return float(loss)
+        return float(loss), float(l_res), float(l_dir)
 
     def train(
         self,
@@ -266,17 +271,16 @@ class NetworkManager:
             Final training loss
         """
         logger.info(f"Starting training for {self.epochs} epochs...")
-
-        loss = 0.0
         for epoch in range(self.epochs):
-            loss = self.train_epoch(epoch)
+            loss_total, l_residual, l_boundary = self.train_epoch(epoch)
             if epoch % 10 == 0 and epoch > 0:
-                logger.info(f"Epoch {epoch:5d} | Loss: [bold magenta]{loss:.2f}[/bold magenta]")
+                logger.info(
+                    f"Epoch {epoch:5d} | Loss: [bold magenta]{loss_total:.2f}[/bold magenta] "
+                    f"(residual={l_residual:.3f}, boundary={l_boundary:.3f})"
+                )
 
         if save_to_disk:
             self.to_disk(params=self.state.params)
-
-        return loss
 
     def predict(self, inputs: FluxInput) -> jnp.ndarray:
         """Generate predictions for given inputs."""
