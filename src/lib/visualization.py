@@ -1,14 +1,15 @@
 """Utility functions for visualizing fusion simulation geometry."""
 
 from pathlib import Path
-from typing import Literal, Optional, Union
+from typing import Literal, Optional
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import pyvista as pv
 
+from src.engine.model_evaluation import compute_gs_residual_on_points
 from src.engine.plasma import (
     calculate_fusion_plasma,
     calculate_poloidal_boundary,
@@ -81,6 +82,68 @@ def plot_toroidal_coils(
             )
 
 
+def plot_rz_samples(
+    geometries: list[PlasmaGeometry], rz_samples: list[dict[str, object]]
+) -> go.Figure:
+    """Plot interior and boundary R-Z samples for one or more geometries."""
+    titles = [f"Geometry {i + 1}" for i in range(len(geometries))]
+    r_min = min(g.R0 - g.a * 1.2 for g in geometries)
+    r_max = max(g.R0 + g.a * 1.2 for g in geometries)
+    z_max = max(g.kappa * g.a * 1.2 for g in geometries)
+
+    r_mid, extent = (r_min + r_max) / 2, max(r_max - r_min, 2 * z_max)
+    r_lims, z_lims = [r_mid - extent / 2, r_mid + extent / 2], [-extent / 2, extent / 2]
+
+    fig = make_subplots(
+        rows=1,
+        cols=len(geometries),
+        subplot_titles=titles,
+        horizontal_spacing=0.05,
+        shared_yaxes=True,
+    )
+    for i in range(len(geometries)):
+        col = i + 1
+        fig.update_xaxes(title_text="R (m)", range=r_lims, row=1, col=col)
+        fig.update_yaxes(
+            range=z_lims,
+            scaleanchor=f"x{col if col > 1 else ''}",
+            scaleratio=1,
+            row=1,
+            col=col,
+        )
+        if i == 0:
+            fig.update_yaxes(title_text="Z (m)", row=1, col=col)
+
+    fig.update_layout(margin={"t": 40, "b": 40, "l": 40, "r": 10}, showlegend=False)
+    fig.update_layout(height=600 if len(geometries) > 1 else 800)
+
+    for i, sample in enumerate(rz_samples, start=1):
+        fig.add_trace(
+            go.Scatter(
+                x=sample["iR"],
+                y=sample["iZ"],
+                mode="markers",
+                marker={"size": 2, "color": "purple"},
+                name="Interior",
+            ),
+            1,
+            i,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=sample["bR"],
+                y=sample["bZ"],
+                mode="markers",
+                marker={"size": 4, "color": "red"},
+                name="Boundary",
+            ),
+            1,
+            i,
+        )
+
+    return fig
+
+
 def plot_plasma(
     plotter: pv.Plotter,
     plasma: FusionPlasma | pv.PolyData | Path,
@@ -109,8 +172,8 @@ def plot_plasma(
         sparse_points = points[::step, ::step, :]
 
         # Close the surface by appending the first row/column to wrap around
-        sparse_points = np.concatenate([sparse_points, sparse_points[:1, :, :]], axis=0)  # Close toroidal
-        sparse_points = np.concatenate([sparse_points, sparse_points[:, :1, :]], axis=1)  # Close poloidal
+        sparse_points = np.concatenate([sparse_points, sparse_points[:1, :, :]], axis=0)
+        sparse_points = np.concatenate([sparse_points, sparse_points[:, :1, :]], axis=1)
 
         # Extract coordinate arrays for structured grid
         x, y, z = sparse_points[:, :, 0], sparse_points[:, :, 1], sparse_points[:, :, 2]
@@ -413,8 +476,6 @@ def plot_gs_residual_heatmap(
     """
     from plotly.subplots import make_subplots
 
-    from src.engine.physics import grad_shafranov_residual
-
     geoms = [c.Geometry for c in configs]
     r_min = min(float(g.R0 - g.a * 1.2) for g in geoms)
     r_max = max(float(g.R0 + g.a * 1.2) for g in geoms)
@@ -432,18 +493,6 @@ def plot_gs_residual_heatmap(
         R=R_grid.flatten(), Z=Z_grid.flatten(), phi=jnp.zeros_like(R_grid.flatten())
     )
 
-    # Build psi_fn matching the training signature for autodiff compatibility
-    apply_fn = manager.state.apply_fn
-    params = manager.state.params
-
-    def psi_fn(
-        p: any, r: jnp.ndarray, z: jnp.ndarray, cfg: PlasmaConfig
-    ) -> jnp.ndarray:
-        inp = FluxInput(R_sample=r, Z_sample=z, config=cfg)
-        p_n, r_n, z_n = inp.normalize()
-        psi_n = apply_fn(p, r=r_n, z=z_n, **p_n)
-        return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
-
     for idx, cfg in enumerate(configs):
         mask = is_point_in_plasma(coords_flat, cfg.Boundary)
         residual = jnp.full(mask.shape, jnp.nan)
@@ -452,17 +501,7 @@ def plot_gs_residual_heatmap(
             R_masked = coords_flat.R[mask]
             Z_masked = coords_flat.Z[mask]
 
-            # Estimate psi_axis from interior predictions
-            psi_vals = manager.get_psi(R_masked, Z_masked, cfg)
-            psi_axis = float(jnp.min(psi_vals))
-
-            # Compute GS residuals via vmap over interior grid points
-            compute_residual = jax.vmap(
-                lambda r, z, _pa=psi_axis, _c=cfg: grad_shafranov_residual(
-                    psi_fn, params, r, z, _pa, _c
-                )
-            )
-            res_vals = compute_residual(R_masked, Z_masked)
+            res_vals = compute_gs_residual_on_points(manager, cfg, R_masked, Z_masked)
             residual = residual.at[mask].set(res_vals.flatten())
 
         col = idx + 1

@@ -195,7 +195,7 @@ class NetworkManager:
         self.train_set = self.sampler._get_sobol_sample(
             n_samples=self.config.n_train,
             lower_bounds=self.sampler._domain_lower_bounds,
-            upper_bounds=self.sampler._domain_upper_bounds
+            upper_bounds=self.sampler._domain_upper_bounds,
         )
 
     @staticmethod
@@ -295,7 +295,7 @@ class NetworkManager:
             self.train_set = self.sampler._get_sobol_sample(
                 n_samples=self.config.n_train,
                 lower_bounds=self.sampler._domain_lower_bounds,
-                upper_bounds=self.sampler._domain_upper_bounds
+                upper_bounds=self.sampler._domain_upper_bounds,
             )
         return float(loss), float(l_res), float(l_dir)
 
