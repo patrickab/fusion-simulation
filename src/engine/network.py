@@ -1,3 +1,4 @@
+from time import time
 from typing import Literal
 
 from flax import linen as nn
@@ -313,13 +314,18 @@ class NetworkManager:
             Final training loss
         """
         logger.info(f"Starting training for {self.epochs} epochs...")
+        start_time = time()  # Initialize timer
         for epoch in range(self.epochs):
             loss_total, l_residual, l_boundary = self.train_epoch(epoch)
-            if epoch % 10 == 0 and epoch > 0:
+            if epoch % RESAMPLING_FREQUENCY == 0 and epoch > 0:
+                elapsed = time() - start_time
+                avg_speed = elapsed / RESAMPLING_FREQUENCY
                 logger.info(
-                    f"Epoch {epoch:5d} | Loss: [bold magenta]{loss_total:.2f}[/bold magenta] "
+                    f"Epoch: {epoch:4d} | sec/epoch: {avg_speed:.2f} | "
+                    f"Loss: [bold magenta]{loss_total:.2f}[/bold magenta] "
                     f"(residual={l_residual:.3f}, boundary={l_boundary:.3f})"
                 )
+                start_time = time()  # Reset timer
 
         if save_to_disk:
             self.to_disk(params=self.state.params)
@@ -468,8 +474,14 @@ class NetworkManager:
 
 
 if __name__ == "__main__":
-    config = HyperParams()
-    manager = NetworkManager(config)
-    manager.train(save_to_disk=True)
-    # params = manager.from_disk(manager.state.params)
-    # manager.state = manager.state.replace(params=params)
+    try:
+        config = HyperParams()
+        manager = NetworkManager(config)
+        manager.train(save_to_disk=True)
+        # params = manager.from_disk(manager.state.params)
+        # manager.state = manager.state.replace(params=params)
+    except KeyboardInterrupt:
+        pass
+    except Exception as e:
+        logger.error(f"Execution failed with an error: {e}", exc_info=True)
+        raise
