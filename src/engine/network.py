@@ -1,3 +1,6 @@
+from datetime import datetime
+import os
+from pathlib import Path
 from time import time
 from typing import Literal
 
@@ -199,15 +202,23 @@ class NetworkManager:
             upper_bounds=self.sampler._domain_upper_bounds,
         )
 
-    @staticmethod
-    def to_disk(params: jnp.ndarray) -> None:
-        """Save Flax model parameters to disk."""
-        with open(Filepaths.PINN_PATH, "wb") as f:
-            f.write(flax.serialization.to_bytes(params))
+    def to_disk(self) -> None:
+        """Save model parameters & config to disk."""
+        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
+        latest_commit = os.popen("git rev-parse --short HEAD").read().strip() or "no_git"
 
-    def from_disk(self, pinn_path=None) -> any:  # noqa
+        output_dir = Path(Filepaths.NETWORKS)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        artifact_stem = f"pinn_{timestamp}_{latest_commit}"
+        artifact_flax_path = output_dir / f"{artifact_stem}.flax"
+        artifact_json_path = output_dir / f"{artifact_stem}.json"
+
+        artifact_flax_path.write_bytes(flax.serialization.to_bytes(self.state.params))
+        self.config.to_json(path=str(artifact_json_path))
+
+    def from_disk(self, pinn_path) -> any:  # noqa
         """Load Flax model parameters from disk."""
-        pinn_path = Filepaths.PINN_PATH if pinn_path is None else pinn_path
         with open(pinn_path, "rb") as f:
             return flax.serialization.from_bytes(self.state.params, f.read())
 
@@ -321,14 +332,14 @@ class NetworkManager:
                 elapsed = time() - start_time
                 avg_speed = elapsed / RESAMPLING_FREQUENCY
                 logger.info(
-                    f"Epoch: {epoch:4d} | sec/epoch: {avg_speed:.2f} | "
-                    f"Loss: [bold magenta]{loss_total:.2f}[/bold magenta] "
-                    f"(residual={l_residual:.3f}, boundary={l_boundary:.3f})"
+                    f"Epoch: {epoch:4d} | Loss: [bold magenta]{loss_total:4.2f}[/bold magenta] | "
+                    f"(residual={l_residual:4.3f}, boundary={l_boundary:8.3f}) | ",
+                    f"sec/epoch: {avg_speed:.2f}",
                 )
                 start_time = time()  # Reset timer
 
         if save_to_disk:
-            self.to_disk(params=self.state.params)
+            self.to_disk()
 
     def predict(self, inputs: FluxInput) -> jnp.ndarray:
         """Generate predictions for given inputs."""

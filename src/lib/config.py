@@ -25,7 +25,6 @@ class Filepaths:
     PLASMA_SURFACE = DATA / "plasma_surface.ply"
     TOROIDAL_COILS = DATA / "toroidal_field_coils.ply"
     TOROIDAL_COIL_3D_DIR = DATA / "toroidal_coils_3d"
-    PINN_PATH = NETWORKS / "pinn_model"
 
 
 class BaseModel:

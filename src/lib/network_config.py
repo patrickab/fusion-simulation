@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 from flax import struct
 import jax.numpy as jnp
 
@@ -25,6 +28,55 @@ class HyperParams(BaseModel):
     n_val: int = 64
     warmup_epochs: int = 100
     decay_epochs: int = 500
+
+    def to_dict(self) -> dict:
+        """Serialize to a JSON-safe dictionary."""
+        return {
+            "input_dim": self.input_dim,
+            "output_dim": self.output_dim,
+            "hidden_dims": list(self.hidden_dims),  # JSON has no tuple type
+            "learning_rate_max": self.learning_rate_max,
+            "learning_rate_min": self.learning_rate_min,
+            "batch_size": self.batch_size,
+            "n_rz_inner_samples": self.n_rz_inner_samples,
+            "n_rz_boundary_samples": self.n_rz_boundary_samples,
+            "n_train": self.n_train,
+            "n_test": self.n_test,
+            "n_val": self.n_val,
+            "warmup_epochs": self.warmup_epochs,
+            "decay_epochs": self.decay_epochs,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "HyperParams":
+        """Deserialize from dictionary. All fields are expected to be present."""
+        return cls(
+            input_dim=int(data["input_dim"]),
+            output_dim=int(data["output_dim"]),
+            hidden_dims=tuple(int(x) for x in data["hidden_dims"]),
+            learning_rate_max=float(data["learning_rate_max"]),
+            learning_rate_min=float(data["learning_rate_min"]),
+            batch_size=int(data["batch_size"]),
+            n_rz_inner_samples=int(data["n_rz_inner_samples"]),
+            n_rz_boundary_samples=int(data["n_rz_boundary_samples"]),
+            n_train=int(data["n_train"]),
+            n_test=int(data["n_test"]),
+            n_val=int(data["n_val"]),
+            warmup_epochs=int(data["warmup_epochs"]),
+            decay_epochs=int(data["decay_epochs"]),
+        )
+
+    def to_json(self, path: str) -> None:
+        """Write hyperparameters to disk as JSON."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+
+    @classmethod
+    def from_json(cls, path: str) -> "HyperParams":
+        """Load hyperparameters from disk."""
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        return cls.from_dict(data)
 
 
 @struct.dataclass

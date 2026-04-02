@@ -30,14 +30,10 @@ st.set_page_config(layout="wide", page_title="Fusion Simulation Lab")
 
 def sync_selected_network() -> None:
     """Load selected checkpoint once and reseed shared samples."""
-    selected_network = st.session_state.selected_pinn
-    if st.session_state.get("loaded_pinn") == selected_network:
-        return
-
-    pinn_path = Filepaths.NETWORKS / selected_network
+    pinn_path = Filepaths.NETWORKS / st.session_state.selected_pinn
+    st.session_state.manager = NetworkManager(HyperParams.from_json(pinn_path.with_suffix(".json")))
     params = st.session_state.manager.from_disk(pinn_path=pinn_path)
     st.session_state.manager.state = st.session_state.manager.state.replace(params=params)
-    st.session_state.loaded_pinn = selected_network
     reseed_network_visualisation()
 
 
@@ -150,13 +146,13 @@ def main() -> None:
     if "manager" not in st.session_state:
         st.session_state.manager = NetworkManager(HyperParams())
         st.session_state.available_networks = sorted(
-            p.name for p in Filepaths.NETWORKS.iterdir() if p.is_file()
+            p.name for p in Filepaths.NETWORKS.glob("*.flax") if p.is_file()
         )
         st.session_state.selected_pinn = st.session_state.available_networks[0]
         st.session_state.seed = 0
         reseed_network_visualisation()
+        sync_selected_network()
 
-    sync_selected_network()
     render_sidebar()
 
     tab1, tab2, tab3 = st.tabs(["Geometry Sampling", "Flux Predictions", "3D Magnetic Field Lines"])
