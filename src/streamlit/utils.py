@@ -1,7 +1,9 @@
 import numpy as np
 import pyvista as pv
 
+from src.engine.network import NetworkManager, Sampler
 from src.lib.geometry_config import PlasmaGeometry, ToroidalCoilConfig
+from src.lib.geometry_config import PlasmaState
 import streamlit as st
 
 default_coil_config = ToroidalCoilConfig(
@@ -85,3 +87,53 @@ def generate_field_lines(
         max_time=100.0,
         initial_step_length=0.05,
     )
+
+
+def reseed_network_visualisation() -> None:
+    """Reseed deterministic samples used by the network visualisation page."""
+    manager: NetworkManager = st.session_state.manager
+    sampler = Sampler(manager.config, seed=int(st.session_state.seed))
+
+    seeded_geometry_configs = sampler._get_sobol_sample(
+        n_samples=4,
+        lower_bounds=sampler._domain_lower_bounds,
+        upper_bounds=sampler._domain_upper_bounds,
+        sobol_sampler="domain",
+    )
+    seeded_train_set = sampler._get_sobol_sample(
+        n_samples=manager.config.n_train,
+        lower_bounds=sampler._domain_lower_bounds,
+        upper_bounds=sampler._domain_upper_bounds,
+        sobol_sampler="domain",
+    )
+    sample_3d = seeded_train_set[st.session_state.seed]
+
+    geom_3d = PlasmaGeometry(
+        R0=sample_3d[0],
+        a=sample_3d[1],
+        kappa=sample_3d[2],
+        delta=sample_3d[3],
+    )
+    state_3d = PlasmaState(
+        p0=sample_3d[4],
+        F_axis=sample_3d[5],
+        pressure_alpha=sample_3d[6],
+        field_exponent=sample_3d[7],
+    )
+
+    flux_input = sampler.sample_flux_input(plasma_configs=seeded_geometry_configs)
+    seeded_geometry_data = [
+        {
+            "geom": flux_input.config[i].Geometry,
+            "state": flux_input.config[i].State,
+            "bR": flux_input.config[i].Boundary.R,
+            "bZ": flux_input.config[i].Boundary.Z,
+            "iR": flux_input.R_sample[i],
+            "iZ": flux_input.Z_sample[i],
+        }
+        for i in range(len(seeded_geometry_configs))
+    ]
+
+    st.session_state.seeded_geometry_data = seeded_geometry_data
+    st.session_state.seeded_3d_geom = geom_3d
+    st.session_state.seeded_3d_state = state_3d
