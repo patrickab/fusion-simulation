@@ -13,7 +13,7 @@ def get_logger(name: str, log_dir: Optional[str] = None, level: int = logging.IN
     Enhanced logger for NN projects.
     Supports both console (Rich) and file output.
     """
-    install_rich_tracebacks(show_locals=True)
+    install_rich_tracebacks(show_locals=False)
 
     logger = logging.getLogger(name)
     logger.setLevel(level)
