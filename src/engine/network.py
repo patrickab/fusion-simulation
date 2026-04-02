@@ -1,3 +1,5 @@
+from typing import Literal
+
 from flax import linen as nn
 import flax.serialization
 from flax.training import train_state
@@ -59,8 +61,26 @@ RESAMPLING_FREQUENCY = 10  # Resample training configs every N epochs
 
 
 class Sampler:
-    def __init__(self, config: HyperParams) -> None:
+    def __init__(self, config: HyperParams, seed: int = BASE_SEED) -> None:
         self.config = config
+        self.seed = seed
+        self._domain_lower_bounds, self._domain_upper_bounds = self._build_domain_bounds()
+
+        # Instatiate separate Sobol samplers for domain, interior points, and boundary points.
+        self._sobol_domain = qmc.Sobol(
+            d=len(self._domain_lower_bounds),
+            scramble=True,
+            seed=self.seed,
+        )
+        self._sobol_inner = qmc.Sobol(d=2, scramble=True, seed=self.seed + 1)
+        self._sobol_boundary = qmc.Sobol(d=1, scramble=True, seed=self.seed + 2)
+
+        # Pre-computed per-epoch coordinate samples.
+        self._theta_int: jnp.ndarray | None = None
+        self._rho_int: jnp.ndarray | None = None
+        self._theta_b: jnp.ndarray | None = None
+
+        self.precompute_coordinate_samples()
 
     def _build_domain_bounds(self) -> tuple[jnp.ndarray, jnp.ndarray]:
         """Create lower and upper bounds arrays for parameter sampling."""
@@ -73,38 +93,60 @@ class Sampler:
     def _get_sobol_sample(
         self,
         n_samples: int,
-        seed: int,
         lower_bounds: jnp.ndarray | None = None,
         upper_bounds: jnp.ndarray | None = None,
+        sobol_sampler: Literal["interior", "boundary", "domain"] | None = None,
     ) -> jnp.ndarray:
         """Generate Sobol sequence samples within specified bounds."""
-        if lower_bounds is None and upper_bounds is None:
-            lower_bounds, upper_bounds = self._build_domain_bounds()
 
-        sampler = qmc.Sobol(d=len(lower_bounds), scramble=True, seed=seed)
-        sample_unit = jnp.array(sampler.random(n_samples), dtype=jnp.float32)
+        sobol_sampler = {
+            "interior": self._sobol_inner,
+            "boundary": self._sobol_boundary,
+            "domain": self._sobol_domain,
+        }.get(sobol_sampler, self._sobol_domain)
+
+        sample_unit = jnp.array(sobol_sampler.random(n_samples), dtype=jnp.float32)
         return sample_unit * (upper_bounds - lower_bounds) + lower_bounds
+
+    def precompute_coordinate_samples(
+        self,
+        n_inner_samples: int | None = None,
+        n_boundary_samples: int | None = None,
+    ) -> None:
+        """Precompute Sobol interior and boundary coordinates for one epoch."""
+        n_inner = self.config.n_rz_inner_samples if n_inner_samples is None else n_inner_samples
+        n_boundary = (
+            self.config.n_rz_boundary_samples if n_boundary_samples is None else n_boundary_samples
+        )
+
+        inner_samples = self._get_sobol_sample(
+            n_samples=n_inner,
+            lower_bounds=jnp.array([0.0, 0.0], dtype=jnp.float32),
+            upper_bounds=jnp.array([2 * jnp.pi, 1.0], dtype=jnp.float32),
+            sobol_sampler="interior",
+        )
+        self._theta_int = inner_samples[:, 0]
+        self._rho_int = jnp.sqrt(inner_samples[:, 1])
+
+        boundary_samples = self._get_sobol_sample(
+            n_samples=n_boundary,
+            lower_bounds=jnp.array([0.0], dtype=jnp.float32),
+            upper_bounds=jnp.array([2 * jnp.pi], dtype=jnp.float32),
+            sobol_sampler="boundary",
+        )
+        self._theta_b = boundary_samples[:, 0]
 
     def sample_flux_input(
         self,
-        seed: int,
-        n_samples: int,
-        n_boundary_samples: int,
         plasma_configs: jnp.ndarray,
     ) -> FluxInput:
         """Sample interior and boundary points for a batch of plasma configurations."""
-        sampler = qmc.Sobol(d=2, scramble=True, seed=seed)
-        samples = jnp.array(sampler.random(n_samples), dtype=jnp.float32)
-        theta_int = samples[:, 0] * 2 * jnp.pi
-        rho_int = jnp.sqrt(samples[:, 1])
+        if self._theta_int is None or self._rho_int is None or self._theta_b is None:
+            self.precompute_coordinate_samples()
 
-        # Use Sobol sampling for boundary points
-        sampler_b = qmc.Sobol(d=1, scramble=True, seed=seed + 9999)
-        theta_b = (
-            jnp.array(sampler_b.random(n_boundary_samples), dtype=jnp.float32).flatten()
-            * 2
-            * jnp.pi
-        )
+        theta_int = self._theta_int
+        rho_int = self._rho_int
+        theta_b = self._theta_b
 
         def compute_single_config(
             plasma_config: jnp.ndarray,
@@ -141,17 +183,19 @@ class Sampler:
 
 # --- Trainer ---
 class NetworkManager:
-    def __init__(self, config: HyperParams) -> None:
+    def __init__(self, config: HyperParams, seed: int = BASE_SEED) -> None:
         self.config = config
+        self.seed = seed
         self.model = FluxPINN(
             hidden_dims=config.hidden_dims,
         )
-        self.sampler: Sampler = Sampler(config)
+        self.sampler: Sampler = Sampler(config, seed=self.seed)
         self.state = self._init_state()
 
         self.train_set = self.sampler._get_sobol_sample(
             n_samples=self.config.n_train,
-            seed=BASE_SEED,
+            lower_bounds=self.sampler._domain_lower_bounds,
+            upper_bounds=self.sampler._domain_upper_bounds
         )
 
     @staticmethod
@@ -168,7 +212,7 @@ class NetworkManager:
 
     def _init_state(self) -> train_state.TrainState:
         """Initialize the training state with dummy data."""
-        key = jax.random.PRNGKey(BASE_SEED)
+        key = jax.random.PRNGKey(self.seed)
         d_rz = jnp.ones((1, self.config.n_rz_inner_samples))
         d_p = jnp.ones(1)
 
@@ -239,21 +283,19 @@ class NetworkManager:
             Tuple of (total_loss, residual_loss, boundary_loss).
         """
         loss, l_res, l_dir = 0.0, 0.0, 0.0
+        self.sampler.precompute_coordinate_samples()
+
         for i in range(0, len(self.train_set), self.config.batch_size):
             train_batch = self.train_set[i : i + self.config.batch_size]
-            inputs = self.sampler.sample_flux_input(
-                seed=epoch + i,
-                n_samples=self.config.n_rz_inner_samples,
-                n_boundary_samples=self.config.n_rz_boundary_samples,
-                plasma_configs=train_batch,
-            )
+            inputs = self.sampler.sample_flux_input(plasma_configs=train_batch)
             self.state, loss, l_res, l_dir = self.train_step(state=self.state, inputs=inputs)
 
         # Periodic dataset resampling
         if epoch % RESAMPLING_FREQUENCY == 0 and epoch > 0:
             self.train_set = self.sampler._get_sobol_sample(
                 n_samples=self.config.n_train,
-                seed=BASE_SEED + epoch,
+                lower_bounds=self.sampler._domain_lower_bounds,
+                upper_bounds=self.sampler._domain_upper_bounds
             )
         return float(loss), float(l_res), float(l_dir)
 

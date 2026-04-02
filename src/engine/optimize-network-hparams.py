@@ -94,12 +94,7 @@ def check_max_capacity(ss: SearchSpace) -> None:
 
         manager = NetworkManager(max_config)
         train_batch = manager.train_set[0 : max_config.batch_size]
-        inputs = manager.sampler.sample_flux_input(
-            seed=0,
-            n_samples=max_config.n_rz_inner_samples,
-            n_boundary_samples=max_config.n_rz_boundary_samples,
-            plasma_configs=train_batch,
-        )
+        inputs = manager.sampler.sample_flux_input(plasma_configs=train_batch)
         # Compilation and first step execution
         manager.state, _ = manager.train_step(manager.state, inputs)
 
