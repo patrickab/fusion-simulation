@@ -260,6 +260,7 @@ class NetworkManager:
     def train_step(
         state: train_state.TrainState,
         inputs: FluxInput,
+        weight_boundary_condition: float,
     ) -> tuple[train_state.TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Perform a single training step using physics-informed gradients.
 
@@ -276,7 +277,12 @@ class NetworkManager:
                 return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
 
             total, l_res, l_dir = pinn_loss_function(
-                psi_fn, params, inputs.R_sample, inputs.Z_sample, inputs.config
+                psi_fn,
+                params,
+                inputs.R_sample,
+                inputs.Z_sample,
+                inputs.config,
+                weight_boundary_condition=weight_boundary_condition,
             )
             # Return total for grad, carry components as aux
             return total, (l_res, l_dir)
@@ -286,7 +292,11 @@ class NetworkManager:
 
     def calculate_loss(self, inputs: FluxInput) -> float:
         """Calculate loss for given inputs without updating state."""
-        _, loss, _, _ = self.train_step(self.state, inputs)
+        _, loss, _, _ = self.train_step(
+            self.state,
+            inputs,
+            self.config.weight_boundary_condition,
+        )
         return float(loss)
 
     def train_epoch(self, epoch: int) -> tuple[float, float, float]:
@@ -301,7 +311,11 @@ class NetworkManager:
         for i in range(0, len(self.train_set), self.config.batch_size):
             train_batch = self.train_set[i : i + self.config.batch_size]
             inputs = self.sampler.sample_flux_input(plasma_configs=train_batch)
-            self.state, loss, l_res, l_dir = self.train_step(state=self.state, inputs=inputs)
+            self.state, loss, l_res, l_dir = self.train_step(
+                state=self.state,
+                inputs=inputs,
+                weight_boundary_condition=self.config.weight_boundary_condition,
+            )
 
         # Periodic dataset resampling
         if epoch % RESAMPLING_FREQUENCY == 0 and epoch > 0:

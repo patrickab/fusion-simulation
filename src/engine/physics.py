@@ -7,7 +7,6 @@ from src.lib.geometry_config import PlasmaConfig
 
 MU_0 = 4 * jnp.pi * 1e-7
 PSI_EDGE = 0.0  # Poloidal flux at plasma boundary
-WEIGHT_BOUNDARY_CONDITION = 10.0
 
 
 def toroidal_field_flux_function(
@@ -168,6 +167,7 @@ def pinn_loss_function(
     R_interior: jnp.ndarray,
     Z_interior: jnp.ndarray,
     batch_config: PlasmaConfig,
+    weight_boundary_condition: float,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Computes the total PINN loss: L_total = L_residual + w * L_boundary
 
@@ -213,5 +213,5 @@ def pinn_loss_function(
     losses = jax.vmap(single_config_loss)(R_interior, Z_interior, batch_config)
     loss_res = jnp.mean(losses[0])
     loss_boundary = jnp.mean(losses[1])
-    total = loss_res + WEIGHT_BOUNDARY_CONDITION * loss_boundary
+    total = loss_res + weight_boundary_condition * loss_boundary
     return total, loss_res, loss_boundary
