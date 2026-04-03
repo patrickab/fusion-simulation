@@ -181,7 +181,7 @@ class Sampler:
                 z_interior,
             )
 
-        configs, R_int, Z_int = jax.vmap(compute_single_config)(plasma_configs)
+        configs, R_int, Z_int = jax.jit(jax.vmap(compute_single_config))(plasma_configs)
 
         return FluxInput(R_sample=R_int, Z_sample=Z_int, config=configs)
 
