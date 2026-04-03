@@ -62,6 +62,7 @@ class FluxPINN(nn.Module):
 # --- Sampler ---
 BASE_SEED = 42
 RESAMPLING_FREQUENCY = 10  # Resample training configs every N epochs
+LOG_FREQUENCY = 10  # Log training metrics every N epochs
 
 
 class Sampler:
@@ -328,13 +329,13 @@ class NetworkManager:
         start_time = time()  # Initialize timer
         for epoch in range(self.epochs):
             loss_total, l_residual, l_boundary = self.train_epoch(epoch)
-            if epoch % RESAMPLING_FREQUENCY == 0 and epoch > 0:
+            if epoch % LOG_FREQUENCY == 0 and epoch > 0:
                 elapsed = time() - start_time
-                avg_speed = elapsed / RESAMPLING_FREQUENCY
+                avg_speed = elapsed / LOG_FREQUENCY
                 logger.info(
-                    f"Epoch: {epoch:4d} | Loss: [bold magenta]{loss_total:4.2f}[/bold magenta] | "
-                    f"(residual={l_residual:4.3f}, boundary={l_boundary:8.3f}) | ",
-                    f"sec/epoch: {avg_speed:.2f}",
+                    f"Epoch: {epoch:4d} | Loss: [bold magenta]{loss_total:6.3f}[/bold magenta] | "
+                    f"(residual= {l_residual:5.2f}, boundary= {l_boundary:2.2f}) | "
+                    f"sec/epoch: {avg_speed:.2f}"
                 )
                 start_time = time()  # Reset timer
 
