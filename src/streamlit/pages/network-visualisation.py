@@ -1,3 +1,5 @@
+import json
+
 import jax.numpy as jnp
 from stpyvista import stpyvista
 
@@ -140,6 +142,10 @@ def render_sidebar() -> None:
             key="seed",
             on_change=reseed_network_visualisation,
         )
+        pinn_path = Filepaths.NETWORKS / st.session_state.selected_pinn
+        if pinn_path.with_suffix(".json").exists():
+            with open(pinn_path.with_suffix(".json")) as f:
+                st.json(json.load(f))
 
 
 def main() -> None:
