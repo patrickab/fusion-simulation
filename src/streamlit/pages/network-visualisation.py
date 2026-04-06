@@ -129,12 +129,66 @@ def render_3d_topology_tab():  # noqa
 
 def render_sidebar() -> None:
     with st.sidebar:
-        st.selectbox(
-            "Select Network",
-            options=st.session_state.available_networks,
-            key="selected_pinn",
-            on_change=sync_selected_network,
-        )
+        top_container = st.container()
+
+        if st.session_state.get("selected_pinn"):
+            col1, col2 = st.columns(2)
+
+            # Rename Network
+            rename_clicked = col1.button("Rename", use_container_width=True)
+            if rename_clicked:
+                st.session_state.rename_mode = not st.session_state.get("rename_mode", False)
+
+            if st.session_state.get("rename_mode", False):
+                new_name = st.text_input(
+                    "New Name", value=st.session_state.selected_pinn.replace(".flax", "")
+                )
+                if st.button("Save Name") and new_name:
+                    flax_name = new_name if new_name.endswith(".flax") else f"{new_name}.flax"
+                    old_path = Filepaths.NETWORKS / st.session_state.selected_pinn
+                    new_path = Filepaths.NETWORKS / flax_name
+
+                    if old_path.exists():
+                        old_path.rename(new_path)
+                    if old_path.with_suffix(".json").exists():
+                        old_path.with_suffix(".json").rename(new_path.with_suffix(".json"))
+
+                    # Update state
+                    st.session_state.available_networks = sorted(
+                        p.name for p in Filepaths.NETWORKS.glob("*.flax") if p.is_file()
+                    )
+                    st.session_state.selected_pinn = flax_name
+                    st.session_state.rename_mode = False
+                    sync_selected_network()
+                    st.rerun()
+
+            # Delete Network
+            if col2.button("Delete", use_container_width=True, type="primary"):
+                target_path = Filepaths.NETWORKS / st.session_state.selected_pinn
+                if target_path.exists():
+                    target_path.unlink()
+                if target_path.with_suffix(".json").exists():
+                    target_path.with_suffix(".json").unlink()
+
+                st.session_state.available_networks = sorted(
+                    p.name for p in Filepaths.NETWORKS.glob("*.flax") if p.is_file()
+                )
+                if st.session_state.available_networks:
+                    st.session_state.selected_pinn = st.session_state.available_networks[-1]
+                    sync_selected_network()
+                else:
+                    st.session_state.selected_pinn = None
+                st.session_state.rename_mode = False
+                st.rerun()
+
+        with top_container:
+            st.selectbox(
+                "Select Network",
+                options=st.session_state.available_networks,
+                key="selected_pinn",
+                on_change=sync_selected_network,
+            )
+
         st.slider(
             "Select Sample",
             min_value=0,
