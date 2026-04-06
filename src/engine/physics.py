@@ -106,7 +106,7 @@ def shafranov_operator(
 # Rematerialization trades compute for memory by recomputing activations during backprop.
 # In PINNs, high-order PDE residuals create massive graphs; remat keeps memory footprint
 # near-constant relative to depth, enabling larger networks and point batches.
-@partial(jax.checkpoint, static_argnums=0)
+#@partial(jax.checkpoint, static_argnums=0)
 def grad_shafranov_residual(
     psi_fn: callable,
     params: any,
@@ -168,7 +168,7 @@ def pinn_loss_function(
     Z_interior: jnp.ndarray,
     batch_config: PlasmaConfig,
     weight_boundary_condition: float,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Computes the total PINN loss: L_total = L_residual + w * L_boundary
 
     Uses a double-vectorization strategy.
@@ -213,5 +213,6 @@ def pinn_loss_function(
     losses = jax.vmap(single_config_loss)(R_interior, Z_interior, batch_config)
     loss_res = jnp.mean(losses[0])
     loss_boundary = jnp.mean(losses[1])
+    per_config_loss = losses[0] + weight_boundary_condition * losses[1]
     total = loss_res + weight_boundary_condition * loss_boundary
-    return total, loss_res, loss_boundary
+    return total, loss_res, loss_boundary, per_config_loss

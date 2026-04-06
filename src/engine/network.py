@@ -247,7 +247,7 @@ class NetworkManager:
             decay_steps=self.config.decay_epochs * steps_per_epoch,
             end_value=self.config.learning_rate_min,
         )
-        tx = optax.adam(learning_rate=schedule)
+        tx = optax.adamw(learning_rate=schedule, weight_decay=self.config.weight_decay)
         return train_state.TrainState.create(apply_fn=self.model.apply, params=params, tx=tx)
 
     @property
@@ -261,22 +261,24 @@ class NetworkManager:
         state: train_state.TrainState,
         inputs: FluxInput,
         weight_boundary_condition: float,
-    ) -> tuple[train_state.TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ) -> tuple[train_state.TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Perform a single training step using physics-informed gradients.
 
         Returns:
-            Tuple of (updated_state, total_loss, residual_loss, boundary_loss).
+            Tuple of (updated_state, total_loss, residual_loss, boundary_loss, per_config_loss).
         """
 
-        def loss_fn(params: any) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
-            @jax.checkpoint
+        def loss_fn(
+            params: any,
+        ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
+            #@jax.checkpoint
             def psi_fn(p: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
                 inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
                 p_n, r_n, z_n = inp.normalize()
                 psi_n = state.apply_fn(p, r=r_n, z=z_n, **p_n)
                 return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
 
-            total, l_res, l_dir = pinn_loss_function(
+            total, l_res, l_dir, l_per_cfg = pinn_loss_function(
                 psi_fn,
                 params,
                 inputs.R_sample,
@@ -285,14 +287,15 @@ class NetworkManager:
                 weight_boundary_condition=weight_boundary_condition,
             )
             # Return total for grad, carry components as aux
-            return total, (l_res, l_dir)
+            return total, (l_res, l_dir, l_per_cfg)
 
-        (loss, (l_res, l_dir)), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
-        return state.apply_gradients(grads=grads), loss, l_res, l_dir
+        val_and_grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, (l_res, l_dir, l_per_cfg)), grads = val_and_grad_fn(state.params)
+        return state.apply_gradients(grads=grads), loss, l_res, l_dir, l_per_cfg
 
     def calculate_loss(self, inputs: FluxInput) -> float:
         """Calculate loss for given inputs without updating state."""
-        _, loss, _, _ = self.train_step(
+        _, loss, _, _, _ = self.train_step(
             self.state,
             inputs,
             self.config.weight_boundary_condition,
@@ -308,22 +311,47 @@ class NetworkManager:
         loss, l_res, l_dir = 0.0, 0.0, 0.0
         self.sampler.precompute_coordinate_samples()
 
+        all_losses = []
+
         for i in range(0, len(self.train_set), self.config.batch_size):
             train_batch = self.train_set[i : i + self.config.batch_size]
             inputs = self.sampler.sample_flux_input(plasma_configs=train_batch)
-            self.state, loss, l_res, l_dir = self.train_step(
+            self.state, loss, l_res, l_dir, per_config_loss = self.train_step(
                 state=self.state,
                 inputs=inputs,
                 weight_boundary_condition=self.config.weight_boundary_condition,
             )
+            all_losses.append(per_config_loss)
 
         # Periodic dataset resampling
         if epoch % RESAMPLING_FREQUENCY == 0 and epoch > 0:
-            self.train_set = self.sampler._get_sobol_sample(
-                n_samples=self.config.n_train,
+            n_sobol = self.config.n_train // 2
+            n_adaptive = self.config.n_train - n_sobol
+
+            sobol_samples = self.sampler._get_sobol_sample(
+                n_samples=n_sobol,
                 lower_bounds=self.sampler._domain_lower_bounds,
                 upper_bounds=self.sampler._domain_upper_bounds,
             )
+
+            all_losses_jnp = jnp.concatenate(all_losses)
+            top_k_indices = jnp.argsort(all_losses_jnp)[-n_adaptive:]
+            top_k_configs = self.train_set[top_k_indices]
+
+            bounds_range = self.sampler._domain_upper_bounds - self.sampler._domain_lower_bounds
+            key = jax.random.PRNGKey(self.seed + epoch)
+            noise = jax.random.normal(key, top_k_configs.shape) * (
+                self.config.sigma_residual_adaptive_sampling * bounds_range
+            )
+
+            adaptive_samples = jnp.clip(
+                top_k_configs + noise,
+                a_min=self.sampler._domain_lower_bounds,
+                a_max=self.sampler._domain_upper_bounds,
+            )
+
+            self.train_set = jnp.concatenate([sobol_samples, adaptive_samples], axis=0)
+
         return float(loss), float(l_res), float(l_dir)
 
     def train(
