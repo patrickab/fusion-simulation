@@ -17,10 +17,12 @@ class HyperParams(BaseModel):
 
     input_dim: int = 10  # 2 (RZ) + 8 (Params)
     output_dim: int = 1
-    hidden_dims: tuple[int, ...] = (128, 128, 128, 128)
+    hidden_dims: tuple[int, ...] = (128, 128, 128, 128, 128)
     learning_rate_max: float = 4e-3
-    learning_rate_min: float = 6e-6
-    weight_boundary_condition: float = 5.0
+    learning_rate_min: float = 2e-4
+    weight_decay: float = 1e-7
+    weight_boundary_condition: float = 10.0
+    sigma_residual_adaptive_sampling: float = 0.1
     batch_size: int = BATCH_SIZE
     n_rz_inner_samples: int = 2048
     n_rz_boundary_samples: int = 256
@@ -38,6 +40,9 @@ class HyperParams(BaseModel):
             "hidden_dims": list(self.hidden_dims),  # JSON has no tuple type
             "learning_rate_max": self.learning_rate_max,
             "learning_rate_min": self.learning_rate_min,
+            "weight_decay": self.weight_decay,
+            "weight_boundary_condition": self.weight_boundary_condition,
+            "sigma_residual_adaptive_sampling": self.sigma_residual_adaptive_sampling,
             "batch_size": self.batch_size,
             "n_rz_inner_samples": self.n_rz_inner_samples,
             "n_rz_boundary_samples": self.n_rz_boundary_samples,
@@ -57,6 +62,11 @@ class HyperParams(BaseModel):
             hidden_dims=tuple(int(x) for x in data["hidden_dims"]),
             learning_rate_max=float(data["learning_rate_max"]),
             learning_rate_min=float(data["learning_rate_min"]),
+            weight_decay=float(data.get("weight_decay", 1e-4)),
+            weight_boundary_condition=float(data.get("weight_boundary_condition", 5.0)),
+            sigma_residual_adaptive_sampling=float(
+                data.get("sigma_residual_adaptive_sampling", 0.05)
+            ),
             batch_size=int(data["batch_size"]),
             n_rz_inner_samples=int(data["n_rz_inner_samples"]),
             n_rz_boundary_samples=int(data["n_rz_boundary_samples"]),
