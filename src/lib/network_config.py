@@ -7,9 +7,6 @@ import jax.numpy as jnp
 from src.lib.config import BaseModel
 from src.lib.geometry_config import PlasmaConfig
 
-BATCH_SIZE = 64
-N_TRAIN = 1024
-
 
 @struct.dataclass
 class HyperParams(BaseModel):
@@ -23,10 +20,10 @@ class HyperParams(BaseModel):
     weight_decay: float = 1e-7
     weight_boundary_condition: float = 10.0
     sigma_residual_adaptive_sampling: float = 0.1
-    batch_size: int = BATCH_SIZE
+    batch_size: int = 64
     n_rz_inner_samples: int = 2048
     n_rz_boundary_samples: int = 256
-    n_train: int = N_TRAIN
+    n_train: int = 1024
     n_test: int = 32
     n_val: int = 64
     warmup_epochs: int = 100
@@ -59,6 +56,13 @@ class DomainBounds(BaseModel):
     # Exponent from 1.01 for numerical stability
     alpha: tuple[float, float] = (1.01, 2.0)  # Pressure profile shape
     exponent: tuple[float, float] = (1.01, 2.0)  # Current profile shape
+
+    @classmethod
+    def get_bounds(cls) -> tuple[jnp.ndarray, jnp.ndarray]:
+        bound_names = list(DomainBounds.__dataclass_fields__.keys())
+        l_bounds = jnp.array([getattr(DomainBounds, name)[0] for name in bound_names])
+        u_bounds = jnp.array([getattr(DomainBounds, name)[1] for name in bound_names])
+        return l_bounds, u_bounds
 
 
 def min_max_scale(val: jnp.ndarray, bounds: tuple[float, float]) -> jnp.ndarray:

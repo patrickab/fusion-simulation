@@ -59,8 +59,8 @@ class FluxPINN(nn.Module):
         """
         # Broadcast all inputs to match coordinate shape (B, N)
         target_shape = r.shape
-        params = [r, z, r0, a, kappa, delta, p0, f_axis, alpha, exponent]
-        x = jnp.stack([jnp.broadcast_to(p, target_shape) for p in params], axis=-1)
+        inputs = [r, z, r0, a, kappa, delta, p0, f_axis, alpha, exponent]
+        x = jnp.stack([jnp.broadcast_to(input, target_shape) for input in inputs], axis=-1)
 
         for dim in self.hidden_dims:
             x = nn.Dense(features=dim, dtype=jnp.float32)(x)
@@ -77,13 +77,19 @@ LOG_FREQUENCY = 10  # Log training metrics every N epochs
 
 
 class Sampler:
+    """Data generation engine for PINN training.
+
+    Uses quasi-random Sobol sequences to guarantee even parameter space coverage without clustering
+    Uses adaptive sampling to focus on high-loss regions, improving model convergence.
+    """
+
     def __init__(self, config: HyperParams, seed: int = BASE_SEED) -> None:
         self.config = config
         self.seed = seed
-        self._domain_lower_bounds, self._domain_upper_bounds = self._build_domain_bounds()
+        self._domain_lower_bounds, self._domain_upper_bounds = DomainBounds.get_bounds()
 
-        # Instatiate separate Sobol samplers for domain, interior points, and boundary points.
-        # Avoids repetitive instatiation of samplers.
+        # Instantiate separate Sobol samplers for domain, interior points, and boundary points.
+        # Avoids repetitive instatiation.
         self._sobol_domain = qmc.Sobol(
             d=len(self._domain_lower_bounds),
             scramble=True,
@@ -92,20 +98,7 @@ class Sampler:
         self._sobol_inner = qmc.Sobol(d=2, scramble=True, seed=self.seed + 1)
         self._sobol_boundary = qmc.Sobol(d=1, scramble=True, seed=self.seed + 2)
 
-        # Pre-computed per-epoch coordinate samples.
-        self._theta_int: jnp.ndarray | None = None
-        self._rho_int: jnp.ndarray | None = None
-        self._theta_b: jnp.ndarray | None = None
-
         self.precompute_coordinate_samples()
-
-    def _build_domain_bounds(self) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """Create lower and upper bounds arrays for parameter sampling."""
-        # Get all field names from DomainBounds dataclass
-        bound_names = list(DomainBounds.__dataclass_fields__.keys())
-        l_bounds = jnp.array([getattr(DomainBounds, name)[0] for name in bound_names])
-        u_bounds = jnp.array([getattr(DomainBounds, name)[1] for name in bound_names])
-        return l_bounds, u_bounds
 
     def _get_sobol_sample(
         self,
@@ -153,19 +146,56 @@ class Sampler:
         )
         self._theta_b = boundary_samples[:, 0]
 
+    def resample_train_set(
+        self,
+        train_set: jnp.ndarray,
+        epoch: int,
+        per_config_losses: list[jnp.ndarray],
+    ) -> jnp.ndarray:
+        """Generate new training set.
+
+        50% drawn via Sobol Sequence: maintains global coverage.
+        50% drawn via Adaptive Sampling: focuses on high-loss regions for improved learning.
+        """
+        n_sobol = self.config.n_train // 2
+        n_adaptive = self.config.n_train - n_sobol
+
+        sobol_samples = self._get_sobol_sample(
+            n_samples=n_sobol,
+            lower_bounds=self._domain_lower_bounds,
+            upper_bounds=self._domain_upper_bounds,
+        )
+
+        all_losses = jnp.concatenate(per_config_losses)
+        top_k_indices = jnp.argsort(all_losses)[-n_adaptive:]
+        top_k_configs = train_set[top_k_indices]
+
+        bounds_range = self._domain_upper_bounds - self._domain_lower_bounds
+        key = jax.random.PRNGKey(self.seed + epoch)
+        noise = jax.random.normal(key, top_k_configs.shape) * (
+            self.config.sigma_residual_adaptive_sampling * bounds_range
+        )
+
+        adaptive_samples = jnp.clip(
+            top_k_configs + noise,
+            a_min=self._domain_lower_bounds,
+            a_max=self._domain_upper_bounds,
+        )
+
+        return jnp.concatenate([sobol_samples, adaptive_samples], axis=0)
+
     def sample_flux_input(
         self,
         plasma_configs: jnp.ndarray,
     ) -> FluxInput:
         """Sample interior and boundary points for a batch of plasma configurations.
 
-        Creates one set of coordinates, then casts them for each plasma config.
-        More efficient than sampling separate coordinates per config.
-        Overfitting avoided by resampling coordinates each epoch.
-        """
-        if self._theta_int is None or self._rho_int is None or self._theta_b is None:
-            self.precompute_coordinate_samples()
+        All configurations within each epoch share the same set of normalized RZ-coordinates.
+        Normalized coordinates are then individually scaled to the plasma configuration on the GPU.
+        This minimizes CPU-to-GPU memory transfer.
 
+        Overfitting is avoided by resampling coordinates each epoch.
+        """
         theta_int = self._theta_int
         rho_int = self._rho_int
         theta_b = self._theta_b
@@ -350,41 +380,19 @@ class NetworkManager:
             )
             all_losses.append(per_config_loss)
 
-        # Periodic dataset resampling
         if epoch % RESAMPLING_FREQUENCY == 0 and epoch > 0:
-            n_sobol = self.config.n_train // 2
-            n_adaptive = self.config.n_train - n_sobol
-
-            sobol_samples = self.sampler._get_sobol_sample(
-                n_samples=n_sobol,
-                lower_bounds=self.sampler._domain_lower_bounds,
-                upper_bounds=self.sampler._domain_upper_bounds,
+            self.train_set = self.sampler.resample_train_set(
+                train_set=self.train_set,
+                epoch=epoch,
+                per_config_losses=all_losses,
             )
-
-            all_losses_jnp = jnp.concatenate(all_losses)
-            top_k_indices = jnp.argsort(all_losses_jnp)[-n_adaptive:]
-            top_k_configs = self.train_set[top_k_indices]
-
-            bounds_range = self.sampler._domain_upper_bounds - self.sampler._domain_lower_bounds
-            key = jax.random.PRNGKey(self.seed + epoch)
-            noise = jax.random.normal(key, top_k_configs.shape) * (
-                self.config.sigma_residual_adaptive_sampling * bounds_range
-            )
-
-            adaptive_samples = jnp.clip(
-                top_k_configs + noise,
-                a_min=self.sampler._domain_lower_bounds,
-                a_max=self.sampler._domain_upper_bounds,
-            )
-
-            self.train_set = jnp.concatenate([sobol_samples, adaptive_samples], axis=0)
 
         return float(loss), float(l_res), float(l_dir)
 
     def train(
         self,
         save_to_disk: bool = True,
-    ) -> float:
+    ) -> None:
         """
         Train the model.
 
