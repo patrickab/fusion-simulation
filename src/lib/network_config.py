@@ -32,51 +32,6 @@ class HyperParams(BaseModel):
     warmup_epochs: int = 100
     decay_epochs: int = 500
 
-    def to_dict(self) -> dict:
-        """Serialize to a JSON-safe dictionary."""
-        return {
-            "input_dim": self.input_dim,
-            "output_dim": self.output_dim,
-            "hidden_dims": list(self.hidden_dims),  # JSON has no tuple type
-            "learning_rate_max": self.learning_rate_max,
-            "learning_rate_min": self.learning_rate_min,
-            "weight_decay": self.weight_decay,
-            "weight_boundary_condition": self.weight_boundary_condition,
-            "sigma_residual_adaptive_sampling": self.sigma_residual_adaptive_sampling,
-            "batch_size": self.batch_size,
-            "n_rz_inner_samples": self.n_rz_inner_samples,
-            "n_rz_boundary_samples": self.n_rz_boundary_samples,
-            "n_train": self.n_train,
-            "n_test": self.n_test,
-            "n_val": self.n_val,
-            "warmup_epochs": self.warmup_epochs,
-            "decay_epochs": self.decay_epochs,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict) -> "HyperParams":
-        """Deserialize from dictionary. All fields are expected to be present."""
-        return cls(
-            input_dim=int(data["input_dim"]),
-            output_dim=int(data["output_dim"]),
-            hidden_dims=tuple(int(x) for x in data["hidden_dims"]),
-            learning_rate_max=float(data["learning_rate_max"]),
-            learning_rate_min=float(data["learning_rate_min"]),
-            weight_decay=float(data.get("weight_decay", 1e-4)),
-            weight_boundary_condition=float(data.get("weight_boundary_condition", 5.0)),
-            sigma_residual_adaptive_sampling=float(
-                data.get("sigma_residual_adaptive_sampling", 0.05)
-            ),
-            batch_size=int(data["batch_size"]),
-            n_rz_inner_samples=int(data["n_rz_inner_samples"]),
-            n_rz_boundary_samples=int(data["n_rz_boundary_samples"]),
-            n_train=int(data["n_train"]),
-            n_test=int(data["n_test"]),
-            n_val=int(data["n_val"]),
-            warmup_epochs=int(data["warmup_epochs"]),
-            decay_epochs=int(data["decay_epochs"]),
-        )
-
     def to_json(self, path: str) -> None:
         """Write hyperparameters to disk as JSON."""
         p = Path(path)

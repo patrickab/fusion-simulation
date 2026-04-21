@@ -2,7 +2,8 @@
 
 import pathlib
 from pathlib import Path
-from typing import Iterator, Self
+import typing
+from typing import Any, Iterator, Self
 
 import jax
 import jax.numpy as jnp
@@ -70,6 +71,38 @@ class BaseModel:
             else:
                 out[k] = v
         return out
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Self:
+        """
+        Constructs the dataclass from a dictionary.
+        Converts lists to tuples for JAX/Flax hashability.
+        """
+        kwargs = {}
+        type_hints = typing.get_type_hints(cls)
+        for k, v in data.items():
+            if isinstance(v, dict):
+                t = type_hints.get(k)
+                if t and hasattr(t, "from_dict"):
+                    kwargs[k] = t.from_dict(v)
+                else:
+                    kwargs[k] = v
+            elif isinstance(v, list):
+                t = type_hints.get(k)
+                origin = typing.get_origin(t) or t
+                if origin is tuple:
+                    kwargs[k] = tuple(v)
+                else:
+                    kwargs[k] = v
+            else:
+                t = type_hints.get(k)
+                if t is int and isinstance(v, str):
+                    kwargs[k] = int(v)
+                elif t is float and isinstance(v, str):
+                    kwargs[k] = float(v)
+                else:
+                    kwargs[k] = v
+        return cls(**kwargs)
 
     def __repr__(self) -> str:
         """String representation."""
