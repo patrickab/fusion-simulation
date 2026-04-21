@@ -35,17 +35,28 @@ class FluxPINN(nn.Module):
     @nn.compact
     def __call__(
         self,
-        r: jnp.ndarray,
-        z: jnp.ndarray,
-        r0: jnp.ndarray,
-        a: jnp.ndarray,
-        kappa: jnp.ndarray,
-        delta: jnp.ndarray,
-        p0: jnp.ndarray,
-        f_axis: jnp.ndarray,
-        alpha: jnp.ndarray,
-        exponent: jnp.ndarray,
+        r: jnp.ndarray,  # r coordinates of shape (B, N)
+        z: jnp.ndarray,  # z coordinates of shape (B, N)
+        r0: jnp.ndarray,  # major radius (reactor center)
+        a: jnp.ndarray,  # minor radius (poloidal plasma)
+        kappa: jnp.ndarray,  # elongation factor
+        delta: jnp.ndarray,  # triangularity factor
+        p0: jnp.ndarray,  # central plasma pressure
+        f_axis: jnp.ndarray,  # toroidal field on psi-axis (tesla-meters)
+        alpha: jnp.ndarray,  # pressure profile shaping parameter
+        exponent: jnp.ndarray,  # current profile shaping parameter
     ) -> jnp.ndarray:
+        """
+        Note: JAX requires a stateless definition for neural networks.
+              This prohibits passing the FluxInput dataclass directly.
+              Therefore all inputs must be passed as arguments.
+
+        Args:
+            Batch of Normalized FluxInput parameters:
+
+        Returns:
+            Normalized Flux prediction of shape (B, N, 1)
+        """
         # Broadcast all inputs to match coordinate shape (B, N)
         target_shape = r.shape
         params = [r, z, r0, a, kappa, delta, p0, f_axis, alpha, exponent]
@@ -61,7 +72,7 @@ class FluxPINN(nn.Module):
 
 # --- Sampler ---
 BASE_SEED = 42
-RESAMPLING_FREQUENCY = 10  # Resample training configs every N epochs
+RESAMPLING_FREQUENCY = 10  # Resample training set every N epochs
 LOG_FREQUENCY = 10  # Log training metrics every N epochs
 
 
@@ -72,6 +83,7 @@ class Sampler:
         self._domain_lower_bounds, self._domain_upper_bounds = self._build_domain_bounds()
 
         # Instatiate separate Sobol samplers for domain, interior points, and boundary points.
+        # Avoids repetitive instatiation of samplers.
         self._sobol_domain = qmc.Sobol(
             d=len(self._domain_lower_bounds),
             scramble=True,
@@ -145,7 +157,12 @@ class Sampler:
         self,
         plasma_configs: jnp.ndarray,
     ) -> FluxInput:
-        """Sample interior and boundary points for a batch of plasma configurations."""
+        """Sample interior and boundary points for a batch of plasma configurations.
+
+        Creates one set of coordinates, then casts them for each plasma config.
+        More efficient than sampling separate coordinates per config.
+        Overfitting avoided by resampling coordinates each epoch.
+        """
         if self._theta_int is None or self._rho_int is None or self._theta_b is None:
             self.precompute_coordinate_samples()
 
@@ -153,10 +170,11 @@ class Sampler:
         rho_int = self._rho_int
         theta_b = self._theta_b
 
+        # Define single case
         def compute_single_config(
             plasma_config: jnp.ndarray,
         ) -> tuple[PlasmaConfig, jnp.ndarray, jnp.ndarray]:
-            geom = PlasmaGeometry(
+            geometry = PlasmaGeometry(
                 R0=plasma_config[0],
                 a=plasma_config[1],
                 kappa=plasma_config[2],
@@ -168,25 +186,26 @@ class Sampler:
                 pressure_alpha=plasma_config[6],
                 field_exponent=plasma_config[7],
             )
-            boundary = calculate_poloidal_boundary(theta_b, geom)
+            boundary = calculate_poloidal_boundary(theta_b, geometry)
 
             # Interior points
-            r_interior, z_interior = jax.vmap(lambda t, r: get_poloidal_points(t, geom, r))(
-                theta_int, rho_int
-            )
+            r_interior, z_interior = jax.vmap(
+                lambda theta, rho: get_poloidal_points(theta, geometry, rho)
+            )(theta_int, rho_int)
 
             return (
-                PlasmaConfig(Geometry=geom, Boundary=boundary, State=state),
+                PlasmaConfig(Geometry=geometry, Boundary=boundary, State=state),
                 r_interior,
                 z_interior,
             )
 
+        # Vectorize, compile & execute over batch of plasma configs
         configs, R_int, Z_int = jax.jit(jax.vmap(compute_single_config))(plasma_configs)
 
         return FluxInput(R_sample=R_int, Z_sample=Z_int, config=configs)
 
 
-# --- Trainer ---
+# --- Manager for Training / Inference ---
 class NetworkManager:
     def __init__(self, config: HyperParams, seed: int = BASE_SEED) -> None:
         self.config = config
@@ -274,7 +293,12 @@ class NetworkManager:
         def loss_fn(
             params: any,
         ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-            #@jax.checkpoint
+            # @jax.checkpoint
+            # JAX checkpoint allows rematerialization of activations.
+            # Trades compute for memory allowing to train larger networks with limited GPU memory.
+
+            # Define psi_fn locally for JIT stability.
+            # Using _make_psi_fn() would create new function objects per step, risking cache misses.
             def psi_fn(p: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
                 inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
                 p_n, r_n, z_n = inp.normalize()
