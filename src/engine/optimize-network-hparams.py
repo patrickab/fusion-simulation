@@ -18,7 +18,7 @@ from torch.quasirandom import SobolEngine
 
 from src.engine.network import NetworkManager
 from src.lib.logger import get_logger
-from src.lib.network_config import BATCH_SIZE, N_TRAIN, HyperParams
+from src.lib.network_config import HyperParams
 
 logger = get_logger(name="HPO", log_dir="logs/hpo")
 
@@ -75,8 +75,8 @@ class SearchSpace:
             learning_rate_min=lr * 0.01,
             warmup_epochs=10,
             decay_epochs=50,
-            n_train=N_TRAIN,
-            batch_size=BATCH_SIZE,
+            n_train=HyperParams.n_train,
+            batch_size=HyperParams.batch_size,
         )
 
 
