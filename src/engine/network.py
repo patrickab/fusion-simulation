@@ -290,34 +290,34 @@ class NetworkManager:
             Tuple of (updated_state, total_loss, residual_loss, boundary_loss, per_config_loss).
         """
 
+        # Define psi_fn locally for JIT stability.
+        # Using _make_psi_fn() would create new function objects per step, risking cache misses.
+        def psi_fn(params: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
+            """Adapter converting neural network output to physical psi flux."""
+            inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
+            p_n, r_n, z_n = inp.normalize()
+            psi_n = state.apply_fn(params, r=r_n, z=z_n, **p_n)
+            return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
+
+        # @jax.checkpoint
+        # Rematerializes activations during backprop. Trades compute for memory,
+        # enabling training of larger networks with limited GPU memory.
         def loss_fn(
             params: any,
         ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-            # @jax.checkpoint
-            # JAX checkpoint allows rematerialization of activations.
-            # Trades compute for memory allowing to train larger networks with limited GPU memory.
-
-            # Define psi_fn locally for JIT stability.
-            # Using _make_psi_fn() would create new function objects per step, risking cache misses.
-            def psi_fn(p: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
-                inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
-                p_n, r_n, z_n = inp.normalize()
-                psi_n = state.apply_fn(p, r=r_n, z=z_n, **p_n)
-                return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
-
             total, l_res, l_dir, l_per_cfg = pinn_loss_function(
-                psi_fn,
+                psi_fn,  # Passes callable directly
                 params,
                 inputs.R_sample,
                 inputs.Z_sample,
                 inputs.config,
                 weight_boundary_condition=weight_boundary_condition,
             )
-            # Return total for grad, carry components as aux
             return total, (l_res, l_dir, l_per_cfg)
 
-        val_and_grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
-        (loss, (l_res, l_dir, l_per_cfg)), grads = val_and_grad_fn(state.params)
+        (loss, (l_res, l_dir, l_per_cfg)), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+            state.params
+        )
         return state.apply_gradients(grads=grads), loss, l_res, l_dir, l_per_cfg
 
     def calculate_loss(self, inputs: FluxInput) -> float:
