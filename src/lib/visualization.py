@@ -10,6 +10,7 @@ from plotly.subplots import make_subplots
 import pyvista as pv
 
 from src.engine.model_evaluation import compute_gs_residual_on_points
+from src.engine.physics import get_b_field_cartesian
 from src.engine.plasma import (
     calculate_fusion_plasma,
     calculate_poloidal_boundary,
@@ -310,7 +311,9 @@ def render_magnetic_field_lines(
     X_j, Y_j, Z_j = jnp.array(X), jnp.array(Y), jnp.array(Z)
 
     # Query network for Cartesian B-vectors
-    vectors = network_manager.get_b_field_cartesian(X_j, Y_j, Z_j, config)
+    vectors = get_b_field_cartesian(
+        network_manager.make_psi_fn(), network_manager.state.params, X_j, Y_j, Z_j, config
+    )
 
     # Assign vectors to grid
     grid["B_field"] = np.array(vectors)
