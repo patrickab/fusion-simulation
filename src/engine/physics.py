@@ -1,4 +1,5 @@
 from functools import partial
+from typing import Callable
 
 import jax
 import jax.numpy as jnp
@@ -7,6 +8,9 @@ from src.lib.geometry_config import PlasmaConfig
 
 MU_0 = 4 * jnp.pi * 1e-7
 PSI_EDGE = 0.0  # Poloidal flux at plasma boundary
+
+
+PsiFn = Callable[[any, jnp.ndarray, jnp.ndarray, PlasmaConfig], jnp.ndarray]
 
 
 def toroidal_field_flux_function(
@@ -216,3 +220,90 @@ def pinn_loss_function(
     per_config_loss = losses[0] + weight_boundary_condition * losses[1]
     total = loss_res + weight_boundary_condition * loss_boundary
     return total, loss_res, loss_boundary, per_config_loss
+
+
+def get_b_field(
+    psi_fn: PsiFn,
+    params: any,
+    R: jnp.ndarray,
+    Z: jnp.ndarray,
+    config: PlasmaConfig,
+) -> jnp.ndarray:
+    """Calculate magnetic field from flux function via Grad-Shafranov equilibrium.
+
+    Theory: B = ∇ψ * ∇φ + F(ψ)∇φ in axisymmetric geometry
+    Yields: B_R = -(1/R)∂ψ/∂Z, B_Z = (1/R)∂ψ/∂R, B_φ = F(ψ)/R
+
+    Args:
+        psi_fn: Function computing ψ(params, R, Z, config).
+        params: Neural network parameters or any psi_fn state.
+        R: Major radial coordinates [m].
+        Z: Vertical coordinates [m].
+        config: Plasma geometry and state parameters.
+
+    Returns:
+        (N, 3) array of [B_R, B_Z, B_φ] in Tesla.
+    """
+    R_arr = jnp.atleast_1d(R).flatten()
+    Z_arr = jnp.atleast_1d(Z).flatten()
+
+    def scalar_psi(r: jnp.ndarray, z: jnp.ndarray) -> jnp.ndarray:
+        rn = jnp.asarray(r)
+        zn = jnp.asarray(z)
+        return psi_fn(params, rn, zn, config).squeeze()
+
+    grad_psi_fn = jax.vmap(jax.grad(scalar_psi, argnums=(0, 1)))
+    dpsi_dR, dpsi_dZ = grad_psi_fn(R_arr, Z_arr)
+
+    BR = -dpsi_dZ / R_arr
+    BZ = dpsi_dR / R_arr
+
+    psi_vals = jax.vmap(scalar_psi)(R_arr, Z_arr)
+    psi_axis = scalar_psi(config.Geometry.R0, 0.0)
+
+    F_val = toroidal_field_flux_function(
+        psi_vals, psi_axis, config.State.F_axis, config.State.field_exponent
+    )
+    Bphi = F_val / R_arr
+
+    return jnp.column_stack([BR, BZ, Bphi])
+
+
+def get_b_field_cartesian(
+    psi_fn: PsiFn,
+    params: any,
+    X: jnp.ndarray,
+    Y: jnp.ndarray,
+    Z: jnp.ndarray,
+    config: PlasmaConfig,
+) -> jnp.ndarray:
+    """Transform cylindrical B-field to Cartesian coordinates.
+
+    Coordinate transform: (R, φ, Z) → (X, Y, Z) where R = √(X²+Y²), φ = atan2(Y, X)
+    Basis transform: e_R = cos(φ)e_X + sin(φ)e_Y, e_φ = -sin(φ)e_X + cos(φ)e_Y
+
+    Args:
+        psi_fn: Function computing ψ(params, R, Z, config).
+        params: Neural network parameters or any psi_fn state.
+        X: Cartesian X coordinates [m].
+        Y: Cartesian Y coordinates [m].
+        Z: Cartesian Z coordinates [m].
+        config: Plasma geometry and state parameters.
+
+    Returns:
+        (N, 3) array of [B_X, B_Y, B_Z] in Tesla.
+    """
+    X_arr = jnp.asarray(X)
+    Y_arr = jnp.asarray(Y)
+    Z_arr = jnp.asarray(Z)
+
+    R = jnp.sqrt(X_arr**2 + Y_arr**2)
+    phi = jnp.arctan2(Y_arr, X_arr)
+
+    B_cyl = get_b_field(psi_fn, params, R, Z_arr, config)
+    BR, BZ_cyl, Bphi = B_cyl[:, 0], B_cyl[:, 1], B_cyl[:, 2]
+
+    BX = BR * jnp.cos(phi) - Bphi * jnp.sin(phi)
+    BY = BR * jnp.sin(phi) + Bphi * jnp.cos(phi)
+
+    return jnp.column_stack([BX, BY, BZ_cyl])
