@@ -88,6 +88,12 @@ class Sampler:
         self.seed = seed
         self._domain_lower_bounds, self._domain_upper_bounds = DomainBounds.get_bounds()
 
+        # Cache compiled batch compute function to avoid JAX recompilation
+        # Vectorize over axis 0 (plasma_configs)
+        self._compute_batch = jax.jit(
+            jax.vmap(Sampler._compute_single_config, in_axes=(0, None, None, None))
+        )
+
         # Instantiate separate Sobol samplers for domain, interior points, and boundary points.
         # Avoids repetitive instatiation.
         self._sobol_domain = qmc.Sobol(
@@ -184,6 +190,38 @@ class Sampler:
 
         return jnp.concatenate([sobol_samples, adaptive_samples], axis=0)
 
+    @staticmethod
+    def _compute_single_config(
+        plasma_config: jnp.ndarray,
+        theta_int: jnp.ndarray,
+        rho_int: jnp.ndarray,
+        theta_b: jnp.ndarray,
+    ) -> tuple[PlasmaConfig, jnp.ndarray, jnp.ndarray]:
+        geometry = PlasmaGeometry(
+            R0=plasma_config[0],
+            a=plasma_config[1],
+            kappa=plasma_config[2],
+            delta=plasma_config[3],
+        )
+        state = PlasmaState(
+            p0=plasma_config[4],
+            F_axis=plasma_config[5],
+            pressure_alpha=plasma_config[6],
+            field_exponent=plasma_config[7],
+        )
+        boundary = calculate_poloidal_boundary(theta_b, geometry)
+
+        # Interior points
+        r_interior, z_interior = jax.vmap(
+            lambda theta, rho: get_poloidal_points(theta, geometry, rho)
+        )(theta_int, rho_int)
+
+        return (
+            PlasmaConfig(Geometry=geometry, Boundary=boundary, State=state),
+            r_interior,
+            z_interior,
+        )
+
     def sample_flux_input(
         self,
         plasma_configs: jnp.ndarray,
@@ -196,41 +234,9 @@ class Sampler:
 
         Overfitting is avoided by resampling coordinates each epoch.
         """
-        theta_int = self._theta_int
-        rho_int = self._rho_int
-        theta_b = self._theta_b
-
-        # Define single case
-        def compute_single_config(
-            plasma_config: jnp.ndarray,
-        ) -> tuple[PlasmaConfig, jnp.ndarray, jnp.ndarray]:
-            geometry = PlasmaGeometry(
-                R0=plasma_config[0],
-                a=plasma_config[1],
-                kappa=plasma_config[2],
-                delta=plasma_config[3],
-            )
-            state = PlasmaState(
-                p0=plasma_config[4],
-                F_axis=plasma_config[5],
-                pressure_alpha=plasma_config[6],
-                field_exponent=plasma_config[7],
-            )
-            boundary = calculate_poloidal_boundary(theta_b, geometry)
-
-            # Interior points
-            r_interior, z_interior = jax.vmap(
-                lambda theta, rho: get_poloidal_points(theta, geometry, rho)
-            )(theta_int, rho_int)
-
-            return (
-                PlasmaConfig(Geometry=geometry, Boundary=boundary, State=state),
-                r_interior,
-                z_interior,
-            )
-
-        # Vectorize, compile & execute over batch of plasma configs
-        configs, R_int, Z_int = jax.jit(jax.vmap(compute_single_config))(plasma_configs)
+        configs, R_int, Z_int = self._compute_batch(
+            plasma_configs, self._theta_int, self._rho_int, self._theta_b
+        )
 
         return FluxInput(R_sample=R_int, Z_sample=Z_int, config=configs)
 
