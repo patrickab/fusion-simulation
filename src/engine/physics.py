@@ -110,7 +110,7 @@ def shafranov_operator(
 # Rematerialization trades compute for memory by recomputing activations during backprop.
 # In PINNs, high-order PDE residuals create massive graphs; remat keeps memory footprint
 # near-constant relative to depth, enabling larger networks and point batches.
-# @partial(jax.checkpoint, static_argnums=0)
+@partial(jax.checkpoint, static_argnums=0)
 def grad_shafranov_residual(
     psi_fn: callable,
     params: any,
