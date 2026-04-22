@@ -5,6 +5,7 @@ Validation loss is computed every val_eval_frequency epochs for pruning decision
 avoiding evaluation overhead on every epoch while still providing unbiased HPO signal.
 """
 
+import argparse
 import json
 import os
 
@@ -325,7 +326,9 @@ def _save_top_configs(results: list[tuple[HyperParams, float]], study: optuna.St
     logger.info(f"Top-k configs saved to: {output_file}")
 
 
-def run_optimization(config: SearchSpaceConfig | None = None) -> list[tuple[HyperParams, float]]:
+def run_optimization(
+    config: SearchSpaceConfig | None = None, restart: bool = False
+) -> list[tuple[HyperParams, float]]:
     """Execute HPO study with validation-based pruning and return top-k configs."""
     config = config or SearchSpaceConfig()
     check_capacity(config)
@@ -340,10 +343,14 @@ def run_optimization(config: SearchSpaceConfig | None = None) -> list[tuple[Hype
     storage_path = Path("logs/hpo/optuna_study.db")
     storage_path.parent.mkdir(parents=True, exist_ok=True)
 
+    if restart and storage_path.exists():
+        storage_path.unlink()
+        logger.info("Deleted existing study database")
+
     study = optuna.create_study(
         study_name="pinn_hpo",
         storage=f"sqlite:///{storage_path}",
-        load_if_exists=True,
+        load_if_exists=not restart,
         direction="minimize",
         sampler=TPESampler(seed=42, n_startup_trials=config.n_startup_trials),
         pruner=HyperbandPruner(
@@ -413,9 +420,16 @@ def train_top_k_models(results: list[tuple[HyperParams, float]]) -> None:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Optuna HPO for PINN")
+    parser.add_argument(
+        "--restart-experiment", action="store_true",
+        help="Delete existing study and start fresh"
+    )
+    args = parser.parse_args()
+
     try:
         config = SearchSpaceConfig()
-        top_results = run_optimization(config)
+        top_results = run_optimization(config, restart=args.restart_experiment)
         if top_results:
             train_top_k_models(top_results)
     except KeyboardInterrupt:
