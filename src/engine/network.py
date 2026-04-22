@@ -257,7 +257,6 @@ class NetworkManager:
         self.sampler: Sampler = Sampler(config, seed=self.seed)
         self.state = self._init_state()
 
-        # Pre-compile psi for efficient inference during evaluation.
         self._psi_fn_jit = jax.jit(self.make_psi_fn())
 
         self.train_set = self.sampler._get_sobol_sample(
@@ -268,7 +267,6 @@ class NetworkManager:
         self.training_log: list[dict] = []
 
     def to_disk(self) -> None:
-        """Save model parameters & config to disk."""
         timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
         latest_commit = os.popen("git rev-parse --short HEAD").read().strip() or "no_git"
 
@@ -352,9 +350,9 @@ class NetworkManager:
             psi_n = state.apply_fn(params, r=r_n, z=z_n, **p_n)
             return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
 
-        @jax.checkpoint
         # Rematerializes activations during backprop. Trades compute for memory,
         # enabling training of larger networks with limited GPU memory.
+        @jax.checkpoint
         def loss_fn(
             params: any,
         ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:

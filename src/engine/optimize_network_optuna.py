@@ -1,8 +1,8 @@
 """Optuna-based hyperparameter optimization with physics-based validation.
 
 Uses a fixed validation set of Sobol-sampled plasma configs to evaluate generalization.
-Validation loss is computed every val_eval_frequency epochs for pruning decisions,
-avoiding evaluation overhead on every epoch while still providing unbiased HPO signal.
+Validation loss uses forward pass only (no gradient computation) via make_psi_fn,
+computed every val_eval_frequency epochs for pruning decisions.
 """
 
 import argparse
@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 
 import jax
+import jax.numpy as jnp
+import numpy as np
 import optuna
 from optuna.pruners import HyperbandPruner
 from optuna.samplers import TPESampler
@@ -25,10 +27,12 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
+from scipy.stats import qmc
 
-from src.engine.network import NetworkManager, Sampler
+from src.engine.network import NetworkManager
+from src.engine.physics import pinn_loss_function
 from src.lib.logger import get_logger
-from src.lib.network_config import DomainBounds, FluxInput, HyperParams
+from src.lib.network_config import DomainBounds, HyperParams
 
 logger = get_logger(name="OptunaHPO", log_dir="logs/hpo")
 console = Console()
@@ -44,17 +48,17 @@ class SearchSpaceConfig:
     lr_min_ratio_range: tuple[float, float] = (0.01, 0.1)
     weight_decay_range: tuple[float, float] = (1e-9, 1e-5)
     sigma_residual_range: tuple[float, float] = (0.01, 0.2)
-    n_rz_inner_choices: tuple[int, ...] = (512, 1024, 2048)
 
     weight_boundary_condition: float = 20.0
+    n_rz_inner: int = 512
     total_epochs: int = 600
     warmup_ratio_range: tuple[float, float] = (0.1, 0.25)
 
-    batch_size: int = 64
+    batch_size: int = 32
     n_train: int = 1024
     n_rz_boundary: int = 256
 
-    n_validate: int = 256
+    n_validate: int = 128
     val_eval_frequency: int = 20
 
     min_epochs: int = 50
@@ -63,20 +67,62 @@ class SearchSpaceConfig:
     n_startup_trials: int = 10
 
 
-def create_validation_inputs(config: SearchSpaceConfig, sampler_config: HyperParams) -> FluxInput:
-    """Create fixed validation inputs using a Sampler with different seed.
-
-    Reuses Sampler's Sobol infrastructure for consistency with training.
-    """
-    sampler = Sampler(sampler_config, seed=123)
+def create_validation_configs(
+    config: SearchSpaceConfig,
+) -> dict[str, Any]:
+    """Create fixed validation plasma configs on CPU (numpy)."""
     lower, upper = DomainBounds.get_bounds()
-    plasma_configs = sampler._get_sobol_sample(
-        n_samples=config.n_validate,
-        lower_bounds=lower,
-        upper_bounds=upper,
-        sobol_sampler="domain",
+
+    sobol = qmc.Sobol(d=len(lower), scramble=True, seed=123)
+    samples = sobol.random(config.n_validate)
+    plasma_configs = np.array(qmc.scale(samples, lower, upper), dtype=np.float32)
+
+    return {"plasma_configs": plasma_configs}
+
+
+def _forward_loss(
+    psi_fn: callable,
+    params: any,
+    inputs: any,
+    weight_bc: float,
+) -> float:
+    """Forward-only loss computation (no gradients) for validation."""
+    total, _, _, _ = pinn_loss_function(
+        psi_fn, params, inputs.R_sample, inputs.Z_sample, inputs.config, weight_bc
     )
-    return sampler.sample_flux_input(plasma_configs=plasma_configs)
+    return float(total)
+
+
+def _calculate_validation_loss(
+    manager: NetworkManager,
+    val_data: dict[str, np.ndarray],
+    chunk_size: int,
+    n_rz_inner: int,
+    n_rz_boundary: int,
+) -> float:
+    """Calculate validation loss in chunks using forward pass only (no gradients)."""
+    plasma_configs = val_data["plasma_configs"]
+    n_configs = len(plasma_configs)
+    total_loss = 0.0
+    n_chunks = 0
+
+    psi_fn = manager._psi_fn_jit
+    params = manager.state.params
+    weight_bc = manager.config.weight_boundary_condition
+
+    for i in range(0, n_configs, chunk_size):
+        end = min(i + chunk_size, n_configs)
+        batch = jnp.array(plasma_configs[i:end], dtype=jnp.float32)
+
+        sampler = manager.sampler
+        sampler.precompute_coordinate_samples(n_rz_inner, n_rz_boundary)
+        inputs = sampler.sample_flux_input(plasma_configs=batch)
+
+        total_loss += float(_forward_loss(psi_fn, params, inputs, weight_bc))
+        n_chunks += 1
+        jax.clear_caches()
+
+    return total_loss / n_chunks
 
 
 class OptunaProgressDisplay:
@@ -198,6 +244,9 @@ def check_capacity(config: SearchSpaceConfig) -> None:
     test_config = HyperParams(
         hidden_dims=tuple([max_width] * max_depth),
         learning_rate_max=1e-3,
+        n_rz_inner_samples=config.n_rz_inner,
+        n_rz_boundary_samples=config.n_rz_boundary,
+        batch_size=config.batch_size,
         warmup_epochs=10,
         decay_epochs=10,
     )
@@ -221,8 +270,6 @@ def build_hyperparams(trial: optuna.Trial, config: SearchSpaceConfig) -> HyperPa
     lr_min_ratio = trial.suggest_float("lr_min_ratio", *config.lr_min_ratio_range, log=True)
     weight_decay = trial.suggest_float("weight_decay", *config.weight_decay_range, log=True)
     sigma_residual = trial.suggest_float("sigma_residual", *config.sigma_residual_range)
-    n_rz_inner = trial.suggest_categorical("n_rz_inner", config.n_rz_inner_choices)
-
     warmup_ratio = trial.suggest_float("warmup_ratio", *config.warmup_ratio_range)
 
     return HyperParams(
@@ -232,7 +279,7 @@ def build_hyperparams(trial: optuna.Trial, config: SearchSpaceConfig) -> HyperPa
         weight_decay=weight_decay,
         weight_boundary_condition=config.weight_boundary_condition,
         sigma_residual_adaptive_sampling=sigma_residual,
-        n_rz_inner_samples=n_rz_inner,
+        n_rz_inner_samples=config.n_rz_inner,
         n_rz_boundary_samples=config.n_rz_boundary,
         warmup_epochs=int(config.total_epochs * warmup_ratio),
         decay_epochs=config.total_epochs - int(config.total_epochs * warmup_ratio),
@@ -245,7 +292,7 @@ def objective(
     trial: optuna.Trial,
     config: SearchSpaceConfig,
     display: OptunaProgressDisplay,
-    val_inputs: FluxInput,
+    val_data: dict[str, np.ndarray],
 ) -> float:
     """Train trial and return validation loss for unbiased HPO.
 
@@ -268,14 +315,18 @@ def objective(
             manager.train_epoch(epoch)
 
             if epoch >= config.min_epochs and epoch % config.val_eval_frequency == 0:
-                val_loss = manager.calculate_loss(val_inputs)
+                val_loss = _calculate_validation_loss(
+                    manager, val_data, config.batch_size, config.n_rz_inner, config.n_rz_boundary
+                )
                 trial.report(val_loss, epoch)
 
                 if trial.should_prune():
                     display.update(trial.number + 1, params_for_display, None, "pruned")
                     raise optuna.TrialPruned
 
-        val_loss = manager.calculate_loss(val_inputs)
+        val_loss = _calculate_validation_loss(
+            manager, val_data, config.batch_size, config.n_rz_inner, config.n_rz_boundary
+        )
         jax.clear_caches()
         display.update(trial.number + 1, params_for_display, val_loss, "done")
         return val_loss
@@ -297,7 +348,6 @@ def get_warmstart_config() -> dict[str, Any]:
         "lr_min_ratio": 0.025,
         "weight_decay": 1e-7,
         "sigma_residual": 0.05,
-        "n_rz_inner": 2048,
         "warmup_ratio": 0.167,
     }
 
@@ -333,12 +383,7 @@ def run_optimization(
     config = config or SearchSpaceConfig()
     check_capacity(config)
 
-    sampler_hp = HyperParams(
-        n_rz_inner_samples=config.n_validate,
-        n_rz_boundary_samples=config.n_rz_boundary,
-        batch_size=config.n_validate,
-    )
-    val_inputs = create_validation_inputs(config, sampler_hp)
+    val_data = create_validation_configs(config)
 
     storage_path = Path("logs/hpo/optuna_study.db")
     storage_path.parent.mkdir(parents=True, exist_ok=True)
@@ -365,7 +410,7 @@ def run_optimization(
     display = OptunaProgressDisplay(config)
     with display:
         study.optimize(
-            lambda trial: objective(trial, config, display, val_inputs),
+            lambda trial: objective(trial, config, display, val_data),
             n_trials=config.n_trials,
             show_progress_bar=False,
         )
@@ -391,7 +436,6 @@ def run_optimization(
         console.print(f"  LR min:        {hp.learning_rate_min:.2e}")
         console.print(f"  Weight decay:  {hp.weight_decay:.2e}")
         console.print(f"  Sigma:         {hp.sigma_residual_adaptive_sampling:.3f}")
-        console.print(f"  n_rz_inner:    {hp.n_rz_inner_samples}")
         console.print(f"  Warmup epochs: {hp.warmup_epochs}")
     console.print("\n" + "=" * 80 + "\n")
 
