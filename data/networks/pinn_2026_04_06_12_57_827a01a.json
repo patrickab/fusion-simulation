@@ -1,6 +1,4 @@
 {
-  "input_dim": 10,
-  "output_dim": 1,
   "hidden_dims": [
     128,
     128,
@@ -16,8 +14,6 @@
   "n_rz_inner_samples": 2048,
   "n_rz_boundary_samples": 256,
   "n_train": 1024,
-  "n_test": 32,
-  "n_val": 64,
   "warmup_epochs": 100,
   "decay_epochs": 500
 }

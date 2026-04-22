@@ -12,8 +12,6 @@ from src.lib.geometry_config import PlasmaConfig
 class HyperParams(BaseModel):
     """Central configuration for the experiment."""
 
-    input_dim: int = 10  # 2 (RZ) + 8 (Params)
-    output_dim: int = 1
     hidden_dims: tuple[int, ...] = (128, 128, 128, 128, 128)
     learning_rate_max: float = 4e-3
     learning_rate_min: float = 2e-4
@@ -24,8 +22,6 @@ class HyperParams(BaseModel):
     n_rz_inner_samples: int = 2048
     n_rz_boundary_samples: int = 256
     n_train: int = 1024
-    n_test: int = 32
-    n_val: int = 64
     warmup_epochs: int = 100
     decay_epochs: int = 500
 
