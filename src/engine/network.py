@@ -1,7 +1,6 @@
 from datetime import datetime
 import os
 from pathlib import Path
-from time import time
 from typing import Callable, Literal
 
 from flax import linen as nn
@@ -10,6 +9,11 @@ from flax.training import train_state
 import jax
 import jax.numpy as jnp
 import optax
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
+from rich.table import Table
 from scipy.stats import qmc
 
 from src.engine.physics import pinn_loss_function
@@ -23,6 +27,7 @@ from src.lib.geometry_config import (
 from src.lib.logger import get_logger
 from src.lib.network_config import DomainBounds, FluxInput, HyperParams
 
+console = Console()
 logger = get_logger(
     name="Network",
 )
@@ -260,6 +265,7 @@ class NetworkManager:
             lower_bounds=self.sampler._domain_lower_bounds,
             upper_bounds=self.sampler._domain_upper_bounds,
         )
+        self.training_log: list[dict] = []
 
     def to_disk(self) -> None:
         """Save model parameters & config to disk."""
@@ -272,9 +278,19 @@ class NetworkManager:
         artifact_stem = f"pinn_{timestamp}_{latest_commit}"
         artifact_flax_path = output_dir / f"{artifact_stem}.flax"
         artifact_json_path = output_dir / f"{artifact_stem}.json"
+        artifact_log_path = output_dir / f"{artifact_stem}.csv"
 
         artifact_flax_path.write_bytes(flax.serialization.to_bytes(self.state.params))
         self.config.to_json(path=str(artifact_json_path))
+
+        if self.training_log:
+            with open(artifact_log_path, "w") as f:
+                f.write("epoch,moving_avg_loss,residual,boundary\n")
+                for entry in self.training_log:
+                    f.write(
+                        f"{entry['epoch']},{entry['moving_avg_loss']:.6f},"
+                        f"{entry['residual']:.6f},{entry['boundary']:.6f}\n"
+                    )
 
     def from_disk(self, pinn_path) -> any:  # noqa
         """Load Flax model parameters from disk."""
@@ -395,32 +411,81 @@ class NetworkManager:
 
         return float(loss), float(l_res), float(l_dir)
 
+    def _log_metric(self, epoch: int, loss: float, residual: float, boundary: float) -> None:
+        self._accumulated_loss += loss
+        self._accumulated_residual += residual
+        self._accumulated_boundary += boundary
+
+        if (epoch + 1) % LOG_FREQUENCY == 0:
+            moving_avg_loss = self._accumulated_loss / LOG_FREQUENCY
+            moving_avg_residual = self._accumulated_residual / LOG_FREQUENCY
+            moving_avg_boundary = self._accumulated_boundary / LOG_FREQUENCY
+
+            self.training_log.append(
+                {
+                    "epoch": epoch + 1,
+                    "moving_avg_loss": moving_avg_loss,
+                    "residual": moving_avg_residual,
+                    "boundary": moving_avg_boundary,
+                }
+            )
+
+            self._table.add_row(
+                f"{epoch + 1}/{self.epochs}",
+                f"{moving_avg_loss:.3f}",
+                f"{moving_avg_residual:.3f}",
+                f"{moving_avg_boundary:.3f}",
+            )
+
+            self._accumulated_loss = 0.0
+            self._accumulated_residual = 0.0
+            self._accumulated_boundary = 0.0
+        else:
+            self.training_log.append(
+                {
+                    "epoch": epoch + 1,
+                    "moving_avg_loss": self._accumulated_loss / ((epoch + 1) % LOG_FREQUENCY),
+                    "residual": self._accumulated_residual / ((epoch + 1) % LOG_FREQUENCY),
+                    "boundary": self._accumulated_boundary / ((epoch + 1) % LOG_FREQUENCY),
+                }
+            )
+
+        self._progress.update(self._epoch_task, advance=1)
+        self._live.update(Panel(Group(self._table, self._progress), border_style="cyan"))
+
     def train(
         self,
         save_to_disk: bool = True,
     ) -> None:
-        """
-        Train the model.
+        self._table = Table(title="Training Metrics", show_header=True, header_style="bold cyan")
+        self._table.add_column("Epoch", justify="right", style="cyan")
+        self._table.add_column("Loss", justify="right", style="magenta")
+        self._table.add_column("Residual", justify="right")
+        self._table.add_column("Boundary", justify="right")
 
-        Args:
-            save_to_disk: Whether to save model params to disk after training
+        self._progress = Progress(
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(style="cyan", complete_style="bold cyan"),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False,
+        )
+        self._epoch_task = self._progress.add_task("Training", total=self.epochs)
 
-        Returns:
-            Final training loss
-        """
-        logger.info(f"Starting training for {self.epochs} epochs...")
-        start_time = time()  # Initialize timer
-        for epoch in range(self.epochs):
-            loss_total, l_residual, l_boundary = self.train_epoch(epoch)
-            if epoch % LOG_FREQUENCY == 0 and epoch > 0:
-                elapsed = time() - start_time
-                avg_speed = elapsed / LOG_FREQUENCY
-                logger.info(
-                    f"Epoch: {epoch:4d} | Loss: [bold magenta]{loss_total:6.3f}[/bold magenta] | "
-                    f"(residual= {l_residual:5.2f}, boundary= {l_boundary:2.2f}) | "
-                    f"sec/epoch: {avg_speed:.2f}"
-                )
-                start_time = time()  # Reset timer
+        self._accumulated_loss = 0.0
+        self._accumulated_residual = 0.0
+        self._accumulated_boundary = 0.0
+
+        with Live(
+            Panel(Group(self._table, self._progress), border_style="cyan"),
+            refresh_per_second=10,
+            console=console,
+            vertical_overflow="visible",
+        ) as self._live:
+            for epoch in range(self.epochs):
+                loss_total, l_residual, l_boundary = self.train_epoch(epoch)
+                self._log_metric(epoch, loss_total, l_residual, l_boundary)
 
         if save_to_disk:
             self.to_disk()
