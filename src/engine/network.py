@@ -314,11 +314,12 @@ class NetworkManager:
         params = self.model.init(key, r=r_n, z=z_n, **norm_params)
 
         steps_per_epoch = self.config.n_train // self.config.batch_size
+        total_steps = (self.config.warmup_epochs + self.config.decay_epochs) * steps_per_epoch
         schedule = optax.warmup_cosine_decay_schedule(
             init_value=0.0,
             peak_value=self.config.learning_rate_max,
             warmup_steps=self.config.warmup_epochs * steps_per_epoch,
-            decay_steps=self.config.decay_epochs * steps_per_epoch,
+            decay_steps=total_steps,
             end_value=self.config.learning_rate_min,
         )
         tx = optax.adamw(learning_rate=schedule, weight_decay=self.config.weight_decay)
@@ -351,7 +352,7 @@ class NetworkManager:
             psi_n = state.apply_fn(params, r=r_n, z=z_n, **p_n)
             return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
 
-        # @jax.checkpoint
+        @jax.checkpoint
         # Rematerializes activations during backprop. Trades compute for memory,
         # enabling training of larger networks with limited GPU memory.
         def loss_fn(
