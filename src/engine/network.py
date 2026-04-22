@@ -411,6 +411,35 @@ class NetworkManager:
 
         return float(loss), float(l_res), float(l_dir)
 
+    def _init_live_display(self) -> Live:
+        """Set up Rich table, progress bar, and accumulators for live training display."""
+        self._table = Table(title="Training Metrics", show_header=True, header_style="bold cyan")
+        self._table.add_column("Epoch", justify="right", style="cyan")
+        self._table.add_column("Loss", justify="right", style="magenta")
+        self._table.add_column("Residual", justify="right")
+        self._table.add_column("Boundary", justify="right")
+
+        self._progress = Progress(
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(style="cyan", complete_style="bold cyan"),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False,
+        )
+        self._epoch_task = self._progress.add_task("Training", total=self.epochs)
+
+        self._accumulated_loss = 0.0
+        self._accumulated_residual = 0.0
+        self._accumulated_boundary = 0.0
+
+        return Live(
+            Panel(Group(self._table, self._progress), border_style="cyan"),
+            refresh_per_second=10,
+            console=console,
+            vertical_overflow="visible",
+        )
+
     def _log_metric(self, epoch: int, loss: float, residual: float, boundary: float) -> None:
         self._accumulated_loss += loss
         self._accumulated_residual += residual
@@ -453,39 +482,12 @@ class NetworkManager:
         self._progress.update(self._epoch_task, advance=1)
         self._live.update(Panel(Group(self._table, self._progress), border_style="cyan"))
 
-    def train(
-        self,
-        save_to_disk: bool = True,
-    ) -> None:
-        self._table = Table(title="Training Metrics", show_header=True, header_style="bold cyan")
-        self._table.add_column("Epoch", justify="right", style="cyan")
-        self._table.add_column("Loss", justify="right", style="magenta")
-        self._table.add_column("Residual", justify="right")
-        self._table.add_column("Boundary", justify="right")
-
-        self._progress = Progress(
-            TextColumn("[bold cyan]{task.description}"),
-            BarColumn(style="cyan", complete_style="bold cyan"),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            console=console,
-            transient=False,
-        )
-        self._epoch_task = self._progress.add_task("Training", total=self.epochs)
-
-        self._accumulated_loss = 0.0
-        self._accumulated_residual = 0.0
-        self._accumulated_boundary = 0.0
-
-        with Live(
-            Panel(Group(self._table, self._progress), border_style="cyan"),
-            refresh_per_second=10,
-            console=console,
-            vertical_overflow="visible",
-        ) as self._live:
+    def train(self, save_to_disk: bool = True) -> None:
+        live = self._init_live_display()
+        with live as self._live:
             for epoch in range(self.epochs):
-                loss_total, l_residual, l_boundary = self.train_epoch(epoch)
-                self._log_metric(epoch, loss_total, l_residual, l_boundary)
+                loss, residual, boundary = self.train_epoch(epoch)
+                self._log_metric(epoch, loss, residual, boundary)
 
         if save_to_disk:
             self.to_disk()
