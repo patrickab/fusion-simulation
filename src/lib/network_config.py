@@ -12,12 +12,12 @@ from src.lib.geometry_config import PlasmaConfig
 class HyperParams(BaseModel):
     """Central configuration for the experiment."""
 
-    hidden_dims: tuple[int, ...] = (128, 128, 128, 128, 128)
-    learning_rate_max: float = 4e-3
-    learning_rate_min: float = 2e-4
+    hidden_dims: tuple[int, ...] = (128, 128, 128, 128)
+    learning_rate_max: float = 2e-3
+    learning_rate_min: float = 5e-5
     weight_decay: float = 1e-7
     weight_boundary_condition: float = 10.0
-    sigma_residual_adaptive_sampling: float = 0.1
+    sigma_residual_adaptive_sampling: float = 0.05
     batch_size: int = 64
     n_rz_inner_samples: int = 2048
     n_rz_boundary_samples: int = 256
