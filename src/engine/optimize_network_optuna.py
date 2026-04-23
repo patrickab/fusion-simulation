@@ -35,7 +35,7 @@ from src.lib.logger import get_logger
 from src.lib.network_config import DomainBounds, HyperParams
 
 logger = get_logger(name="OptunaHPO", log_dir="logs/hpo")
-console = Console()
+console = Console(width=160)
 
 
 @dataclass
@@ -135,7 +135,9 @@ class OptunaProgressDisplay:
         self._epoch_task = self._progress.add_task(
             "[magenta]Epochs:  ", total=self.config.total_epochs, visible=False
         )
-        self._live = Live(self._build_layout(), refresh_per_second=4, console=console)
+        self._live = Live(
+            self._build_layout(), refresh_per_second=4, console=console, vertical_overflow="visible"
+        )
 
     def _get_trials_table(self) -> Table:
         t = Table(title="Previous Trials", show_header=True, header_style="bold cyan")
@@ -266,7 +268,10 @@ class OptunaProgressDisplay:
             "epoch": 0,
             "val_loss": None,
         }
-        self._progress.update(self._epoch_task, completed=0, total=total_epochs, visible=True)
+        self._progress.remove_task(self._epoch_task)
+        self._epoch_task = self._progress.add_task(
+            "[magenta]Epochs:  ", total=total_epochs, visible=True
+        )
         self._live.update(self._build_layout())
 
     def update_epoch(self, epoch: int, val_loss: float | None = None) -> None:
