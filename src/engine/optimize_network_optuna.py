@@ -30,7 +30,6 @@ from rich.table import Table
 from scipy.stats import qmc
 
 from src.engine.network import NetworkManager
-from src.engine.physics import pinn_loss_function
 from src.lib.logger import get_logger
 from src.lib.network_config import DomainBounds, HyperParams
 
@@ -80,47 +79,34 @@ def create_validation_configs(
     return {"plasma_configs": plasma_configs}
 
 
-def _forward_loss(
-    psi_fn: callable,
-    params: any,
-    inputs: any,
-    weight_bc: float,
-) -> float:
-    """Forward-only loss computation (no gradients) for validation."""
-    total, _, _, _ = pinn_loss_function(
-        psi_fn, params, inputs.R_sample, inputs.Z_sample, inputs.config, weight_bc
-    )
-    return float(total)
-
-
 def _calculate_validation_loss(
     manager: NetworkManager,
     val_data: dict[str, np.ndarray],
-    chunk_size: int,
     n_rz_inner: int,
     n_rz_boundary: int,
 ) -> float:
-    """Calculate validation loss in chunks using forward pass only (no gradients)."""
+    """Calculate validation loss in chunks using fast, gradient-free eval_step."""
     plasma_configs = val_data["plasma_configs"]
     n_configs = len(plasma_configs)
+
+    # Large chunk size to maximize GPU throughput during validation.
+    # We use a fixed large chunk as validation doesn't track gradients, saving VRAM.
+    chunk_size = 128
     total_loss = 0.0
     n_chunks = 0
 
-    psi_fn = manager._psi_fn_jit
-    params = manager.state.params
     weight_bc = manager.config.weight_boundary_condition
+    sampler = manager.sampler
+    sampler.precompute_coordinate_samples(n_rz_inner, n_rz_boundary)
 
     for i in range(0, n_configs, chunk_size):
         end = min(i + chunk_size, n_configs)
         batch = jnp.array(plasma_configs[i:end], dtype=jnp.float32)
-
-        sampler = manager.sampler
-        sampler.precompute_coordinate_samples(n_rz_inner, n_rz_boundary)
         inputs = sampler.sample_flux_input(plasma_configs=batch)
 
-        total_loss += float(_forward_loss(psi_fn, params, inputs, weight_bc))
+        loss, _, _, _ = manager.eval_step(manager.state, inputs, weight_bc)
+        total_loss += float(loss)
         n_chunks += 1
-        jax.clear_caches()
 
     return total_loss / n_chunks
 
@@ -190,22 +176,28 @@ class OptunaProgressDisplay:
             loss_str = "--"
 
         status_str = {
-            "done": "[green]done[/]", "pruned": "[yellow]pruned[/]", "failed": "[red]failed[/]"
+            "done": "[green]done[/]",
+            "pruned": "[yellow]pruned[/]",
+            "failed": "[red]failed[/]",
         }.get(status, status)
 
-        self._trials_data.append({
-            "trial": trial_num,
-            "depth": params.get("depth", "?"),
-            "width": params.get("width", "?"),
-            "lr": f"{params.get('lr', 0):.0e}",
-            "loss": loss_str,
-            "status": status_str,
-        })
+        self._trials_data.append(
+            {
+                "trial": trial_num,
+                "depth": params.get("depth", "?"),
+                "width": params.get("width", "?"),
+                "lr": f"{params.get('lr', 0):.0e}",
+                "loss": loss_str,
+                "status": status_str,
+            }
+        )
         if len(self._trials_data) > 8:
             self._trials_data.pop(0)
 
         self._trials_table = Table(
-            title="Recent Trials", show_header=True, header_style="bold cyan",
+            title="Recent Trials",
+            show_header=True,
+            header_style="bold cyan",
         )
         for col in ["Trial", "Depth", "Width", "LR", "Val Loss", "Status"]:
             self._trials_table.add_column(col, width=5 if col != "Status" else 7, justify="right")
@@ -215,15 +207,20 @@ class OptunaProgressDisplay:
             )
 
         self._best_table = Table(
-            title=f"Top {self.config.top_k} Configs", show_header=True, header_style="bold green",
+            title=f"Top {self.config.top_k} Configs",
+            show_header=True,
+            header_style="bold green",
         )
         for col in ["Rank", "Depth", "Width", "LR", "Val Loss"]:
             w = 9 if col in ("Rank", "Val Loss") else 5
             self._best_table.add_column(col, width=w, justify="right")
         for rank, (p, loss) in enumerate(self._best_configs, 1):
             self._best_table.add_row(
-                str(rank), str(p.get("depth", "?")), str(p.get("width", "?")),
-                f"{p.get('lr', 0):.0e}", f"{loss:.4f}"
+                str(rank),
+                str(p.get("depth", "?")),
+                str(p.get("width", "?")),
+                f"{p.get('lr', 0):.0e}",
+                f"{loss:.4f}",
             )
 
         self._live.update(self._build_layout())
@@ -316,7 +313,7 @@ def objective(
 
             if epoch >= config.min_epochs and epoch % config.val_eval_frequency == 0:
                 val_loss = _calculate_validation_loss(
-                    manager, val_data, config.batch_size, config.n_rz_inner, config.n_rz_boundary
+                    manager, val_data, config.n_rz_inner, config.n_rz_boundary
                 )
                 trial.report(val_loss, epoch)
 
@@ -325,7 +322,7 @@ def objective(
                     raise optuna.TrialPruned
 
         val_loss = _calculate_validation_loss(
-            manager, val_data, config.batch_size, config.n_rz_inner, config.n_rz_boundary
+            manager, val_data, config.n_rz_inner, config.n_rz_boundary
         )
         jax.clear_caches()
         display.update(trial.number + 1, params_for_display, val_loss, "done")
@@ -405,7 +402,8 @@ def run_optimization(
         ),
     )
 
-    study.enqueue_trial(get_warmstart_config())
+    if len(study.trials) == 0:
+        study.enqueue_trial(get_warmstart_config())
 
     display = OptunaProgressDisplay(config)
     with display:
@@ -466,8 +464,7 @@ def train_top_k_models(results: list[tuple[HyperParams, float]]) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Optuna HPO for PINN")
     parser.add_argument(
-        "--restart-experiment", action="store_true",
-        help="Delete existing study and start fresh"
+        "--restart-experiment", action="store_true", help="Delete existing study and start fresh"
     )
     args = parser.parse_args()
 
@@ -479,4 +476,3 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("\nOptimization interrupted. Study saved to SQLite.")
         jax.clear_caches()
-

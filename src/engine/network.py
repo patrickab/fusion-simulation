@@ -381,7 +381,9 @@ class NetworkManager:
         # Rematerializes activations during backprop. Trades compute for memory,
         # enabling training of larger networks with limited GPU memory.
         @jax.checkpoint
-        def loss_wrapper(params):
+        def loss_wrapper(
+            params: any,
+        ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
             """Wrap compute loss to enable gradient computation"""
             return NetworkManager.compute_loss(
                 params, state.apply_fn, inputs, weight_boundary_condition
@@ -390,7 +392,6 @@ class NetworkManager:
         (loss, (l_res, l_dir, l_per_cfg)), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(
             state.params
         )
-        return state.apply_gradients(grads=grads), loss, l_res, l_dir, l_per_cfg
         return state.apply_gradients(grads=grads), loss, l_res, l_dir, l_per_cfg
 
     def train_epoch(self, epoch: int) -> tuple[float, float, float]:

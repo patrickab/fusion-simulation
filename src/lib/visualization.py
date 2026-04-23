@@ -28,7 +28,6 @@ from src.lib.geometry_config import (
     ToroidalCoil3D,
     ToroidalCoilConfig,
 )
-from src.lib.network_config import FluxInput
 from src.lib.utils import _coils_to_polydata, _plasma_to_polydata
 from src.toroidal_geometry import calculate_toroidal_coil_boundary, generate_toroidal_coils_3d
 
