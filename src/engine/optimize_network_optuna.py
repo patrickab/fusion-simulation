@@ -114,7 +114,7 @@ def _calculate_validation_loss(
 class OptunaProgressDisplay:
     """Rich live dashboard showing optimization progress and top configs."""
 
-    def __init__(self, config: SearchSpaceConfig) -> None:
+    def __init__(self, config: SearchSpaceConfig, prior_trials: int = 0) -> None:
         self.config = config
         self._trials_data: list[dict[str, Any]] = []
         self._best_configs: list[tuple[dict[str, Any], float]] = []
@@ -122,6 +122,8 @@ class OptunaProgressDisplay:
         self._n_pruned = 0
         self._n_failed = 0
         self._n_completed = 0
+        self._trials_processed = 0
+        self._prior_trials = prior_trials
         self._start_time = datetime.now()
 
         self._progress = Progress(
@@ -145,8 +147,9 @@ class OptunaProgressDisplay:
         summary = (
             f"[bold]Best Val Loss:[/] {self._best_loss:.4f}  |  "
             f"[bold]Elapsed:[/] {elapsed_str}\n"
-            f"Completed: {self._n_completed}  |  Pruned: {self._n_pruned}  "
-            f"| Failed: {self._n_failed}"
+            f"Session: {self._n_completed} done  |  {self._n_pruned} pruned  "
+            f"| {self._n_failed} failed"
+            + (f"  |  Prior: {self._prior_trials}" if self._prior_trials else "")
         )
         return Panel(
             Group(self._progress, summary, self._trials_table, self._best_table),
@@ -157,7 +160,8 @@ class OptunaProgressDisplay:
     def update(
         self, trial_num: int, params: dict[str, Any], loss: float | None, status: str
     ) -> None:
-        self._progress.update(self._task, completed=trial_num)
+        self._trials_processed += 1
+        self._progress.update(self._task, completed=self._trials_processed)
 
         if status == "pruned":
             self._n_pruned += 1
@@ -405,13 +409,21 @@ def run_optimization(
     if len(study.trials) == 0:
         study.enqueue_trial(get_warmstart_config())
 
-    display = OptunaProgressDisplay(config)
-    with display:
-        study.optimize(
-            lambda trial: objective(trial, config, display, val_data),
-            n_trials=config.n_trials,
-            show_progress_bar=False,
+    prior_trials = sum(1 for t in study.trials if t.state != optuna.trial.TrialState.WAITING)
+    remaining_trials = max(0, config.n_trials - prior_trials)
+    if remaining_trials == 0:
+        logger.info(
+            f"Study already has {prior_trials} trials (target: {config.n_trials}). Nothing to run."
         )
+        display = OptunaProgressDisplay(config, prior_trials=prior_trials)
+    else:
+        display = OptunaProgressDisplay(config, prior_trials=prior_trials)
+        with display:
+            study.optimize(
+                lambda trial: objective(trial, config, display, val_data),
+                n_trials=remaining_trials,
+                show_progress_bar=False,
+            )
 
     complete_trials = sorted(
         [
