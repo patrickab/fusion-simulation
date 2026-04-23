@@ -22,6 +22,7 @@ import numpy as np
 import optuna
 from optuna.pruners import HyperbandPruner
 from optuna.samplers import TPESampler
+from rich import box
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
@@ -125,16 +126,20 @@ class OptunaProgressDisplay:
         self._trials_processed = 0
         self._prior_trials = prior_trials
         self._start_time = datetime.now()
+        self._current_trial_info: dict[str, Any] = {}
 
         self._progress = Progress(
-            TextColumn("[bold cyan]Progress:"),
+            TextColumn("[bold cyan]{task.description}"),
             BarColumn(complete_style="cyan", finished_style="green"),
-            TextColumn("{task.completed}/{task.total} trials"),
+            TextColumn("{task.completed}/{task.total}"),
             TextColumn("({task.percentage:.0f}%)"),
             TimeElapsedColumn(),
             console=console,
         )
-        self._task = self._progress.add_task("", total=self.config.n_trials)
+        self._task = self._progress.add_task("Progress:", total=self.config.n_trials)
+        self._epoch_task = self._progress.add_task(
+            "[magenta]Epochs:  ", total=self.config.total_epochs, visible=False
+        )
         self._trials_table = Table(show_header=True, header_style="bold cyan")
         self._best_table = Table(show_header=True, header_style="bold green")
 
@@ -151,17 +156,76 @@ class OptunaProgressDisplay:
             f"| {self._n_failed} failed"
             + (f"  |  Prior: {self._prior_trials}" if self._prior_trials else "")
         )
+
+        elements = [self._progress, summary, self._best_table]
+
+        curr_table = Table(show_header=False, box=box.SIMPLE)
+        if self._current_trial_info:
+            current_trial = self._current_trial_info
+            params = current_trial["params"]
+            curr_table.title = f"Current Trial: {current_trial['trial']}"
+            curr_table.add_row("Architecture:", f"{params.get('depth')}x{params.get('width')}")
+            curr_table.add_row("Max LR:", f"{params.get('lr_max', 0):.2e}")
+            curr_table.add_row("Min LR:", f"{params.get('lr_min', 0):.2e}")
+            curr_table.add_row("Weight Decay:", f"{params.get('wd', 0):.2e}")
+            curr_table.add_row("Sigma Res:", f"{params.get('sig', 0):.3f}")
+            val_loss_str = (
+                f"{current_trial['val_loss']:.4f}"
+                if current_trial.get("val_loss") is not None
+                else "--"
+            )
+            curr_table.add_row("Recent Val Loss:", f"[bold cyan]{val_loss_str}[/bold cyan]")
+        else:
+            curr_table.title = "Current Trial: ---"
+            curr_table.add_row("Architecture:", "---")
+            curr_table.add_row("Max LR:", "---")
+            curr_table.add_row("Min LR:", "---")
+            curr_table.add_row("Weight Decay:", "---")
+            curr_table.add_row("Sigma Res:", "---")
+            curr_table.add_row("Recent Val Loss:", "[bold cyan]---[/bold cyan]")
+
+        curr_panel = Panel(curr_table, border_style="magenta")
+        elements.append(curr_panel)
+
+        elements.append(self._trials_table)
+
         return Panel(
-            Group(self._progress, summary, self._trials_table, self._best_table),
+            Group(*elements),
             title="[bold cyan]PINN HPO Optimization[/bold cyan]",
             border_style="cyan",
         )
 
+    def start_trial(self, trial_num: int, params: dict[str, Any], total_epochs: int) -> None:
+        self._current_trial_info = {
+            "trial": trial_num,
+            "params": params,
+            "epoch": 0,
+            "val_loss": None,
+        }
+        self._progress.update(self._epoch_task, completed=0, total=total_epochs, visible=True)
+        self._live.update(self._build_layout())
+
+    def update_epoch(self, epoch: int, val_loss: float | None = None) -> None:
+        if not self._current_trial_info:
+            return
+        self._current_trial_info["epoch"] = epoch
+        if val_loss is not None:
+            self._current_trial_info["val_loss"] = val_loss
+        self._progress.update(self._epoch_task, completed=epoch)
+        self._live.update(self._build_layout())
+
     def update(
-        self, trial_num: int, params: dict[str, Any], loss: float | None, status: str
+        self,
+        trial_num: int,
+        params: dict[str, Any],
+        loss: float | None,
+        status: str,
+        epoch: int | None = None,
     ) -> None:
         self._trials_processed += 1
         self._progress.update(self._task, completed=self._trials_processed)
+        self._progress.update(self._epoch_task, visible=False)
+        self._current_trial_info = {}
 
         if status == "pruned":
             self._n_pruned += 1
@@ -179,35 +243,57 @@ class OptunaProgressDisplay:
         else:
             loss_str = "--"
 
-        status_str = {
-            "done": "[green]done[/]",
-            "pruned": "[yellow]pruned[/]",
-            "failed": "[red]failed[/]",
-        }.get(status, status)
+        if status == "pruned":
+            status_str = (
+                f"[yellow]pruned @ {epoch}[/]" if epoch is not None else "[yellow]pruned[/]"
+            )
+        elif status == "failed":
+            status_str = f"[red]failed @ {epoch}[/]" if epoch is not None else "[red]failed[/]"
+        else:
+            status_str = f"[green]done @ {epoch}[/]" if epoch is not None else "[green]done[/]"
 
         self._trials_data.append(
             {
                 "trial": trial_num,
                 "depth": params.get("depth", "?"),
                 "width": params.get("width", "?"),
-                "lr": f"{params.get('lr', 0):.0e}",
+                "lr_max": f"{params.get('lr_max', 0):.2e}",
+                "lr_min": f"{params.get('lr_min', 0):.2e}",
+                "wd": f"{params.get('wd', 0):.2e}",
+                "sig": f"{params.get('sig', 0):.3f}",
                 "loss": loss_str,
                 "status": status_str,
             }
         )
-        if len(self._trials_data) > 8:
-            self._trials_data.pop(0)
 
         self._trials_table = Table(
-            title="Recent Trials",
+            title="Previous Trials",
             show_header=True,
             header_style="bold cyan",
         )
-        for col in ["Trial", "Depth", "Width", "LR", "Val Loss", "Status"]:
-            self._trials_table.add_column(col, width=5 if col != "Status" else 7, justify="right")
+        for col in [
+            "Trial",
+            "Depth",
+            "Width",
+            "Max LR",
+            "Min LR",
+            "Weight Decay",
+            "Sig Adapt Sampling",
+            "Val Loss",
+            "Status",
+        ]:
+            self._trials_table.add_column(col, justify="right" if col != "Status" else "left")
         for d in self._trials_data:
             self._trials_table.add_row(
-                str(d["trial"]), str(d["depth"]), str(d["width"]), d["lr"], d["loss"], d["status"]
+                str(d["trial"]),
+                str(d["depth"]),
+                str(d["width"]),
+                d["lr_max"],
+                d["lr_min"],
+                d["wd"],
+                d["sig"],
+                d["loss"],
+                d["status"],
             )
 
         self._best_table = Table(
@@ -215,15 +301,26 @@ class OptunaProgressDisplay:
             show_header=True,
             header_style="bold green",
         )
-        for col in ["Rank", "Depth", "Width", "LR", "Val Loss"]:
-            w = 9 if col in ("Rank", "Val Loss") else 5
-            self._best_table.add_column(col, width=w, justify="right")
+        for col in [
+            "Rank",
+            "Depth",
+            "Width",
+            "Max LR",
+            "Min LR",
+            "Weight Decay",
+            "Sig Adapt Sampling",
+            "Val Loss",
+        ]:
+            self._best_table.add_column(col, justify="right")
         for rank, (p, loss) in enumerate(self._best_configs, 1):
             self._best_table.add_row(
                 str(rank),
                 str(p.get("depth", "?")),
                 str(p.get("width", "?")),
-                f"{p.get('lr', 0):.0e}",
+                f"{p.get('lr_max', 0):.2e}",
+                f"{p.get('lr_min', 0):.2e}",
+                f"{p.get('wd', 0):.2e}",
+                f"{p.get('sig', 0):.3f}",
                 f"{loss:.4f}",
             )
 
@@ -304,13 +401,17 @@ def objective(
     params_for_display = {
         "depth": len(hp.hidden_dims),
         "width": hp.hidden_dims[0],
-        "lr": hp.learning_rate_max,
+        "lr_max": hp.learning_rate_max,
+        "lr_min": hp.learning_rate_min,
+        "wd": hp.weight_decay,
+        "sig": hp.sigma_residual_adaptive_sampling,
     }
 
     try:
         manager = NetworkManager(hp)
         total_epochs = hp.warmup_epochs + hp.decay_epochs
         val_loss = float("inf")
+        display.start_trial(trial.number + 1, params_for_display, total_epochs)
 
         for epoch in range(total_epochs):
             manager.train_epoch(epoch)
@@ -322,21 +423,30 @@ def objective(
                 trial.report(val_loss, epoch)
 
                 if trial.should_prune():
-                    display.update(trial.number + 1, params_for_display, None, "pruned")
+                    display.update(trial.number + 1, params_for_display, None, "pruned", epoch)
                     raise optuna.TrialPruned
+
+            # Update live epoch progress display
+            display.update_epoch(epoch + 1, val_loss if val_loss != float("inf") else None)
 
         val_loss = _calculate_validation_loss(
             manager, val_data, config.n_rz_inner, config.n_rz_boundary
         )
         jax.clear_caches()
-        display.update(trial.number + 1, params_for_display, val_loss, "done")
+        display.update(trial.number + 1, params_for_display, val_loss, "done", total_epochs)
         return val_loss
 
     except optuna.TrialPruned:
         raise
     except Exception:
         logger.exception(f"Trial {trial.number} failed")
-        display.update(trial.number + 1, params_for_display, None, "failed")
+        display.update(
+            trial.number + 1,
+            params_for_display,
+            None,
+            "failed",
+            epoch if "epoch" in locals() else None,
+        )
         return float("inf")
 
 
@@ -384,6 +494,9 @@ def run_optimization(
     config = config or SearchSpaceConfig()
     check_capacity(config)
 
+    # Disable Optuna's default stdout logging to prevent rich Live display corruption
+    optuna.logging.set_verbosity(optuna.logging.WARNING)
+
     val_data = create_validation_configs(config)
 
     storage_path = Path("logs/hpo/optuna_study.db")
@@ -402,7 +515,7 @@ def run_optimization(
         pruner=HyperbandPruner(
             min_resource=config.min_epochs,
             max_resource=config.total_epochs,
-            reduction_factor=3,
+            reduction_factor=2,
         ),
     )
 
