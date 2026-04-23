@@ -43,20 +43,20 @@ class SearchSpaceConfig:
     """Hyperparameter search bounds for Optuna HPO."""
 
     depth_range: tuple[int, int] = (3, 5)
-    width_choices: tuple[int, ...] = (128, 160, 192)
-    lr_max_range: tuple[float, float] = (1e-4, 5e-3)
+    width_choices: tuple[int, ...] = (128, 160, 200, 256)
+    lr_max_range: tuple[float, float] = (5e-4, 5e-3)
     lr_min_ratio_range: tuple[float, float] = (0.01, 0.1)
     weight_decay_range: tuple[float, float] = (1e-9, 1e-5)
-    sigma_residual_range: tuple[float, float] = (0.01, 0.2)
+    sigma_residual_range: tuple[float, float] = (0.01, 0.3)
 
-    weight_boundary_condition: float = 20.0
+    weight_boundary_condition: float = 10.0
     n_rz_inner: int = 512
     total_epochs: int = 600
     warmup_ratio_range: tuple[float, float] = (0.1, 0.25)
 
     batch_size: int = 32
     n_train: int = 1024
-    n_rz_boundary: int = 256
+    n_rz_boundary: int = 128
 
     n_validate: int = 128
     val_eval_frequency: int = 20
