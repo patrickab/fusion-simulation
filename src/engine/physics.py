@@ -3,6 +3,7 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
+import optax
 
 from src.lib.geometry_config import PlasmaConfig
 
@@ -195,7 +196,8 @@ def pinn_loss_function(
         residual_fn = jax.vmap(
             lambda r, z: grad_shafranov_residual(psi_fn, params, r, z, psi_axis, config)
         )
-        loss_res = jnp.mean(residual_fn(R, Z) ** 2)
+        res_vals = residual_fn(R, Z)
+        loss_res = jnp.mean(optax.huber_loss(res_vals, delta=1.0))
 
         # 3. Boundary Condition Loss (Dirichlet: ψ = 0 at plasma edge)
         R_b, Z_b = config.Boundary.R, config.Boundary.Z
