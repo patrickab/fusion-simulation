@@ -117,15 +117,10 @@ class OptunaProgressDisplay:
 
     def __init__(self, config: SearchSpaceConfig, prior_trials: int = 0) -> None:
         self.config = config
-        self._trials_data: list[dict[str, Any]] = []
-        self._best_configs: list[tuple[dict[str, Any], float]] = []
-        self._best_loss = float("inf")
-        self._n_pruned = 0
-        self._n_failed = 0
-        self._n_completed = 0
-        self._trials_processed = 0
-        self._prior_trials = prior_trials
-        self._start_time = datetime.now()
+        self._trials_data, self._best_configs = [], []
+        self._best_loss, self._start_time = float("inf"), datetime.now()
+        self._counts = {"pruned": 0, "failed": 0, "done": 0}
+        self._trials_processed, self._prior_trials = 0, prior_trials
         self._current_trial_info: dict[str, Any] = {}
 
         self._progress = Progress(
@@ -140,55 +135,124 @@ class OptunaProgressDisplay:
         self._epoch_task = self._progress.add_task(
             "[magenta]Epochs:  ", total=self.config.total_epochs, visible=False
         )
-        self._trials_table = Table(show_header=True, header_style="bold cyan")
-        self._best_table = Table(show_header=True, header_style="bold green")
-
         self._live = Live(self._build_layout(), refresh_per_second=4, console=console)
 
+    def _get_trials_table(self) -> Table:
+        t = Table(title="Previous Trials", show_header=True, header_style="bold cyan")
+        for c in [
+            "Trial",
+            "Depth",
+            "Width",
+            "Max LR",
+            "Min LR",
+            "Weight Decay",
+            "Sig Adapt Sampling",
+            "Val Loss",
+            "Status",
+        ]:
+            t.add_column(c, justify="left" if c == "Status" else "right")
+        for d in self._trials_data:
+            t.add_row(
+                *[
+                    str(d.get(k, "?"))
+                    for k in [
+                        "trial",
+                        "depth",
+                        "width",
+                        "lr_max",
+                        "lr_min",
+                        "wd",
+                        "sig",
+                        "loss",
+                        "status",
+                    ]
+                ]
+            )
+        return t
+
+    def _get_best_table(self) -> Table:
+        t = Table(
+            title=f"Top {self.config.top_k} Configs", show_header=True, header_style="bold green"
+        )
+        for c in [
+            "Rank",
+            "Depth",
+            "Width",
+            "Max LR",
+            "Min LR",
+            "Weight Decay",
+            "Sig Adapt Sampling",
+            "Val Loss",
+        ]:
+            t.add_column(c, justify="right")
+        for rank, (p, loss) in enumerate(self._best_configs, 1):
+            t.add_row(
+                str(rank),
+                str(p.get("depth", "?")),
+                str(p.get("width", "?")),
+                f"{p.get('lr_max', 0):.2e}",
+                f"{p.get('lr_min', 0):.2e}",
+                f"{p.get('wd', 0):.2e}",
+                f"{p.get('sig', 0):.3f}",
+                f"{loss:.4f}",
+            )
+        return t
+
     def _build_layout(self) -> Panel:
-        elapsed = datetime.now() - self._start_time
-        secs = elapsed.seconds
-        elapsed_str = f"{secs // 3600:02d}:{(secs % 3600) // 60:02d}:{secs % 60:02d}"
+        elapsed_str = str(datetime.now() - self._start_time).split(".")[0]
         summary = (
-            f"[bold]Best Val Loss:[/] {self._best_loss:.4f}  |  "
-            f"[bold]Elapsed:[/] {elapsed_str}\n"
-            f"Session: {self._n_completed} done  |  {self._n_pruned} pruned  "
-            f"| {self._n_failed} failed"
+            f"[bold]Best Val Loss:[/] {self._best_loss:.4f}  |  [bold]Elapsed:[/] {elapsed_str}\n"
+            f"Session: {self._counts['done']} done  |  {self._counts['pruned']} pruned  |  {self._counts['failed']} failed"
             + (f"  |  Prior: {self._prior_trials}" if self._prior_trials else "")
         )
 
-        elements = [self._progress, summary, self._best_table]
-
         curr_table = Table(show_header=False, box=box.SIMPLE)
         if self._current_trial_info:
-            current_trial = self._current_trial_info
-            params = current_trial["params"]
-            curr_table.title = f"Current Trial: {current_trial['trial']}"
-            curr_table.add_row("Architecture:", f"{params.get('depth')}x{params.get('width')}")
-            curr_table.add_row("Max LR:", f"{params.get('lr_max', 0):.2e}")
-            curr_table.add_row("Min LR:", f"{params.get('lr_min', 0):.2e}")
-            curr_table.add_row("Weight Decay:", f"{params.get('wd', 0):.2e}")
-            curr_table.add_row("Sigma Res:", f"{params.get('sig', 0):.3f}")
-            val_loss_str = (
-                f"{current_trial['val_loss']:.4f}"
-                if current_trial.get("val_loss") is not None
-                else "--"
+            ct, p = self._current_trial_info, self._current_trial_info["params"]
+            val = ct.get("val_loss")
+            title, rows = (
+                f"Current Trial: {ct['trial']}",
+                [
+                    ("Architecture:", f"{p.get('depth')}x{p.get('width')}"),
+                    ("Max LR:", f"{p.get('lr_max', 0):.2e}"),
+                    ("Min LR:", f"{p.get('lr_min', 0):.2e}"),
+                    ("Weight Decay:", f"{p.get('wd', 0):.2e}"),
+                    ("Sigma Res:", f"{p.get('sig', 0):.3f}"),
+                    (
+                        "Recent Val Loss:",
+                        f"[bold cyan]{val:.4f}[/bold cyan]"
+                        if val is not None
+                        else "[bold cyan]--[/bold cyan]",
+                    ),
+                ],
             )
-            curr_table.add_row("Recent Val Loss:", f"[bold cyan]{val_loss_str}[/bold cyan]")
         else:
-            curr_table.title = "Current Trial: ---"
-            curr_table.add_row("Architecture:", "---")
-            curr_table.add_row("Max LR:", "---")
-            curr_table.add_row("Min LR:", "---")
-            curr_table.add_row("Weight Decay:", "---")
-            curr_table.add_row("Sigma Res:", "---")
-            curr_table.add_row("Recent Val Loss:", "[bold cyan]---[/bold cyan]")
+            title, rows = (
+                "Current Trial: ---",
+                [
+                    (k, "---" if "Loss" not in k else "[bold cyan]---[/bold cyan]")
+                    for k in [
+                        "Architecture:",
+                        "Max LR:",
+                        "Min LR:",
+                        "Weight Decay:",
+                        "Sigma Res:",
+                        "Recent Val Loss:",
+                    ]
+                ],
+            )
 
-        curr_panel = Panel(curr_table, border_style="magenta")
-        elements.append(curr_panel)
+        curr_table.title = title
+        for k, v in rows:
+            curr_table.add_row(k, v)
 
-        elements.append(self._trials_table)
-
+        elements = [
+            self._progress,
+            summary,
+            self._get_best_table(),
+            Panel(curr_table, border_style="magenta"),
+            self._get_trials_table(),
+        ]
         return Panel(
             Group(*elements),
             title="[bold cyan]PINN HPO Optimization[/bold cyan]",
@@ -226,31 +290,17 @@ class OptunaProgressDisplay:
         self._progress.update(self._task, completed=self._trials_processed)
         self._progress.update(self._epoch_task, visible=False)
         self._current_trial_info = {}
-
-        if status == "pruned":
-            self._n_pruned += 1
-        elif status == "failed":
-            self._n_failed += 1
-        elif status == "done":
-            self._n_completed += 1
+        if status in self._counts:
+            self._counts[status] += 1
 
         if loss is not None:
             self._best_configs.append((params.copy(), loss))
             self._best_configs.sort(key=lambda x: x[1])
             self._best_configs = self._best_configs[: self.config.top_k]
             self._best_loss = self._best_configs[0][1]
-            loss_str = f"{loss:.4f}"
-        else:
-            loss_str = "--"
 
-        if status == "pruned":
-            status_str = (
-                f"[yellow]pruned @ {epoch}[/]" if epoch is not None else "[yellow]pruned[/]"
-            )
-        elif status == "failed":
-            status_str = f"[red]failed @ {epoch}[/]" if epoch is not None else "[red]failed[/]"
-        else:
-            status_str = f"[green]done @ {epoch}[/]" if epoch is not None else "[green]done[/]"
+        c = {"pruned": "yellow", "failed": "red", "done": "green"}.get(status, "white")
+        status_str = f"[{c}]{status}" + (f" @ {epoch}" if epoch is not None else "") + "[/]"
 
         self._trials_data.append(
             {
@@ -261,69 +311,10 @@ class OptunaProgressDisplay:
                 "lr_min": f"{params.get('lr_min', 0):.2e}",
                 "wd": f"{params.get('wd', 0):.2e}",
                 "sig": f"{params.get('sig', 0):.3f}",
-                "loss": loss_str,
+                "loss": f"{loss:.4f}" if loss is not None else "--",
                 "status": status_str,
             }
         )
-
-        self._trials_table = Table(
-            title="Previous Trials",
-            show_header=True,
-            header_style="bold cyan",
-        )
-        for col in [
-            "Trial",
-            "Depth",
-            "Width",
-            "Max LR",
-            "Min LR",
-            "Weight Decay",
-            "Sig Adapt Sampling",
-            "Val Loss",
-            "Status",
-        ]:
-            self._trials_table.add_column(col, justify="right" if col != "Status" else "left")
-        for d in self._trials_data:
-            self._trials_table.add_row(
-                str(d["trial"]),
-                str(d["depth"]),
-                str(d["width"]),
-                d["lr_max"],
-                d["lr_min"],
-                d["wd"],
-                d["sig"],
-                d["loss"],
-                d["status"],
-            )
-
-        self._best_table = Table(
-            title=f"Top {self.config.top_k} Configs",
-            show_header=True,
-            header_style="bold green",
-        )
-        for col in [
-            "Rank",
-            "Depth",
-            "Width",
-            "Max LR",
-            "Min LR",
-            "Weight Decay",
-            "Sig Adapt Sampling",
-            "Val Loss",
-        ]:
-            self._best_table.add_column(col, justify="right")
-        for rank, (p, loss) in enumerate(self._best_configs, 1):
-            self._best_table.add_row(
-                str(rank),
-                str(p.get("depth", "?")),
-                str(p.get("width", "?")),
-                f"{p.get('lr_max', 0):.2e}",
-                f"{p.get('lr_min', 0):.2e}",
-                f"{p.get('wd', 0):.2e}",
-                f"{p.get('sig', 0):.3f}",
-                f"{loss:.4f}",
-            )
-
         self._live.update(self._build_layout())
 
     def __enter__(self) -> "OptunaProgressDisplay":
