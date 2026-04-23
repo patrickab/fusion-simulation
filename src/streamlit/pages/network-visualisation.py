@@ -267,7 +267,7 @@ def render_metrics() -> None:
 
 
 def main() -> None:
-    if "manager" not in st.session_state:
+    if "manager" not in st.session_state or "seeded_flux_input" not in st.session_state:
         st.session_state.manager = NetworkManager(HyperParams())
         st.session_state.available_networks = sorted(
             p.name for p in Filepaths.NETWORKS.glob("*.flax") if p.is_file()
