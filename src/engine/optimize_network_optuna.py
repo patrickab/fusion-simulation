@@ -283,6 +283,11 @@ class OptunaProgressDisplay:
         self._progress.update(self._epoch_task, completed=epoch)
         self._live.update(self._build_layout())
 
+    def would_qualify_for_top_k(self, loss: float) -> bool:
+        if len(self._best_configs) < self.config.top_k:
+            return True
+        return loss < self._best_configs[-1][1]
+
     def update(
         self,
         trial_num: int,
@@ -428,6 +433,8 @@ def objective(
         val_loss = _calculate_validation_loss(
             manager, val_data, config.n_rz_inner, config.n_rz_boundary
         )
+        if display.would_qualify_for_top_k(val_loss):
+            manager.to_disk()
         jax.clear_caches()
         display.update(trial.number + 1, params_for_display, val_loss, "done", total_epochs)
         return val_loss
@@ -562,38 +569,33 @@ def run_optimization(
     return results
 
 
-def train_top_k_models(results: list[tuple[HyperParams, float]]) -> None:
-    """Train top-k configs from scratch with full epochs and save to disk."""
-    console.print("\n" + "=" * 80)
-    console.print("[bold cyan]TRAINING TOP-K MODELS WITH FULL EPOCHS[/bold cyan]")
-    console.print("=" * 80)
-
-    for rank, (hp, hpo_loss) in enumerate(results, 1):
-        dims = f"{len(hp.hidden_dims)}x{hp.hidden_dims[0]}"
-        console.print(f"\n[bold]--- Rank {rank}: {dims} ---[/bold]")
-        console.print(f"  HPO Val Loss: {hpo_loss:.4f}")
-
-        manager = NetworkManager(hp)
-        manager.train(save_to_disk=True)
-
-        if manager.training_log:
-            console.print(f"  Final Train Loss: {manager.training_log[-1]['moving_avg_loss']:.4f}")
-
-        jax.clear_caches()
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Optuna HPO for PINN")
     parser.add_argument(
         "--restart-experiment", action="store_true", help="Delete existing study and start fresh"
     )
+    parser.add_argument(
+        "--test", action="store_true", help="Run with minimal parameters for rapid iteration"
+    )
     args = parser.parse_args()
 
+    config = SearchSpaceConfig()
+    if args.test:
+        config.batch_size = 8
+        config.n_train = 64
+        config.n_rz_boundary = 16
+        config.n_rz_inner = 64
+        config.depth_range = (1, 2)
+        config.width_choices = (32, 128)
+        config.n_validate = 16
+        config.n_trials = 5
+        config.total_epochs = 30
+        config.min_epochs = 5
+        config.n_startup_trials = 2
+        args.restart_experiment = True
+
     try:
-        config = SearchSpaceConfig()
-        top_results = run_optimization(config, restart=args.restart_experiment)
-        if top_results:
-            train_top_k_models(top_results)
+        run_optimization(config, restart=args.restart_experiment)
     except KeyboardInterrupt:
         logger.info("\nOptimization interrupted. Study saved to SQLite.")
         jax.clear_caches()
