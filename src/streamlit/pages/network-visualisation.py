@@ -30,6 +30,29 @@ import streamlit as st
 st.set_page_config(layout="wide", page_title="Fusion Simulation Lab")
 
 
+def extract_commit(filename: str) -> str | None:
+    stem = filename.replace(".flax", "")
+    parts = stem.split("_")
+    if len(parts) >= 2:
+        return parts[-1]
+    return None
+
+
+def get_available_commits(networks: list[str]) -> list[str]:
+    commits = set()
+    for network in networks:
+        commit = extract_commit(network)
+        if commit:
+            commits.add(commit)
+    return sorted(commits)
+
+
+def filter_networks_by_commit(networks: list[str], commit: str | None) -> list[str]:
+    if not commit:
+        return networks
+    return [n for n in networks if extract_commit(n) == commit]
+
+
 def sync_selected_network() -> None:
     """Load selected checkpoint once and reseed shared samples."""
     pinn_path = Filepaths.NETWORKS / st.session_state.selected_pinn
@@ -182,11 +205,23 @@ def render_sidebar() -> None:
                 st.rerun()
 
         with top_container:
+            commit_filter = st.session_state.get("filter_commit", "All")
+            commit_filter = commit_filter if commit_filter != "All" else None
+            filtered_networks = filter_networks_by_commit(
+                st.session_state.available_networks, commit_filter
+            )
+            if st.session_state.selected_pinn not in filtered_networks and filtered_networks:
+                st.session_state.selected_pinn = filtered_networks[0]
             st.selectbox(
                 "Select Network",
-                options=st.session_state.available_networks,
+                options=filtered_networks,
                 key="selected_pinn",
                 on_change=sync_selected_network,
+            )
+            st.selectbox(
+                "Filter by Commit",
+                options=["All"] + get_available_commits(st.session_state.available_networks),
+                key="filter_commit",
             )
 
         st.slider(
@@ -209,6 +244,7 @@ def main() -> None:
             p.name for p in Filepaths.NETWORKS.glob("*.flax") if p.is_file()
         )
         st.session_state.selected_pinn = st.session_state.available_networks[0]
+        st.session_state.filter_commit = "All"
         st.session_state.seed = 0
         reseed_network_visualisation()
         sync_selected_network()
