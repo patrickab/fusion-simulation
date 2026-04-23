@@ -3,6 +3,7 @@ import json
 import jax.numpy as jnp
 from stpyvista import stpyvista
 
+from src.engine.model_evaluation import compute_gs_residual_on_points
 from src.engine.network import NetworkManager
 from src.engine.plasma import (
     calculate_fusion_plasma,
@@ -108,6 +109,7 @@ def render_flux_predictions_tab():  # noqa
         )
         fig_flux.update_layout(height=500)
         st.subheader("Magnetic Flux ψ(R, Z)")
+        render_metrics()
         st.plotly_chart(fig_flux, use_container_width=True)
         return
 
@@ -116,6 +118,7 @@ def render_flux_predictions_tab():  # noqa
         fig_res.update_layout(height=500, margin={"l": 20, "r": 20, "t": 40, "b": 20})
 
     st.subheader("Grad-Shafranov Residual")
+    render_metrics()
     st.plotly_chart(fig_res, use_container_width=True)
 
 
@@ -235,6 +238,32 @@ def render_sidebar() -> None:
         if pinn_path.with_suffix(".json").exists():
             with open(pinn_path.with_suffix(".json")) as f:
                 st.json(json.load(f))
+
+
+def render_metrics() -> None:
+    """Render high-level metrics for the currently sampled geometries."""
+    manager: NetworkManager = st.session_state.manager
+    flux_input = st.session_state.seeded_flux_input
+
+    # Compute evaluation metrics
+    total, l_res, l_dir, l_per_cfg = manager.eval_step(
+        manager.state, flux_input, manager.config.weight_boundary_condition
+    )
+
+    # Compute max pointwise residual across all sampled configurations
+    max_res = 0.0
+    for i, cfg in enumerate(flux_input.config):
+        res_vals = compute_gs_residual_on_points(
+            manager, cfg, flux_input.R_sample[i], flux_input.Z_sample[i]
+        )
+        max_res = max(max_res, float(jnp.max(jnp.abs(res_vals))))
+
+    cols = st.columns(5)
+    cols[0].metric("Average Loss", f"{float(total):.2f}")
+    cols[1].metric("Interior Loss", f"{float(l_res):.2f}")
+    cols[2].metric("Boundary Loss", f"{float(l_dir):.2f}")
+    cols[3].metric("Max Avg Loss (Geometry)", f"{float(jnp.max(l_per_cfg)):.2f}")
+    cols[4].metric("Max Pointwise Residual", f"{max_res:.2f}")
 
 
 def main() -> None:
