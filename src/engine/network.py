@@ -329,56 +329,69 @@ class NetworkManager:
         return self.config.warmup_epochs + self.config.decay_epochs
 
     @staticmethod
+    def compute_loss(
+        params: any,
+        apply_fn: Callable,
+        inputs: FluxInput,
+        weight_boundary_condition: float,
+    ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
+        """Pure function to compute physics loss. Reusable for both training and evaluation."""
+
+        # Define psi_fn locally for JIT stability.
+        # Using _make_psi_fn() would create new function objects per step, risking cache misses.
+        def psi_fn(p: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
+            """Adapter converting neural network output to physical psi flux."""
+            inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
+            p_n, r_n, z_n = inp.normalize()
+            psi_n = apply_fn(p, r=r_n, z=z_n, **p_n)
+            return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
+
+        total, l_res, l_dir, l_per_cfg = pinn_loss_function(
+            psi_fn,
+            params,
+            inputs.R_sample,
+            inputs.Z_sample,
+            inputs.config,
+            weight_boundary_condition=weight_boundary_condition,
+        )
+        return total, (l_res, l_dir, l_per_cfg)
+
+    @staticmethod
+    @jax.jit
+    def eval_step(
+        state: train_state.TrainState,
+        inputs: FluxInput,
+        weight_boundary_condition: float,
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        """Fast, gradient-free evaluation step returning all loss components."""
+        total, (l_res, l_dir, l_per_cfg) = NetworkManager.compute_loss(
+            state.params, state.apply_fn, inputs, weight_boundary_condition
+        )
+        return total, l_res, l_dir, l_per_cfg
+
+    @staticmethod
     @jax.jit
     def train_step(
         state: train_state.TrainState,
         inputs: FluxInput,
         weight_boundary_condition: float,
     ) -> tuple[train_state.TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-        """Perform a single training step using physics-informed gradients.
-
-        Returns:
-            Tuple of (updated_state, total_loss, residual_loss, boundary_loss, per_config_loss).
-        """
-
-        # Define psi_fn locally for JIT stability.
-        # Using _make_psi_fn() would create new function objects per step, risking cache misses.
-        def psi_fn(params: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
-            """Adapter converting neural network output to physical psi flux."""
-            inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
-            p_n, r_n, z_n = inp.normalize()
-            psi_n = state.apply_fn(params, r=r_n, z=z_n, **p_n)
-            return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
+        """Perform a single training step using physics-informed gradients."""
 
         # Rematerializes activations during backprop. Trades compute for memory,
         # enabling training of larger networks with limited GPU memory.
         @jax.checkpoint
-        def loss_fn(
-            params: any,
-        ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-            total, l_res, l_dir, l_per_cfg = pinn_loss_function(
-                psi_fn,  # Passes callable directly
-                params,
-                inputs.R_sample,
-                inputs.Z_sample,
-                inputs.config,
-                weight_boundary_condition=weight_boundary_condition,
+        def loss_wrapper(params):
+            """Wrap compute loss to enable gradient computation"""
+            return NetworkManager.compute_loss(
+                params, state.apply_fn, inputs, weight_boundary_condition
             )
-            return total, (l_res, l_dir, l_per_cfg)
 
-        (loss, (l_res, l_dir, l_per_cfg)), grads = jax.value_and_grad(loss_fn, has_aux=True)(
+        (loss, (l_res, l_dir, l_per_cfg)), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(
             state.params
         )
         return state.apply_gradients(grads=grads), loss, l_res, l_dir, l_per_cfg
-
-    def calculate_loss(self, inputs: FluxInput) -> float:
-        """Calculate loss for given inputs without updating state."""
-        _, loss, _, _, _ = self.train_step(
-            self.state,
-            inputs,
-            self.config.weight_boundary_condition,
-        )
-        return float(loss)
+        return state.apply_gradients(grads=grads), loss, l_res, l_dir, l_per_cfg
 
     def train_epoch(self, epoch: int) -> tuple[float, float, float]:
         """Run one training epoch.
@@ -490,12 +503,6 @@ class NetworkManager:
 
         if save_to_disk:
             self.to_disk()
-
-    def predict(self, inputs: FluxInput) -> jnp.ndarray:
-        """Generate predictions for given inputs."""
-        norm_params, r_n, z_n = inputs.normalize()
-        psi_norm = self.model.apply(self.state.params, r=r_n, z=z_n, **norm_params)
-        return psi_norm * inputs.get_physical_scale()
 
     def get_psi(self, R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig) -> jnp.ndarray:
         """Evaluate magnetic flux psi at physical coordinates.

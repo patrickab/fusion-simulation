@@ -134,6 +134,7 @@ def reseed_network_visualisation() -> None:
         for i in range(len(seeded_geometry_configs))
     ]
 
+    st.session_state.seeded_flux_input = flux_input
     st.session_state.seeded_geometry_data = seeded_geometry_data
     st.session_state.seeded_3d_geom = geom_3d
     st.session_state.seeded_3d_state = state_3d
