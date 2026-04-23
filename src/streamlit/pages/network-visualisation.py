@@ -223,7 +223,7 @@ def render_sidebar() -> None:
             )
             st.selectbox(
                 "Filter by Commit",
-                options=["All"] + get_available_commits(st.session_state.available_networks),
+                options=["All", *get_available_commits(st.session_state.available_networks)],
                 key="filter_commit",
             )
 

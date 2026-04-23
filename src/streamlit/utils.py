@@ -2,8 +2,7 @@ import numpy as np
 import pyvista as pv
 
 from src.engine.network import NetworkManager, Sampler
-from src.lib.geometry_config import PlasmaGeometry, ToroidalCoilConfig
-from src.lib.geometry_config import PlasmaState
+from src.lib.geometry_config import PlasmaGeometry, PlasmaState, ToroidalCoilConfig
 import streamlit as st
 
 default_coil_config = ToroidalCoilConfig(
