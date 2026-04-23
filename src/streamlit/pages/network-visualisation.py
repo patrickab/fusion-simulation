@@ -3,6 +3,7 @@ import json
 import jax.numpy as jnp
 from stpyvista import stpyvista
 
+from src.engine.model_evaluation import compute_gs_residual_on_points
 from src.engine.network import NetworkManager
 from src.engine.plasma import (
     calculate_fusion_plasma,
@@ -28,6 +29,29 @@ from src.streamlit.utils import reseed_network_visualisation
 import streamlit as st
 
 st.set_page_config(layout="wide", page_title="Fusion Simulation Lab")
+
+
+def extract_commit(filename: str) -> str | None:
+    stem = filename.replace(".flax", "")
+    parts = stem.split("_")
+    if len(parts) >= 2:
+        return parts[-1]
+    return None
+
+
+def get_available_commits(networks: list[str]) -> list[str]:
+    commits = set()
+    for network in networks:
+        commit = extract_commit(network)
+        if commit:
+            commits.add(commit)
+    return sorted(commits)
+
+
+def filter_networks_by_commit(networks: list[str], commit: str | None) -> list[str]:
+    if not commit:
+        return networks
+    return [n for n in networks if extract_commit(n) == commit]
 
 
 def sync_selected_network() -> None:
@@ -85,6 +109,7 @@ def render_flux_predictions_tab():  # noqa
         )
         fig_flux.update_layout(height=500)
         st.subheader("Magnetic Flux ψ(R, Z)")
+        render_metrics()
         st.plotly_chart(fig_flux, use_container_width=True)
         return
 
@@ -93,6 +118,7 @@ def render_flux_predictions_tab():  # noqa
         fig_res.update_layout(height=500, margin={"l": 20, "r": 20, "t": 40, "b": 20})
 
     st.subheader("Grad-Shafranov Residual")
+    render_metrics()
     st.plotly_chart(fig_res, use_container_width=True)
 
 
@@ -182,11 +208,23 @@ def render_sidebar() -> None:
                 st.rerun()
 
         with top_container:
+            commit_filter = st.session_state.get("filter_commit", "All")
+            commit_filter = commit_filter if commit_filter != "All" else None
+            filtered_networks = filter_networks_by_commit(
+                st.session_state.available_networks, commit_filter
+            )
+            if st.session_state.selected_pinn not in filtered_networks and filtered_networks:
+                st.session_state.selected_pinn = filtered_networks[0]
             st.selectbox(
                 "Select Network",
-                options=st.session_state.available_networks,
+                options=filtered_networks,
                 key="selected_pinn",
                 on_change=sync_selected_network,
+            )
+            st.selectbox(
+                "Filter by Commit",
+                options=["All"] + get_available_commits(st.session_state.available_networks),
+                key="filter_commit",
             )
 
         st.slider(
@@ -202,6 +240,32 @@ def render_sidebar() -> None:
                 st.json(json.load(f))
 
 
+def render_metrics() -> None:
+    """Render high-level metrics for the currently sampled geometries."""
+    manager: NetworkManager = st.session_state.manager
+    flux_input = st.session_state.seeded_flux_input
+
+    # Compute evaluation metrics
+    total, l_res, l_dir, l_per_cfg = manager.eval_step(
+        manager.state, flux_input, manager.config.weight_boundary_condition
+    )
+
+    # Compute max pointwise residual across all sampled configurations
+    max_res = 0.0
+    for i, cfg in enumerate(flux_input.config):
+        res_vals = compute_gs_residual_on_points(
+            manager, cfg, flux_input.R_sample[i], flux_input.Z_sample[i]
+        )
+        max_res = max(max_res, float(jnp.max(jnp.abs(res_vals))))
+
+    cols = st.columns(5)
+    cols[0].metric("Average Loss", f"{float(total):.2f}")
+    cols[1].metric("Interior Loss", f"{float(l_res):.2f}")
+    cols[2].metric("Boundary Loss", f"{float(l_dir):.2f}")
+    cols[3].metric("Max Avg Loss (Geometry)", f"{float(jnp.max(l_per_cfg)):.2f}")
+    cols[4].metric("Max Pointwise Residual", f"{max_res:.2f}")
+
+
 def main() -> None:
     if "manager" not in st.session_state:
         st.session_state.manager = NetworkManager(HyperParams())
@@ -209,6 +273,7 @@ def main() -> None:
             p.name for p in Filepaths.NETWORKS.glob("*.flax") if p.is_file()
         )
         st.session_state.selected_pinn = st.session_state.available_networks[0]
+        st.session_state.filter_commit = "All"
         st.session_state.seed = 0
         reseed_network_visualisation()
         sync_selected_network()
