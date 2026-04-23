@@ -504,12 +504,6 @@ class NetworkManager:
         if save_to_disk:
             self.to_disk()
 
-    def predict(self, inputs: FluxInput) -> jnp.ndarray:
-        """Generate predictions for given inputs."""
-        norm_params, r_n, z_n = inputs.normalize()
-        psi_norm = self.model.apply(self.state.params, r=r_n, z=z_n, **norm_params)
-        return psi_norm * inputs.get_physical_scale()
-
     def get_psi(self, R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig) -> jnp.ndarray:
         """Evaluate magnetic flux psi at physical coordinates.
 
