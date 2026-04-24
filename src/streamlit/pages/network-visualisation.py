@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import jax.numpy as jnp
 from stpyvista import stpyvista
@@ -32,11 +33,24 @@ st.set_page_config(layout="wide", page_title="Fusion Simulation Lab")
 
 
 def extract_commit(filename: str) -> str | None:
-    stem = filename.replace(".flax", "")
+    stem = Path(filename).stem
     parts = stem.split("_")
     if len(parts) >= 2:
         return parts[-1]
     return None
+
+def get_available_networks() -> list[str]:
+    view_mode = st.session_state.get("network_view_mode", "New Benchmarks")
+    networks = []
+    
+    if view_mode in ["New Benchmarks", "All"]:
+        # Only get files in root of NETWORKS, exclude subdirectories like archive
+        networks.extend(p for p in Filepaths.NETWORKS.glob("*.flax") if p.is_file())
+        
+    if view_mode in ["Archive", "All"] and Filepaths.NETWORK_ARCHIVE.exists():
+        networks.extend(p for p in Filepaths.NETWORK_ARCHIVE.glob("*.flax") if p.is_file())
+        
+    return sorted(str(p.relative_to(Filepaths.NETWORKS)) for p in networks)
 
 
 def get_available_commits(networks: list[str]) -> list[str]:
@@ -72,7 +86,6 @@ def sync_selected_network() -> None:
 
     params = st.session_state.manager.from_disk(pinn_path=pinn_path)
     st.session_state.manager.state = st.session_state.manager.state.replace(params=params)
-    st.session_state.manager.ema_params = params
     reseed_network_visualisation()
 
 
@@ -173,22 +186,82 @@ def render_sidebar() -> None:
     with st.sidebar:
         top_container = st.container()
 
+        with top_container:
+            st.radio(
+                "View",
+                options=["New Benchmarks", "Archive", "All"],
+                horizontal=True,
+                key="network_view_mode",
+            )
+            st.session_state.available_networks = get_available_networks()
+            
+            commit_filter = st.session_state.get("filter_commit", "All")
+            commit_filter = commit_filter if commit_filter != "All" else None
+            filtered_networks = filter_networks_by_commit(
+                st.session_state.available_networks, commit_filter
+            )
+            was_selected = st.session_state.get("selected_pinn")
+            if was_selected not in filtered_networks and filtered_networks:
+                st.session_state.selected_pinn = filtered_networks[0]
+                sync_selected_network()
+            st.selectbox(
+                "Select Network",
+                options=filtered_networks,
+                key="selected_pinn",
+                on_change=sync_selected_network,
+            )
+            st.selectbox(
+                "Filter by Commit",
+                options=["All", *get_available_commits(st.session_state.available_networks)],
+                key="filter_commit",
+            )
+
         if st.session_state.get("selected_pinn"):
-            col1, col2 = st.columns(2)
+            col1, col2, col3 = st.columns(3)
+
+            # Archive Network
+            if col1.button("Archive", use_container_width=True):
+                old_path = Filepaths.NETWORKS / st.session_state.selected_pinn
+                Filepaths.NETWORK_ARCHIVE.mkdir(parents=True, exist_ok=True)
+                new_path = Filepaths.NETWORK_ARCHIVE / Path(st.session_state.selected_pinn).name
+
+                if old_path.exists():
+                    old_path.rename(new_path)
+                if old_path.with_suffix(".json").exists():
+                    old_path.with_suffix(".json").rename(new_path.with_suffix(".json"))
+
+                st.session_state.available_networks = get_available_networks()
+                if st.session_state.available_networks:
+                    commit_filter = st.session_state.get("filter_commit", "All")
+                    filtered_networks = filter_networks_by_commit(
+                        st.session_state.available_networks,
+                        commit_filter if commit_filter != "All" else None,
+                    )
+                    st.session_state.selected_pinn = (
+                        filtered_networks[-1]
+                        if filtered_networks
+                        else st.session_state.available_networks[-1]
+                    )
+                    sync_selected_network()
+                else:
+                    st.session_state.selected_pinn = None
+                st.rerun()
 
             # Rename Network
-            rename_clicked = col1.button("Rename", use_container_width=True)
+            rename_clicked = col2.button("Rename", use_container_width=True)
             if rename_clicked:
                 st.session_state.rename_mode = not st.session_state.get("rename_mode", False)
 
             if st.session_state.get("rename_mode", False):
                 new_name = st.text_input(
-                    "New Name", value=st.session_state.selected_pinn.replace(".flax", "")
+                    "New Name", value=Path(st.session_state.selected_pinn).stem
                 )
                 if st.button("Save Name") and new_name:
                     flax_name = new_name if new_name.endswith(".flax") else f"{new_name}.flax"
                     old_path = Filepaths.NETWORKS / st.session_state.selected_pinn
-                    new_path = Filepaths.NETWORKS / flax_name
+                    # If archived, keep it in the archive when renaming
+                    parent_dir = old_path.parent
+                    new_path = parent_dir / flax_name
 
                     if old_path.exists():
                         old_path.rename(new_path)
@@ -196,25 +269,21 @@ def render_sidebar() -> None:
                         old_path.with_suffix(".json").rename(new_path.with_suffix(".json"))
 
                     # Update state
-                    st.session_state.available_networks = sorted(
-                        p.name for p in Filepaths.NETWORKS.glob("*.flax") if p.is_file()
-                    )
-                    st.session_state.selected_pinn = flax_name
+                    st.session_state.available_networks = get_available_networks()
+                    st.session_state.selected_pinn = str(new_path.relative_to(Filepaths.NETWORKS))
                     st.session_state.rename_mode = False
                     sync_selected_network()
                     st.rerun()
 
             # Delete Network
-            if col2.button("Delete", use_container_width=True, type="primary"):
+            if col3.button("Delete", use_container_width=True, type="primary"):
                 target_path = Filepaths.NETWORKS / st.session_state.selected_pinn
                 if target_path.exists():
                     target_path.unlink()
                 if target_path.with_suffix(".json").exists():
                     target_path.with_suffix(".json").unlink()
 
-                st.session_state.available_networks = sorted(
-                    p.name for p in Filepaths.NETWORKS.glob("*.flax") if p.is_file()
-                )
+                st.session_state.available_networks = get_available_networks()
                 if st.session_state.available_networks:
                     commit_filter = st.session_state.get("filter_commit", "All")
                     filtered_networks = filter_networks_by_commit(
@@ -231,26 +300,6 @@ def render_sidebar() -> None:
                     st.session_state.selected_pinn = None
                 st.session_state.rename_mode = False
                 st.rerun()
-
-        with top_container:
-            commit_filter = st.session_state.get("filter_commit", "All")
-            commit_filter = commit_filter if commit_filter != "All" else None
-            filtered_networks = filter_networks_by_commit(
-                st.session_state.available_networks, commit_filter
-            )
-            if st.session_state.selected_pinn not in filtered_networks and filtered_networks:
-                st.session_state.selected_pinn = filtered_networks[0]
-            st.selectbox(
-                "Select Network",
-                options=filtered_networks,
-                key="selected_pinn",
-                on_change=sync_selected_network,
-            )
-            st.selectbox(
-                "Filter by Commit",
-                options=["All", *get_available_commits(st.session_state.available_networks)],
-                key="filter_commit",
-            )
 
         st.slider(
             "Select Sample",
@@ -293,14 +342,15 @@ def render_metrics() -> None:
 
 def main() -> None:
     if "manager" not in st.session_state or "seeded_flux_input" not in st.session_state:
-        st.session_state.available_networks = sorted(
-            p.name for p in Filepaths.NETWORKS.glob("*.flax") if p.is_file()
-        )
-        st.session_state.selected_pinn = st.session_state.available_networks[0]
+        st.session_state.available_networks = get_available_networks()
+        if st.session_state.available_networks:
+            st.session_state.selected_pinn = st.session_state.available_networks[0]
         st.session_state.filter_commit = "All"
         st.session_state.seed = 0
-        sync_selected_network()
-        reseed_network_visualisation()
+        
+        if st.session_state.available_networks:
+            sync_selected_network()
+            reseed_network_visualisation()
 
     render_sidebar()
 
