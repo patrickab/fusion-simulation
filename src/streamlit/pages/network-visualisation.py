@@ -57,9 +57,19 @@ def filter_networks_by_commit(networks: list[str], commit: str | None) -> list[s
 def sync_selected_network() -> None:
     """Load selected checkpoint once and reseed shared samples."""
     pinn_path = Filepaths.NETWORKS / st.session_state.selected_pinn
-    st.session_state.manager = NetworkManager(HyperParams.from_json(pinn_path.with_suffix(".json")))
+    new_config = HyperParams.from_json(pinn_path.with_suffix(".json"))
+    
+    # Re-instantiate only if the JIT-sensitive architecture changes
+    if "manager" not in st.session_state or st.session_state.manager.config.hidden_dims != new_config.hidden_dims:
+        st.session_state.manager = NetworkManager(new_config)
+    else:
+        # Same architecture: safely reuse XLA executables and update configs in-place
+        st.session_state.manager.config = new_config
+        st.session_state.manager.sampler.config = new_config
+        
     params = st.session_state.manager.from_disk(pinn_path=pinn_path)
     st.session_state.manager.state = st.session_state.manager.state.replace(params=params)
+    st.session_state.manager.ema_params = params
     reseed_network_visualisation()
 
 
@@ -101,25 +111,20 @@ def render_flux_predictions_tab():  # noqa
     configs = [to_plasma_config(d["geom"], d["state"]) for d in data]
 
     if mode == "Flux Prediction":
-        fig_flux = plot_flux_heatmap(
+        fig = plot_flux_heatmap(
             st.session_state.manager,
             configs,
             backend="plotly",
             resolution=res,
         )
-        fig_flux.update_layout(height=500)
         st.subheader("Magnetic Flux ψ(R, Z)")
-        render_metrics()
-        st.plotly_chart(fig_flux, use_container_width=True)
-        return
+    else:
+        fig = plot_gs_residual_heatmap(st.session_state.manager, configs, resolution=res)
+        st.subheader("Grad-Shafranov Residual")
 
-    with st.spinner("Computing Grad-Shafranov residual…"):
-        fig_res = plot_gs_residual_heatmap(st.session_state.manager, configs, resolution=res)
-        fig_res.update_layout(height=500, margin={"l": 20, "r": 20, "t": 40, "b": 20})
-
-    st.subheader("Grad-Shafranov Residual")
+    fig.update_layout(height=500, margin={"l": 20, "r": 20, "t": 40, "b": 20})
     render_metrics()
-    st.plotly_chart(fig_res, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="heatmap_chart")
 
 
 def render_3d_topology_tab():  # noqa
@@ -200,7 +205,14 @@ def render_sidebar() -> None:
                     p.name for p in Filepaths.NETWORKS.glob("*.flax") if p.is_file()
                 )
                 if st.session_state.available_networks:
-                    st.session_state.selected_pinn = st.session_state.available_networks[-1]
+                    commit_filter = st.session_state.get("filter_commit", "All")
+                    filtered_networks = filter_networks_by_commit(
+                        st.session_state.available_networks,
+                        commit_filter if commit_filter != "All" else None,
+                    )
+                    st.session_state.selected_pinn = (
+                        filtered_networks[-1] if filtered_networks else st.session_state.available_networks[-1]
+                    )
                     sync_selected_network()
                 else:
                     st.session_state.selected_pinn = None
@@ -268,15 +280,14 @@ def render_metrics() -> None:
 
 def main() -> None:
     if "manager" not in st.session_state or "seeded_flux_input" not in st.session_state:
-        st.session_state.manager = NetworkManager(HyperParams())
         st.session_state.available_networks = sorted(
             p.name for p in Filepaths.NETWORKS.glob("*.flax") if p.is_file()
         )
         st.session_state.selected_pinn = st.session_state.available_networks[0]
         st.session_state.filter_commit = "All"
         st.session_state.seed = 0
-        reseed_network_visualisation()
         sync_selected_network()
+        reseed_network_visualisation()
 
     render_sidebar()
 
