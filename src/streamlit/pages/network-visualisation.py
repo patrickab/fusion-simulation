@@ -31,6 +31,8 @@ import streamlit as st
 
 st.set_page_config(layout="wide", page_title="Fusion Simulation Lab")
 
+PLOT_GRID_RESOLUTION = 100
+
 
 def extract_commit(filename: str) -> str | None:
     stem = Path(filename).stem
@@ -119,14 +121,7 @@ def render_geometry_sampling_tab():  # noqa
 
 def render_flux_predictions_tab():  # noqa
     """Render the magnetic flux prediction heatmap tab, with optional GS residual."""
-    col1, col3, _ = st.columns([1, 2, 4])
-    res = col1.slider("Grid Resolution", 20, 200, 100, key="prediction_res")
-    mode = col3.radio(
-        " ",
-        options=["Flux Prediction", "GS Residual", "Both"],
-        horizontal=True,
-        key="prediction_mode",
-    )
+    mode = st.session_state.get("prediction_mode", "Flux Prediction")
 
     data = st.session_state.seeded_geometry_data
     configs = [to_plasma_config(d["geom"], d["state"]) for d in data]
@@ -139,14 +134,16 @@ def render_flux_predictions_tab():  # noqa
             st.session_state.manager,
             configs,
             backend="plotly",
-            resolution=res,
+            resolution=PLOT_GRID_RESOLUTION,
         )
         fig_flux.update_layout(height=500, margin={"l": 20, "r": 20, "t": 40, "b": 20})
         st.plotly_chart(fig_flux, use_container_width=True, key="heatmap_chart_flux")
 
     if mode in ["GS Residual", "Both"]:
         st.subheader("Grad-Shafranov Residual")
-        fig_res = plot_gs_residual_heatmap(st.session_state.manager, configs, resolution=res)
+        fig_res = plot_gs_residual_heatmap(
+            st.session_state.manager, configs, resolution=PLOT_GRID_RESOLUTION
+        )
         fig_res.update_layout(height=500, margin={"l": 20, "r": 20, "t": 40, "b": 20})
         st.plotly_chart(fig_res, use_container_width=True, key="heatmap_chart_res")
 
@@ -187,6 +184,11 @@ def render_sidebar() -> None:
         top_container = st.container()
 
         with top_container:
+            # Apply pending network selection before widget instantiation
+            if st.session_state.get("_next_pinn"):
+                st.session_state.selected_pinn = st.session_state._next_pinn
+                del st.session_state._next_pinn
+
             st.radio(
                 "View",
                 options=["New Benchmarks", "Archive", "All"],
@@ -237,14 +239,13 @@ def render_sidebar() -> None:
                         st.session_state.available_networks,
                         commit_filter if commit_filter != "All" else None,
                     )
-                    st.session_state.selected_pinn = (
+                    st.session_state._next_pinn = (
                         filtered_networks[-1]
                         if filtered_networks
                         else st.session_state.available_networks[-1]
                     )
-                    sync_selected_network()
                 else:
-                    st.session_state.selected_pinn = None
+                    st.session_state._next_pinn = None
                 st.rerun()
 
             # Rename Network
@@ -268,11 +269,9 @@ def render_sidebar() -> None:
                     if old_path.with_suffix(".json").exists():
                         old_path.with_suffix(".json").rename(new_path.with_suffix(".json"))
 
-                    # Update state
                     st.session_state.available_networks = get_available_networks()
-                    st.session_state.selected_pinn = str(new_path.relative_to(Filepaths.NETWORKS))
+                    st.session_state._next_pinn = str(new_path.relative_to(Filepaths.NETWORKS))
                     st.session_state.rename_mode = False
-                    sync_selected_network()
                     st.rerun()
 
             # Delete Network
@@ -290,16 +289,17 @@ def render_sidebar() -> None:
                         st.session_state.available_networks,
                         commit_filter if commit_filter != "All" else None,
                     )
-                    st.session_state.selected_pinn = (
+                    st.session_state._next_pinn = (
                         filtered_networks[-1]
                         if filtered_networks
                         else st.session_state.available_networks[-1]
                     )
-                    sync_selected_network()
                 else:
-                    st.session_state.selected_pinn = None
+                    st.session_state._next_pinn = None
                 st.session_state.rename_mode = False
                 st.rerun()
+
+        st.divider()
 
         st.slider(
             "Select Sample",
@@ -308,6 +308,16 @@ def render_sidebar() -> None:
             key="seed",
             on_change=reseed_network_visualisation,
         )
+
+        st.radio(
+            "Plot Options",
+            options=["Flux Prediction", "GS Residual", "Both"],
+            horizontal=True,
+            key="prediction_mode",
+        )
+
+        st.divider()
+
         pinn_path = Filepaths.NETWORKS / st.session_state.selected_pinn
         if pinn_path.with_suffix(".json").exists():
             with open(pinn_path.with_suffix(".json")) as f:
