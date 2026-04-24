@@ -412,6 +412,7 @@ def objective(
         manager = NetworkManager(hp)
         total_epochs = hp.warmup_epochs + hp.decay_epochs
         val_loss = float("inf")
+        val_loss_history: list[float] = []
         display.start_trial(trial.number + 1, params_for_display, total_epochs)
 
         for epoch in range(total_epochs):
@@ -421,7 +422,11 @@ def objective(
                 val_loss = _calculate_validation_loss(
                     manager, val_data, config.n_rz_inner, config.n_rz_boundary
                 )
-                trial.report(val_loss, epoch)
+                val_loss_history.append(val_loss)
+                if len(val_loss_history) > 3:
+                    val_loss_history.pop(0)
+                avg_val_loss = sum(val_loss_history) / len(val_loss_history)
+                trial.report(avg_val_loss, epoch)
 
                 if trial.should_prune():
                     display.update(trial.number + 1, params_for_display, None, "pruned", epoch)
