@@ -37,6 +37,10 @@ from src.lib.network_config import DomainBounds, HyperParams
 logger = get_logger(name="OptunaHPO", log_dir="logs/hpo")
 console = Console(width=160)
 
+K_EXPERIMENTS = 3
+K_MOVING_AVERAGE = 4
+VALIDATION_FREQUENCY = 20
+
 
 @dataclass
 class SearchSpaceConfig:
@@ -59,11 +63,11 @@ class SearchSpaceConfig:
     n_rz_boundary: int = 128
 
     n_validate: int = 128
-    val_eval_frequency: int = 20
+    val_eval_frequency: int = VALIDATION_FREQUENCY
 
     min_epochs: int = 50
     n_trials: int = 50
-    top_k: int = 3
+    top_k: int = K_EXPERIMENTS
     n_startup_trials: int = 10
 
 
@@ -421,7 +425,7 @@ def objective(
                     manager, val_data, config.n_rz_inner, config.n_rz_boundary
                 )
                 val_loss_history.append(val_loss)
-                if len(val_loss_history) > 3:
+                if len(val_loss_history) > K_MOVING_AVERAGE:
                     val_loss_history.pop(0)
                 avg_val_loss = sum(val_loss_history) / len(val_loss_history)
                 trial.report(avg_val_loss, epoch)
