@@ -52,7 +52,7 @@ class SearchSpaceConfig:
     weight_boundary_condition: float = 10.0
     n_rz_inner: int = 512
     total_epochs: int = 600
-    warmup_ratio_range: tuple[float, float] = (0.1, 0.25)
+    warmup_ratio: float = 0.167
 
     batch_size: int = 32
     n_train: int = 1024
@@ -369,8 +369,6 @@ def build_hyperparams(trial: optuna.Trial, config: SearchSpaceConfig) -> HyperPa
     lr_min_ratio = trial.suggest_float("lr_min_ratio", *config.lr_min_ratio_range, log=True)
     weight_decay = trial.suggest_float("weight_decay", *config.weight_decay_range, log=True)
     sigma_residual = trial.suggest_float("sigma_residual", *config.sigma_residual_range)
-    warmup_ratio = trial.suggest_float("warmup_ratio", *config.warmup_ratio_range)
-
     return HyperParams(
         hidden_dims=tuple([width] * depth),
         learning_rate_max=lr_max,
@@ -380,8 +378,8 @@ def build_hyperparams(trial: optuna.Trial, config: SearchSpaceConfig) -> HyperPa
         sigma_residual_adaptive_sampling=sigma_residual,
         n_rz_inner_samples=config.n_rz_inner,
         n_rz_boundary_samples=config.n_rz_boundary,
-        warmup_epochs=int(config.total_epochs * warmup_ratio),
-        decay_epochs=config.total_epochs - int(config.total_epochs * warmup_ratio),
+        warmup_epochs=int(config.total_epochs * config.warmup_ratio),
+        decay_epochs=config.total_epochs - int(config.total_epochs * config.warmup_ratio),
         batch_size=config.batch_size,
         n_train=config.n_train,
     )
@@ -467,7 +465,7 @@ def get_warmstart_config() -> dict[str, Any]:
         "lr_min_ratio": 0.025,
         "weight_decay": 1e-7,
         "sigma_residual": 0.05,
-        "warmup_ratio": 0.167,
+
     }
 
 
