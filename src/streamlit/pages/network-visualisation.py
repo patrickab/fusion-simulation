@@ -58,15 +58,18 @@ def sync_selected_network() -> None:
     """Load selected checkpoint once and reseed shared samples."""
     pinn_path = Filepaths.NETWORKS / st.session_state.selected_pinn
     new_config = HyperParams.from_json(pinn_path.with_suffix(".json"))
-    
+
     # Re-instantiate only if the JIT-sensitive architecture changes
-    if "manager" not in st.session_state or st.session_state.manager.config.hidden_dims != new_config.hidden_dims:
+    if (
+        "manager" not in st.session_state
+        or st.session_state.manager.config.hidden_dims != new_config.hidden_dims
+    ):
         st.session_state.manager = NetworkManager(new_config)
     else:
         # Same architecture: safely reuse XLA executables and update configs in-place
         st.session_state.manager.config = new_config
         st.session_state.manager.sampler.config = new_config
-        
+
     params = st.session_state.manager.from_disk(pinn_path=pinn_path)
     st.session_state.manager.state = st.session_state.manager.state.replace(params=params)
     st.session_state.manager.ema_params = params
@@ -103,28 +106,36 @@ def render_geometry_sampling_tab():  # noqa
 
 def render_flux_predictions_tab():  # noqa
     """Render the magnetic flux prediction heatmap tab, with optional GS residual."""
-    col1, col2, _ = st.columns([1, 1, 4])
+    col1, col3, _ = st.columns([1, 2, 4])
     res = col1.slider("Grid Resolution", 20, 200, 100, key="prediction_res")
-    mode = col2.radio(" ", options=["Flux Prediction", "GS Residual"], horizontal=True)
+    mode = col3.radio(
+        " ",
+        options=["Flux Prediction", "GS Residual", "Both"],
+        horizontal=True,
+        key="prediction_mode",
+    )
 
     data = st.session_state.seeded_geometry_data
     configs = [to_plasma_config(d["geom"], d["state"]) for d in data]
 
-    if mode == "Flux Prediction":
-        fig = plot_flux_heatmap(
+    render_metrics()
+
+    if mode in ["Flux Prediction", "Both"]:
+        st.subheader("Magnetic Flux ψ(R, Z)")
+        fig_flux = plot_flux_heatmap(
             st.session_state.manager,
             configs,
             backend="plotly",
             resolution=res,
         )
-        st.subheader("Magnetic Flux ψ(R, Z)")
-    else:
-        fig = plot_gs_residual_heatmap(st.session_state.manager, configs, resolution=res)
-        st.subheader("Grad-Shafranov Residual")
+        fig_flux.update_layout(height=500, margin={"l": 20, "r": 20, "t": 40, "b": 20})
+        st.plotly_chart(fig_flux, use_container_width=True, key="heatmap_chart_flux")
 
-    fig.update_layout(height=500, margin={"l": 20, "r": 20, "t": 40, "b": 20})
-    render_metrics()
-    st.plotly_chart(fig, use_container_width=True, key="heatmap_chart")
+    if mode in ["GS Residual", "Both"]:
+        st.subheader("Grad-Shafranov Residual")
+        fig_res = plot_gs_residual_heatmap(st.session_state.manager, configs, resolution=res)
+        fig_res.update_layout(height=500, margin={"l": 20, "r": 20, "t": 40, "b": 20})
+        st.plotly_chart(fig_res, use_container_width=True, key="heatmap_chart_res")
 
 
 def render_3d_topology_tab():  # noqa
@@ -211,7 +222,9 @@ def render_sidebar() -> None:
                         commit_filter if commit_filter != "All" else None,
                     )
                     st.session_state.selected_pinn = (
-                        filtered_networks[-1] if filtered_networks else st.session_state.available_networks[-1]
+                        filtered_networks[-1]
+                        if filtered_networks
+                        else st.session_state.available_networks[-1]
                     )
                     sync_selected_network()
                 else:
