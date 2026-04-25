@@ -1,3 +1,4 @@
+import argparse
 from datetime import datetime
 import os
 from pathlib import Path
@@ -544,12 +545,31 @@ class NetworkManager:
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train PINN network")
+    parser.add_argument(
+        "--test", action="store_true", help="Run with minimal parameters for rapid iteration"
+    )
+    args = parser.parse_args()
+
     try:
-        config = HyperParams()
-        manager = NetworkManager(config)
-        manager.train(save_to_disk=True)
-        # params = manager.from_disk(manager.state.params)
-        # manager.state = manager.state.replace(params=params)
+        if not args.test:
+            config = HyperParams()
+            manager = NetworkManager(config)
+            manager.train(save_to_disk=True)
+        else:
+            globals()["N_VALIDATION_SIZE"] = 16
+            globals()["VALIDATION_FREQUENCY"] = 20
+            config = HyperParams(
+                hidden_dims=(32, 32),
+                batch_size=8,
+                n_rz_inner_samples=64,
+                n_rz_boundary_samples=16,
+                n_train=64,
+                warmup_epochs=20,
+                decay_epochs=20,
+            )
+            manager = NetworkManager(config)
+            manager.train(save_to_disk=False)
     except KeyboardInterrupt:
         pass
     except Exception as e:
