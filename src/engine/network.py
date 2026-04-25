@@ -9,6 +9,7 @@ import flax.serialization
 from flax.training import train_state
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from rich.console import Console, Group
 from rich.live import Live
@@ -80,6 +81,8 @@ class FluxPINN(nn.Module):
 BASE_SEED = 42
 RESAMPLING_FREQUENCY = 10  # Resample training set every N epochs
 LOG_FREQUENCY = 10  # Log training metrics every N epochs
+N_VALIDATION_SIZE = 128  # Number of validation plasma configs
+VALIDATION_FREQUENCY = 5 * LOG_FREQUENCY  # Evaluate validation set every N epochs
 
 
 class Sampler:
@@ -284,11 +287,12 @@ class NetworkManager:
 
         if self.training_log:
             with open(artifact_log_path, "w") as f:
-                f.write("epoch,moving_avg_loss,residual,boundary\n")
+                f.write("epoch,moving_avg_loss,val_loss,residual,boundary\n")
                 for entry in self.training_log:
+                    vl = f"{entry['val_loss']:.6f}" if entry["val_loss"] is not None else ""
                     f.write(
                         f"{entry['epoch']},{entry['moving_avg_loss']:.6f},"
-                        f"{entry['residual']:.6f},{entry['boundary']:.6f}\n"
+                        f"{vl},{entry['residual']:.6f},{entry['boundary']:.6f}\n"
                     )
 
     def from_disk(self, pinn_path) -> any:  # noqa
@@ -370,6 +374,31 @@ class NetworkManager:
         )
         return total, l_res, l_dir, l_per_cfg
 
+    def _create_validation_configs(self) -> np.ndarray:
+        """Create fixed validation plasma configs using Sobol sampling."""
+        lower, upper = DomainBounds.get_bounds()
+        sobol = qmc.Sobol(d=len(lower), scramble=True, seed=BASE_SEED + 123)
+        samples = sobol.random(N_VALIDATION_SIZE)
+        return np.array(qmc.scale(samples, lower, upper), dtype=np.float32)
+
+    def _calculate_validation_loss(self, val_configs: np.ndarray) -> float:
+        """Calculate validation loss using gradient-free eval_step."""
+        chunk_size = 128
+        total_loss = 0.0
+        n_chunks = 0
+        weight_bc = self.config.weight_boundary_condition
+        self.sampler.precompute_coordinate_samples()
+
+        for i in range(0, len(val_configs), chunk_size):
+            end = min(i + chunk_size, len(val_configs))
+            batch = jnp.array(val_configs[i:end], dtype=jnp.float32)
+            inputs = self.sampler.sample_flux_input(plasma_configs=batch)
+            loss, _, _, _ = self.eval_step(self.state, inputs, weight_bc)
+            total_loss += float(loss)
+            n_chunks += 1
+
+        return total_loss / n_chunks
+
     @staticmethod
     @jax.jit
     def train_step(
@@ -430,6 +459,7 @@ class NetworkManager:
         self._table = Table(title="Training Metrics", show_header=True, header_style="bold cyan")
         self._table.add_column("Epoch", justify="right", style="cyan")
         self._table.add_column("Loss", justify="right", style="magenta")
+        self._table.add_column("Val Loss", justify="right", style="green")
         self._table.add_column("Residual", justify="right")
         self._table.add_column("Boundary", justify="right")
 
@@ -454,10 +484,14 @@ class NetworkManager:
             vertical_overflow="visible",
         )
 
-    def _log_metric(self, epoch: int, loss: float, residual: float, boundary: float) -> None:
+    def _log_metric(
+        self, epoch: int, loss: float, residual: float, boundary: float, val_loss: float | None
+    ) -> None:
         self._accumulated_loss += loss
         self._accumulated_residual += residual
         self._accumulated_boundary += boundary
+
+        val_loss_str = f"{val_loss:.3f}" if val_loss is not None else "-"
 
         if (epoch + 1) % LOG_FREQUENCY == 0:
             moving_avg_loss = self._accumulated_loss / LOG_FREQUENCY
@@ -468,6 +502,7 @@ class NetworkManager:
                 {
                     "epoch": epoch + 1,
                     "moving_avg_loss": moving_avg_loss,
+                    "val_loss": val_loss,
                     "residual": moving_avg_residual,
                     "boundary": moving_avg_boundary,
                 }
@@ -476,6 +511,7 @@ class NetworkManager:
             self._table.add_row(
                 f"{epoch + 1}/{self.epochs}",
                 f"{moving_avg_loss:.3f}",
+                val_loss_str,
                 f"{moving_avg_residual:.3f}",
                 f"{moving_avg_boundary:.3f}",
             )
@@ -488,6 +524,7 @@ class NetworkManager:
                 {
                     "epoch": epoch + 1,
                     "moving_avg_loss": self._accumulated_loss / ((epoch + 1) % LOG_FREQUENCY),
+                    "val_loss": val_loss,
                     "residual": self._accumulated_residual / ((epoch + 1) % LOG_FREQUENCY),
                     "boundary": self._accumulated_boundary / ((epoch + 1) % LOG_FREQUENCY),
                 }
@@ -498,10 +535,14 @@ class NetworkManager:
 
     def train(self, save_to_disk: bool = True) -> None:
         live = self._init_live_display()
+        val_configs = self._create_validation_configs()
         with live as self._live:
             for epoch in range(self.epochs):
                 loss, residual, boundary = self.train_epoch(epoch)
-                self._log_metric(epoch, loss, residual, boundary)
+                val_loss = None
+                if (epoch + 1) % VALIDATION_FREQUENCY == 0:
+                    val_loss = self._calculate_validation_loss(val_configs)
+                self._log_metric(epoch, loss, residual, boundary, val_loss)
 
         if save_to_disk:
             self.to_disk()
