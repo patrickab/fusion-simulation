@@ -1,7 +1,9 @@
 import json
+import math
 from pathlib import Path
 
 import jax.numpy as jnp
+import plotly.graph_objects as go
 from stpyvista import stpyvista
 
 from src.engine.model_evaluation import compute_gs_residual_on_points
@@ -41,17 +43,18 @@ def extract_commit(filename: str) -> str | None:
         return parts[-1]
     return None
 
+
 def get_available_networks() -> list[str]:
     view_mode = st.session_state.get("network_view_mode", "New Benchmarks")
     networks = []
-    
+
     if view_mode in ["New Benchmarks", "All"]:
         # Only get files in root of NETWORKS, exclude subdirectories like archive
         networks.extend(p for p in Filepaths.NETWORKS.glob("*.flax") if p.is_file())
-        
+
     if view_mode in ["Archive", "All"] and Filepaths.NETWORK_ARCHIVE.exists():
         networks.extend(p for p in Filepaths.NETWORK_ARCHIVE.glob("*.flax") if p.is_file())
-        
+
     return sorted(str(p.relative_to(Filepaths.NETWORKS)) for p in networks)
 
 
@@ -102,16 +105,17 @@ def to_plasma_config(geom: PlasmaGeometry, state: PlasmaState) -> PlasmaConfig:
 # --- UI Components ---
 def render_geometry_sampling_tab():  # noqa
     """Render the geometry sampling visualization tab."""
+    n = st.session_state.get("sample_size", 4)
     col1, _, _ = st.columns([1, 1, 4])
     with col1:
         view_option = st.selectbox(
             "Select Geometry View",
-            ["Show All"] + [f"Geometry {i + 1}" for i in range(4)],
+            ["Show All"] + [f"Geometry {i + 1}" for i in range(n)],
             key="geom_view",
         )
 
     data = st.session_state.seeded_geometry_data
-    indices = range(4) if view_option == "Show All" else [int(view_option.split()[-1]) - 1]
+    indices = range(n) if view_option == "Show All" else [int(view_option.split()[-1]) - 1]
 
     selected_samples = [data[idx] for idx in indices]
     geometries = [sample["geom"] for sample in selected_samples]
@@ -119,14 +123,53 @@ def render_geometry_sampling_tab():  # noqa
     st.plotly_chart(fig, use_container_width=True)
 
 
-def render_flux_predictions_tab():  # noqa
+def apply_grid_layout(fig: go.Figure, n_items: int) -> None:
+    n_cols = min(n_items, 4)
+    n_rows = math.ceil(n_items / n_cols)
+    fig.update_layout(height=500 * n_rows, margin={"l": 20, "r": 20, "t": 40, "b": 20})
+
+
+def render_flux_predictions_tab() -> None:
     """Render the magnetic flux prediction heatmap tab, with optional GS residual."""
+    metrics_col, _, options_col, sample_col = st.columns([3, 2, 2, 1])
+
+    with metrics_col:
+        render_metrics()
+
+    with options_col:
+        st.radio(
+            "Plot Options",
+            options=["Flux Prediction", "GS Residual", "Both"],
+            horizontal=True,
+            key="prediction_mode",
+        )
+
+    with sample_col:
+        st.selectbox(
+            "Sample Size",
+            options=[4, 8, 12, 16, 20, 24],
+            key="sample_size",
+            on_change=reseed_network_visualisation,
+        )
+
+    commit = st.session_state.get("filter_commit", "All")
+    if commit != "All":
+        st.button(
+            "Plot Benchmark",
+            key="plot_benchmark",
+            on_click=lambda: st.session_state.update(benchmark_active=True),
+        )
+    else:
+        st.session_state.benchmark_active = False
+
     mode = st.session_state.get("prediction_mode", "Flux Prediction")
 
     data = st.session_state.seeded_geometry_data
     configs = [to_plasma_config(d["geom"], d["state"]) for d in data]
 
-    render_metrics()
+    if st.session_state.get("benchmark_active"):
+        render_benchmark(mode, configs)
+        return
 
     if mode in ["Flux Prediction", "Both"]:
         st.subheader("Magnetic Flux ψ(R, Z)")
@@ -136,7 +179,7 @@ def render_flux_predictions_tab():  # noqa
             backend="plotly",
             resolution=PLOT_GRID_RESOLUTION,
         )
-        fig_flux.update_layout(height=500, margin={"l": 20, "r": 20, "t": 40, "b": 20})
+        apply_grid_layout(fig_flux, len(configs))
         st.plotly_chart(fig_flux, use_container_width=True, key="heatmap_chart_flux")
 
     if mode in ["GS Residual", "Both"]:
@@ -144,7 +187,7 @@ def render_flux_predictions_tab():  # noqa
         fig_res = plot_gs_residual_heatmap(
             st.session_state.manager, configs, resolution=PLOT_GRID_RESOLUTION
         )
-        fig_res.update_layout(height=500, margin={"l": 20, "r": 20, "t": 40, "b": 20})
+        apply_grid_layout(fig_res, len(configs))
         st.plotly_chart(fig_res, use_container_width=True, key="heatmap_chart_res")
 
 
@@ -196,7 +239,7 @@ def render_sidebar() -> None:
                 key="network_view_mode",
             )
             st.session_state.available_networks = get_available_networks()
-            
+
             commit_filter = st.session_state.get("filter_commit", "All")
             commit_filter = commit_filter if commit_filter != "All" else None
             filtered_networks = filter_networks_by_commit(
@@ -309,13 +352,6 @@ def render_sidebar() -> None:
             on_change=reseed_network_visualisation,
         )
 
-        st.radio(
-            "Plot Options",
-            options=["Flux Prediction", "GS Residual", "Both"],
-            horizontal=True,
-            key="prediction_mode",
-        )
-
         st.divider()
 
         pinn_path = Filepaths.NETWORKS / st.session_state.selected_pinn
@@ -343,11 +379,11 @@ def render_metrics() -> None:
         max_res = max(max_res, float(jnp.max(jnp.abs(res_vals))))
 
     cols = st.columns(5)
-    cols[0].metric("Average Loss", f"{float(total):.2f}")
+    cols[3].metric("Max Loss", f"{float(jnp.max(l_per_cfg)):.2f}")
+    cols[0].metric("Avg Loss", f"{float(total):.2f}")
     cols[1].metric("Interior Loss", f"{float(l_res):.2f}")
-    cols[2].metric("Boundary Loss", f"{float(l_dir):.2f}")
-    cols[3].metric("Max Avg Loss (Geometry)", f"{float(jnp.max(l_per_cfg)):.2f}")
-    cols[4].metric("Max Pointwise Residual", f"{max_res:.2f}")
+    cols[2].metric("Boundary Loss (raw)", f"{float(l_dir):.2f}")
+    cols[4].metric("Max Residual", f"{max_res:.2f}")
 
 
 def main() -> None:
@@ -357,7 +393,8 @@ def main() -> None:
             st.session_state.selected_pinn = st.session_state.available_networks[0]
         st.session_state.filter_commit = "All"
         st.session_state.seed = 0
-        
+        st.session_state.sample_size = 4
+
         if st.session_state.available_networks:
             sync_selected_network()
             reseed_network_visualisation()
