@@ -94,7 +94,7 @@ def reseed_network_visualisation() -> None:
     sampler = Sampler(manager.config, seed=int(st.session_state.seed))
 
     seeded_geometry_configs = sampler._get_sobol_sample(
-        n_samples=4,
+        n_samples=st.session_state.get("sample_size", 4),
         lower_bounds=sampler._domain_lower_bounds,
         upper_bounds=sampler._domain_upper_bounds,
         sobol_sampler="domain",

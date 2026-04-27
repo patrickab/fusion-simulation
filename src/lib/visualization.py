@@ -1,5 +1,6 @@
 """Utility functions for visualizing fusion simulation geometry."""
 
+import math
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -86,7 +87,10 @@ def plot_rz_samples(
     geometries: list[PlasmaGeometry], rz_samples: list[dict[str, object]]
 ) -> go.Figure:
     """Plot interior and boundary R-Z samples for one or more geometries."""
-    titles = [f"Geometry {i + 1}" for i in range(len(geometries))]
+    n = len(geometries)
+    n_cols = min(n, 4)
+    n_rows = math.ceil(n / n_cols)
+    titles = [f"Geometry {i + 1}" for i in range(n)]
     r_min = min(g.R0 - g.a * 1.2 for g in geometries)
     r_max = max(g.R0 + g.a * 1.2 for g in geometries)
     z_max = max(g.kappa * g.a * 1.2 for g in geometries)
@@ -95,29 +99,31 @@ def plot_rz_samples(
     r_lims, z_lims = [r_mid - extent / 2, r_mid + extent / 2], [-extent / 2, extent / 2]
 
     fig = make_subplots(
-        rows=1,
-        cols=len(geometries),
+        rows=n_rows,
+        cols=n_cols,
         subplot_titles=titles,
-        horizontal_spacing=0.05,
         shared_yaxes=True,
     )
-    for i in range(len(geometries)):
-        col = i + 1
-        fig.update_xaxes(title_text="R (m)", range=r_lims, row=1, col=col)
+    for i in range(n):
+        row = (i // n_cols) + 1
+        col = (i % n_cols) + 1
+        fig.update_xaxes(title_text="R (m)", range=r_lims, row=row, col=col)
         fig.update_yaxes(
             range=z_lims,
-            scaleanchor=f"x{col if col > 1 else ''}",
+            scaleanchor=f"x{col if col > 1 else ''}" if n_rows == 1 else "x",
             scaleratio=1,
-            row=1,
+            row=row,
             col=col,
         )
         if i == 0:
-            fig.update_yaxes(title_text="Z (m)", row=1, col=col)
+            fig.update_yaxes(title_text="Z (m)", row=row, col=col)
 
     fig.update_layout(margin={"t": 40, "b": 40, "l": 40, "r": 10}, showlegend=False)
-    fig.update_layout(height=600 if len(geometries) > 1 else 800)
+    fig.update_layout(height=600 * n_rows)
 
-    for i, sample in enumerate(rz_samples, start=1):
+    for i, sample in enumerate(rz_samples):
+        row = (i // n_cols) + 1
+        col = (i % n_cols) + 1
         fig.add_trace(
             go.Scatter(
                 x=sample["iR"],
@@ -126,8 +132,8 @@ def plot_rz_samples(
                 marker={"size": 2, "color": "purple"},
                 name="Interior",
             ),
-            1,
-            i,
+            row,
+            col,
         )
         fig.add_trace(
             go.Scatter(
@@ -137,8 +143,8 @@ def plot_rz_samples(
                 marker={"size": 4, "color": "red"},
                 name="Boundary",
             ),
-            1,
-            i,
+            row,
+            col,
         )
 
     return fig
@@ -358,6 +364,9 @@ def plot_flux_heatmap(
     if backend == "plotly":
         from plotly.subplots import make_subplots
 
+        n_cols = min(len(configs), 4)
+        n_rows = math.ceil(len(configs) / n_cols)
+
         def setup_physics_subplots(
             geoms: list[PlasmaGeometry],
         ) -> tuple[go.Figure, list[float], list[float]]:
@@ -366,7 +375,7 @@ def plot_flux_heatmap(
             z_max = max(g.kappa * g.a * 1.2 for g in geoms)
             r_mid, extent = (r_min + r_max) / 2, max(r_max - r_min, 2 * z_max)
             r_lims, z_lims = [r_mid - extent / 2, r_mid + extent / 2], [-extent / 2, extent / 2]
-            fig = make_subplots(rows=1, cols=len(geoms), shared_yaxes=True)
+            fig = make_subplots(rows=n_rows, cols=n_cols, shared_xaxes=True, shared_yaxes=True)
             return fig, r_lims, z_lims
 
         fig, r_lims, z_lims = setup_physics_subplots([c.Geometry for c in configs])
@@ -377,7 +386,7 @@ def plot_flux_heatmap(
         )
 
         all_psi = []
-        for cfg in configs:
+        for i, cfg in enumerate(configs):
             mask = is_point_in_plasma(coords_flat, cfg.Boundary)
             psi = jnp.full(mask.shape, jnp.nan)
             if mask.any():
@@ -387,7 +396,8 @@ def plot_flux_heatmap(
                 psi = psi.at[mask].set(val.flatten())
                 all_psi.append(val.flatten())
 
-            idx = configs.index(cfg) + 1
+            row = (i // n_cols) + 1
+            col = (i % n_cols) + 1
             fig.add_trace(
                 go.Heatmap(
                     x=R,
@@ -396,10 +406,10 @@ def plot_flux_heatmap(
                     colorscale="Viridis",
                     zmin=0,
                     zmax=90,
-                    showscale=(idx == len(configs)),
+                    showscale=(i == len(configs) - 1),
                 ),
-                1,
-                idx,
+                row,
+                col,
             )
             fig.add_trace(
                 go.Scatter(
@@ -409,8 +419,8 @@ def plot_flux_heatmap(
                     line={"color": "white", "width": 2},
                     showlegend=False,
                 ),
-                1,
-                idx,
+                row,
+                col,
             )
 
         fig.update_layout(template="plotly_dark", margin={"l": 20, "r": 20, "t": 20, "b": 20})
@@ -484,7 +494,10 @@ def plot_gs_residual_heatmap(
     r_lims = [r_mid - extent / 2, r_mid + extent / 2]
     z_lims = [-extent / 2, extent / 2]
 
-    fig = make_subplots(rows=1, cols=len(configs), shared_yaxes=True)
+    n_cols = min(len(configs), 4)
+    n_rows = math.ceil(len(configs) / n_cols)
+
+    fig = make_subplots(rows=n_rows, cols=n_cols, shared_xaxes=True, shared_yaxes=True)
 
     R = jnp.linspace(*r_lims, resolution)
     Z = jnp.linspace(*z_lims, resolution)
@@ -504,7 +517,8 @@ def plot_gs_residual_heatmap(
             res_vals = compute_gs_residual_on_points(manager, cfg, R_masked, Z_masked)
             residual = residual.at[mask].set(res_vals.flatten())
 
-        col = idx + 1
+        row = (idx // n_cols) + 1
+        col = (idx % n_cols) + 1
         residual_grid = np.array(residual).reshape(resolution, resolution)
 
         fig.add_trace(
@@ -516,10 +530,10 @@ def plot_gs_residual_heatmap(
                 zmid=0,
                 zmin=-0.5,
                 zmax=0.5,
-                showscale=(col == len(configs)),
-                colorbar={"title": "Residual"} if col == len(configs) else None,
+                showscale=(idx == len(configs) - 1),
+                colorbar={"title": "Residual"} if idx == len(configs) - 1 else None,
             ),
-            1,
+            row,
             col,
         )
         fig.add_trace(
@@ -530,7 +544,7 @@ def plot_gs_residual_heatmap(
                 line={"color": "white", "width": 2},
                 showlegend=False,
             ),
-            1,
+            row,
             col,
         )
 
