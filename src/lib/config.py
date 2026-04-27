@@ -18,6 +18,7 @@ class Filepaths:
     ROOT = Path.cwd()
     DATA = Path(ROOT) / "data"
     NETWORKS = DATA / "networks"
+    NETWORK_ARCHIVE = NETWORKS / "archive"
 
     if not NETWORKS.exists():
         print(f"Creating output directory at {NETWORKS}")

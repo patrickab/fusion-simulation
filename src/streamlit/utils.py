@@ -2,8 +2,7 @@ import numpy as np
 import pyvista as pv
 
 from src.engine.network import NetworkManager, Sampler
-from src.lib.geometry_config import PlasmaGeometry, ToroidalCoilConfig
-from src.lib.geometry_config import PlasmaState
+from src.lib.geometry_config import PlasmaGeometry, PlasmaState, ToroidalCoilConfig
 import streamlit as st
 
 default_coil_config = ToroidalCoilConfig(
@@ -95,7 +94,7 @@ def reseed_network_visualisation() -> None:
     sampler = Sampler(manager.config, seed=int(st.session_state.seed))
 
     seeded_geometry_configs = sampler._get_sobol_sample(
-        n_samples=4,
+        n_samples=st.session_state.get("sample_size", 4),
         lower_bounds=sampler._domain_lower_bounds,
         upper_bounds=sampler._domain_upper_bounds,
         sobol_sampler="domain",
