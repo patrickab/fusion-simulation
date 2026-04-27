@@ -1,24 +1,20 @@
 from datetime import datetime
 import json
-import math
-from pathlib import Path
-
-import jax.numpy as jnp
-import plotly.graph_objects as go
 
 from src.engine.network import NetworkManager
-from src.engine.plasma import calculate_poloidal_boundary
 from src.lib.config import Filepaths
-from src.lib.geometry_config import (
-    PlasmaConfig,
-    PlasmaGeometry,
-    PlasmaState,
-    RotationalAngles,
-)
+from src.lib.geometry_config import PlasmaConfig
 from src.lib.network_config import HyperParams
 from src.lib.visualization import (
     plot_flux_heatmap,
     plot_gs_residual_heatmap,
+)
+from src.streamlit.network_utils import (
+    apply_grid_layout,
+    filter_networks_by_commit,
+    get_available_commits,
+    get_available_networks,
+    to_plasma_config,
 )
 from src.streamlit.utils import reseed_network_visualisation
 import streamlit as st
@@ -26,41 +22,6 @@ import streamlit as st
 st.set_page_config(layout="wide", page_title="Benchmark Visualizer")
 
 PLOT_GRID_RESOLUTION = 80
-
-
-def extract_commit(filename: str) -> str | None:
-    parts = Path(filename).stem.split("_")
-    return parts[-1] if len(parts) >= 2 else None
-
-
-def get_available_networks() -> list[str]:
-    paths = list(Filepaths.NETWORKS.glob("*.flax"))
-    if Filepaths.NETWORK_ARCHIVE.exists():
-        paths.extend(Filepaths.NETWORK_ARCHIVE.glob("*.flax"))
-    return sorted(str(p.relative_to(Filepaths.NETWORKS)) for p in paths if p.is_file())
-
-
-def get_available_commits(networks: list[str]) -> list[str]:
-    return sorted({c for n in networks if (c := extract_commit(n))})
-
-
-def filter_networks_by_commit(networks: list[str], commit: str | None) -> list[str]:
-    if not commit or commit == "All":
-        return networks
-    return [n for n in networks if extract_commit(n) == commit]
-
-
-def to_plasma_config(geom: PlasmaGeometry, state: PlasmaState) -> PlasmaConfig:
-    boundary = calculate_poloidal_boundary(
-        jnp.linspace(0, 2 * jnp.pi, RotationalAngles.n_theta), geom
-    )
-    return PlasmaConfig(Geometry=geom, Boundary=boundary, State=state)
-
-
-def apply_grid_layout(fig: go.Figure, n_items: int) -> None:
-    n_cols = min(n_items, 4)
-    n_rows = math.ceil(n_items / n_cols)
-    fig.update_layout(height=400 * n_rows, margin={"l": 10, "r": 10, "t": 30, "b": 10})
 
 
 def render_benchmark_row(network_name: str, configs: list[PlasmaConfig], mode: str) -> None:
