@@ -1,24 +1,13 @@
 import json
-import math
 from pathlib import Path
 
 import jax.numpy as jnp
-import plotly.graph_objects as go
 from stpyvista import stpyvista
 
 from src.engine.model_evaluation import compute_gs_residual_on_points
 from src.engine.network import NetworkManager
-from src.engine.plasma import (
-    calculate_fusion_plasma,
-    calculate_poloidal_boundary,
-)
+from src.engine.plasma import calculate_fusion_plasma
 from src.lib.config import Filepaths
-from src.lib.geometry_config import (
-    PlasmaConfig,
-    PlasmaGeometry,
-    PlasmaState,
-    RotationalAngles,
-)
 from src.lib.network_config import HyperParams
 from src.lib.visualization import (
     initialize_plotter,
@@ -28,6 +17,14 @@ from src.lib.visualization import (
     render_fusion_plasma,
     render_magnetic_field_lines,
 )
+from src.streamlit.network_utils import (
+    apply_grid_layout,
+    filter_networks_by_commit,
+    get_available_commits,
+    get_available_networks,
+    move_network_files,
+    to_plasma_config,
+)
 from src.streamlit.utils import reseed_network_visualisation
 import streamlit as st
 
@@ -36,41 +33,8 @@ st.set_page_config(layout="wide", page_title="Fusion Simulation Lab")
 PLOT_GRID_RESOLUTION = 100
 
 
-def extract_commit(filename: str) -> str | None:
-    stem = Path(filename).stem
-    parts = stem.split("_")
-    if len(parts) >= 2:
-        return parts[-1]
-    return None
-
-
-def get_available_networks() -> list[str]:
-    view_mode = st.session_state.get("network_view_mode", "New Benchmarks")
-    networks = []
-
-    if view_mode in ["New Benchmarks", "All"]:
-        # Only get files in root of NETWORKS, exclude subdirectories like archive
-        networks.extend(p for p in Filepaths.NETWORKS.glob("*.flax") if p.is_file())
-
-    if view_mode in ["Archive", "All"] and Filepaths.NETWORK_ARCHIVE.exists():
-        networks.extend(p for p in Filepaths.NETWORK_ARCHIVE.glob("*.flax") if p.is_file())
-
-    return sorted(str(p.relative_to(Filepaths.NETWORKS)) for p in networks)
-
-
-def get_available_commits(networks: list[str]) -> list[str]:
-    commits = set()
-    for network in networks:
-        commit = extract_commit(network)
-        if commit:
-            commits.add(commit)
-    return sorted(commits)
-
-
-def filter_networks_by_commit(networks: list[str], commit: str | None) -> list[str]:
-    if not commit:
-        return networks
-    return [n for n in networks if extract_commit(n) == commit]
+def _get_networks() -> list[str]:
+    return get_available_networks(st.session_state.get("network_view_mode", "New Benchmarks"))
 
 
 def sync_selected_network() -> None:
@@ -94,14 +58,6 @@ def sync_selected_network() -> None:
     reseed_network_visualisation()
 
 
-def to_plasma_config(geom: PlasmaGeometry, state: PlasmaState) -> PlasmaConfig:
-    boundary = calculate_poloidal_boundary(
-        jnp.linspace(0, 2 * jnp.pi, RotationalAngles.n_theta),
-        geom,
-    )
-    return PlasmaConfig(Geometry=geom, Boundary=boundary, State=state)
-
-
 # --- UI Components ---
 def render_geometry_sampling_tab():  # noqa
     """Render the geometry sampling visualization tab."""
@@ -121,12 +77,6 @@ def render_geometry_sampling_tab():  # noqa
     geometries = [sample["geom"] for sample in selected_samples]
     fig = plot_rz_samples(geometries, selected_samples)
     st.plotly_chart(fig, use_container_width=True)
-
-
-def apply_grid_layout(fig: go.Figure, n_items: int) -> None:
-    n_cols = min(n_items, 4)
-    n_rows = math.ceil(n_items / n_cols)
-    fig.update_layout(height=500 * n_rows, margin={"l": 20, "r": 20, "t": 40, "b": 20})
 
 
 def render_flux_predictions_tab() -> None:
@@ -160,12 +110,9 @@ def render_flux_predictions_tab() -> None:
     if mode in ["Flux Prediction", "Both"]:
         st.subheader("Magnetic Flux ψ(R, Z)")
         fig_flux = plot_flux_heatmap(
-            st.session_state.manager,
-            configs,
-            backend="plotly",
-            resolution=PLOT_GRID_RESOLUTION,
+            st.session_state.manager, configs, backend="plotly", resolution=PLOT_GRID_RESOLUTION
         )
-        apply_grid_layout(fig_flux, len(configs))
+        apply_grid_layout(fig_flux, len(configs), height_per_row=500)
         st.plotly_chart(fig_flux, use_container_width=True, key="heatmap_chart_flux")
 
     if mode in ["GS Residual", "Both"]:
@@ -173,7 +120,7 @@ def render_flux_predictions_tab() -> None:
         fig_res = plot_gs_residual_heatmap(
             st.session_state.manager, configs, resolution=PLOT_GRID_RESOLUTION
         )
-        apply_grid_layout(fig_res, len(configs))
+        apply_grid_layout(fig_res, len(configs), height_per_row=500)
         st.plotly_chart(fig_res, use_container_width=True, key="heatmap_chart_res")
 
 
@@ -208,125 +155,116 @@ def render_3d_topology_tab():  # noqa
         stpyvista(plotter)
 
 
+def handle_archive() -> None:
+    Filepaths.NETWORK_ARCHIVE.mkdir(parents=True, exist_ok=True)
+    new_path_stem = Filepaths.NETWORK_ARCHIVE / Path(st.session_state.selected_pinn).stem
+    move_network_files(st.session_state.selected_pinn, new_path_stem)
+    _update_networks_after_action()
+
+
+def handle_rename(new_name: str) -> None:
+    if not new_name:
+        return
+
+    old_path = Filepaths.NETWORKS / st.session_state.selected_pinn
+    new_path_stem = old_path.parent / new_name
+
+    move_network_files(st.session_state.selected_pinn, new_path_stem)
+
+    st.session_state.available_networks = _get_networks()
+    st.session_state._next_pinn = str(
+        new_path_stem.with_suffix(".flax").relative_to(Filepaths.NETWORKS)
+    )
+    st.session_state.rename_mode = False
+    st.rerun()
+
+
+def handle_delete() -> None:
+    target_path = Filepaths.NETWORKS / st.session_state.selected_pinn
+    if target_path.exists():
+        target_path.unlink()
+    if target_path.with_suffix(".json").exists():
+        target_path.with_suffix(".json").unlink()
+
+    st.session_state.rename_mode = False
+    _update_networks_after_action()
+
+
+def _update_networks_after_action() -> None:
+    st.session_state.available_networks = _get_networks()
+    if st.session_state.available_networks:
+        commit_filter = st.session_state.get("filter_commit", "All")
+        filtered_networks = filter_networks_by_commit(
+            st.session_state.available_networks,
+            commit_filter if commit_filter != "All" else None,
+        )
+        st.session_state._next_pinn = (
+            filtered_networks[-1] if filtered_networks else st.session_state.available_networks[-1]
+        )
+    else:
+        st.session_state._next_pinn = None
+    st.rerun()
+
+
+def render_network_actions() -> None:
+    if not st.session_state.get("selected_pinn"):
+        return
+
+    col1, col2, col3 = st.columns(3)
+
+    if col1.button("Archive", use_container_width=True):
+        handle_archive()
+
+    if col2.button("Rename", use_container_width=True):
+        st.session_state.rename_mode = not st.session_state.get("rename_mode", False)
+
+    if st.session_state.get("rename_mode", False):
+        new_name = st.text_input("New Name", value=Path(st.session_state.selected_pinn).stem)
+        if st.button("Save Name"):
+            handle_rename(new_name)
+
+    if col3.button("Delete", use_container_width=True, type="primary"):
+        handle_delete()
+
+
 def render_sidebar() -> None:
     with st.sidebar:
-        top_container = st.container()
+        # Apply pending network selection before widget instantiation
+        if st.session_state.get("_next_pinn"):
+            st.session_state.selected_pinn = st.session_state._next_pinn
+            del st.session_state._next_pinn
 
-        with top_container:
-            # Apply pending network selection before widget instantiation
-            if st.session_state.get("_next_pinn"):
-                st.session_state.selected_pinn = st.session_state._next_pinn
-                del st.session_state._next_pinn
+        st.radio(
+            "View",
+            options=["New Benchmarks", "Archive", "All"],
+            horizontal=True,
+            key="network_view_mode",
+        )
 
-            st.radio(
-                "View",
-                options=["New Benchmarks", "Archive", "All"],
-                horizontal=True,
-                key="network_view_mode",
-            )
-            st.session_state.available_networks = get_available_networks()
+        st.session_state.available_networks = _get_networks()
+        commit_filter = st.session_state.get("filter_commit", "All")
+        commit_filter = commit_filter if commit_filter != "All" else None
 
-            commit_filter = st.session_state.get("filter_commit", "All")
-            commit_filter = commit_filter if commit_filter != "All" else None
-            filtered_networks = filter_networks_by_commit(
-                st.session_state.available_networks, commit_filter
-            )
-            was_selected = st.session_state.get("selected_pinn")
-            if was_selected not in filtered_networks and filtered_networks:
-                st.session_state.selected_pinn = filtered_networks[0]
-                sync_selected_network()
-            st.selectbox(
-                "Select Network",
-                options=filtered_networks,
-                key="selected_pinn",
-                on_change=sync_selected_network,
-            )
-            st.selectbox(
-                "Filter by Commit",
-                options=["All", *get_available_commits(st.session_state.available_networks)],
-                key="filter_commit",
-            )
+        filtered_networks = filter_networks_by_commit(
+            st.session_state.available_networks, commit_filter
+        )
 
-        if st.session_state.get("selected_pinn"):
-            col1, col2, col3 = st.columns(3)
+        was_selected = st.session_state.get("selected_pinn")
+        if was_selected not in filtered_networks and filtered_networks:
+            st.session_state.selected_pinn = filtered_networks[0]
+            sync_selected_network()
 
-            # Archive Network
-            if col1.button("Archive", use_container_width=True):
-                old_path = Filepaths.NETWORKS / st.session_state.selected_pinn
-                Filepaths.NETWORK_ARCHIVE.mkdir(parents=True, exist_ok=True)
-                new_path = Filepaths.NETWORK_ARCHIVE / Path(st.session_state.selected_pinn).name
+        st.selectbox(
+            "Select Network",
+            options=filtered_networks,
+            key="selected_pinn",
+            on_change=sync_selected_network,
+        )
 
-                if old_path.exists():
-                    old_path.rename(new_path)
-                if old_path.with_suffix(".json").exists():
-                    old_path.with_suffix(".json").rename(new_path.with_suffix(".json"))
+        commits = ["All", *get_available_commits(st.session_state.available_networks)]
+        st.selectbox("Filter by Commit", options=commits, key="filter_commit")
 
-                st.session_state.available_networks = get_available_networks()
-                if st.session_state.available_networks:
-                    commit_filter = st.session_state.get("filter_commit", "All")
-                    filtered_networks = filter_networks_by_commit(
-                        st.session_state.available_networks,
-                        commit_filter if commit_filter != "All" else None,
-                    )
-                    st.session_state._next_pinn = (
-                        filtered_networks[-1]
-                        if filtered_networks
-                        else st.session_state.available_networks[-1]
-                    )
-                else:
-                    st.session_state._next_pinn = None
-                st.rerun()
-
-            # Rename Network
-            rename_clicked = col2.button("Rename", use_container_width=True)
-            if rename_clicked:
-                st.session_state.rename_mode = not st.session_state.get("rename_mode", False)
-
-            if st.session_state.get("rename_mode", False):
-                new_name = st.text_input(
-                    "New Name", value=Path(st.session_state.selected_pinn).stem
-                )
-                if st.button("Save Name") and new_name:
-                    flax_name = new_name if new_name.endswith(".flax") else f"{new_name}.flax"
-                    old_path = Filepaths.NETWORKS / st.session_state.selected_pinn
-                    # If archived, keep it in the archive when renaming
-                    parent_dir = old_path.parent
-                    new_path = parent_dir / flax_name
-
-                    if old_path.exists():
-                        old_path.rename(new_path)
-                    if old_path.with_suffix(".json").exists():
-                        old_path.with_suffix(".json").rename(new_path.with_suffix(".json"))
-
-                    st.session_state.available_networks = get_available_networks()
-                    st.session_state._next_pinn = str(new_path.relative_to(Filepaths.NETWORKS))
-                    st.session_state.rename_mode = False
-                    st.rerun()
-
-            # Delete Network
-            if col3.button("Delete", use_container_width=True, type="primary"):
-                target_path = Filepaths.NETWORKS / st.session_state.selected_pinn
-                if target_path.exists():
-                    target_path.unlink()
-                if target_path.with_suffix(".json").exists():
-                    target_path.with_suffix(".json").unlink()
-
-                st.session_state.available_networks = get_available_networks()
-                if st.session_state.available_networks:
-                    commit_filter = st.session_state.get("filter_commit", "All")
-                    filtered_networks = filter_networks_by_commit(
-                        st.session_state.available_networks,
-                        commit_filter if commit_filter != "All" else None,
-                    )
-                    st.session_state._next_pinn = (
-                        filtered_networks[-1]
-                        if filtered_networks
-                        else st.session_state.available_networks[-1]
-                    )
-                else:
-                    st.session_state._next_pinn = None
-                st.session_state.rename_mode = False
-                st.rerun()
+        render_network_actions()
 
         st.divider()
 
@@ -372,18 +310,26 @@ def render_metrics() -> None:
     cols[4].metric("Max Residual", f"{max_res:.2f}")
 
 
-def main() -> None:
-    if "manager" not in st.session_state or "seeded_flux_input" not in st.session_state:
-        st.session_state.available_networks = get_available_networks()
-        if st.session_state.available_networks:
-            st.session_state.selected_pinn = st.session_state.available_networks[0]
-        st.session_state.filter_commit = "All"
+def init_session_state() -> None:
+    if "selected_pinn" not in st.session_state:
         st.session_state.seed = 0
         st.session_state.sample_size = 4
+        st.session_state.filter_commit = "All"
+        st.session_state.network_view_mode = "New Benchmarks"
 
-        if st.session_state.available_networks:
+        networks = _get_networks()
+        st.session_state.available_networks = networks
+        if networks:
+            st.session_state.selected_pinn = networks[0]
             sync_selected_network()
+        else:
+            # Fallback if no networks exist
+            st.session_state.manager = NetworkManager(HyperParams())
             reseed_network_visualisation()
+
+
+def main() -> None:
+    init_session_state()
 
     render_sidebar()
 
