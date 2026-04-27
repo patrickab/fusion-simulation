@@ -5,6 +5,7 @@ PAGES = {
     "Visualization": [
         st.Page("pages/reactor-visualisation.py", title="Reactor Visualizer"),
         st.Page("pages/network-visualisation.py", title="Network Visualizer"),
+        st.Page("pages/benchmark-visualisation.py", title="Benchmark Visualizer"),
     ],
 }
 

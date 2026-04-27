@@ -152,24 +152,10 @@ def render_flux_predictions_tab() -> None:
             on_change=reseed_network_visualisation,
         )
 
-    commit = st.session_state.get("filter_commit", "All")
-    if commit != "All":
-        st.button(
-            "Plot Benchmark",
-            key="plot_benchmark",
-            on_click=lambda: st.session_state.update(benchmark_active=True),
-        )
-    else:
-        st.session_state.benchmark_active = False
-
     mode = st.session_state.get("prediction_mode", "Flux Prediction")
 
     data = st.session_state.seeded_geometry_data
     configs = [to_plasma_config(d["geom"], d["state"]) for d in data]
-
-    if st.session_state.get("benchmark_active"):
-        render_benchmark(mode, configs)
-        return
 
     if mode in ["Flux Prediction", "Both"]:
         st.subheader("Magnetic Flux ψ(R, Z)")
