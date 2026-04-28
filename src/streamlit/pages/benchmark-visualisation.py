@@ -36,35 +36,32 @@ def render_benchmark_row(network_name: str, configs: list[PlasmaConfig], mode: s
     with open(config_path) as f:
         config_dict = json.load(f)
 
-    mtime = datetime.fromtimestamp(pinn_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    display_name = network_name.replace(".flax", "")
 
-    st.subheader(f"{mtime} | {network_name}")
+    with st.expander(display_name, expanded=True):
+        col_meta, col_plots = st.columns([1, 4])
 
-    col_meta, col_plots = st.columns([1, 4])
+        with col_meta:
+            st.json(config_dict)
 
-    with col_meta:
-        st.json(config_dict)
+        with col_plots:
+            manager = NetworkManager(network_config)
+            params = manager.from_disk(pinn_path=pinn_path)
+            manager.state = manager.state.replace(params=params)
 
-    with col_plots:
-        manager = NetworkManager(network_config)
-        params = manager.from_disk(pinn_path=pinn_path)
-        manager.state = manager.state.replace(params=params)
+            if mode in ["Flux Prediction", "Both"]:
+                st.write("**Magnetic Flux ψ(R, Z)**")
+                fig_flux = plot_flux_heatmap(
+                    manager, configs, backend="plotly", resolution=PLOT_GRID_RESOLUTION
+                )
+                apply_grid_layout(fig_flux, len(configs))
+                st.plotly_chart(fig_flux, width="stretch", key=f"flux_{network_name}")
 
-        if mode in ["Flux Prediction", "Both"]:
-            st.write("**Magnetic Flux ψ(R, Z)**")
-            fig_flux = plot_flux_heatmap(
-                manager, configs, backend="plotly", resolution=PLOT_GRID_RESOLUTION
-            )
-            apply_grid_layout(fig_flux, len(configs))
-            st.plotly_chart(fig_flux, use_container_width=True, key=f"flux_{network_name}")
-
-        if mode in ["GS Residual", "Both"]:
-            st.write("**Grad-Shafranov Residual**")
-            fig_res = plot_gs_residual_heatmap(manager, configs, resolution=PLOT_GRID_RESOLUTION)
-            apply_grid_layout(fig_res, len(configs))
-            st.plotly_chart(fig_res, use_container_width=True, key=f"res_{network_name}")
-
-    st.divider()
+            if mode in ["GS Residual", "Both"]:
+                st.write("**Grad-Shafranov Residual**")
+                fig_res = plot_gs_residual_heatmap(manager, configs, resolution=PLOT_GRID_RESOLUTION)
+                apply_grid_layout(fig_res, len(configs))
+                st.plotly_chart(fig_res, width="stretch", key=f"res_{network_name}")
 
 
 def init_session_state(networks: list[str]) -> None:
@@ -103,7 +100,7 @@ def main() -> None:
 
         st.divider()
         st.slider("Reseed Samples", 0, 1000, key="seed", on_change=reseed_network_visualisation)
-        run_bench = st.button("Run Benchmark", use_container_width=True, type="primary")
+        run_bench = st.button("Run Benchmark", width="stretch", type="primary")
 
     if "seeded_geometry_data" not in st.session_state:
         reseed_network_visualisation()
