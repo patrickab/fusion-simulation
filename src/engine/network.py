@@ -2,6 +2,7 @@ import argparse
 from datetime import datetime
 import os
 from pathlib import Path
+import time
 from typing import Callable, Literal
 
 from flax import linen as nn
@@ -287,12 +288,15 @@ class NetworkManager:
 
         if self.training_log:
             with open(artifact_log_path, "w") as f:
-                f.write("epoch,moving_avg_loss,val_loss,residual,boundary\n")
+                f.write(
+                    "epoch,lr,moving_avg_loss,val_loss,residual,boundary,grad_norm,epoch_time\n"
+                )
                 for entry in self.training_log:
                     vl = f"{entry['val_loss']:.6f}" if entry["val_loss"] is not None else ""
                     f.write(
-                        f"{entry['epoch']},{entry['moving_avg_loss']:.6f},"
-                        f"{vl},{entry['residual']:.6f},{entry['boundary']:.6f}\n"
+                        f"{entry['epoch']},{entry['lr']:.2e},{entry['moving_avg_loss']:.6f},"
+                        f"{vl},{entry['residual']:.6f},{entry['boundary']:.6f},"
+                        f"{entry['grad_norm']:.6f},{entry['epoch_time']:.4f}\n"
                     )
 
     def from_disk(self, pinn_path) -> any:  # noqa
@@ -325,6 +329,7 @@ class NetworkManager:
             decay_steps=total_steps,
             end_value=self.config.learning_rate_min,
         )
+        self._lr_schedule = schedule
         tx = optax.adamw(learning_rate=schedule, weight_decay=self.config.weight_decay)
         return train_state.TrainState.create(apply_fn=self.model.apply, params=params, tx=tx)
 
@@ -405,7 +410,9 @@ class NetworkManager:
         state: train_state.TrainState,
         inputs: FluxInput,
         weight_boundary_condition: float,
-    ) -> tuple[train_state.TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    ) -> tuple[
+        train_state.TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray
+    ]:
         """Perform a single training step using physics-informed gradients."""
 
         # Rematerializes activations during backprop. Trades compute for memory,
@@ -422,28 +429,33 @@ class NetworkManager:
         (loss, (l_res, l_dir, l_per_cfg)), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(
             state.params
         )
-        return state.apply_gradients(grads=grads), loss, l_res, l_dir, l_per_cfg
+        grad_norm = optax.tree_utils.tree_norm(grads)
+        return state.apply_gradients(grads=grads), loss, l_res, l_dir, l_per_cfg, grad_norm
 
-    def train_epoch(self, epoch: int) -> tuple[float, float, float]:
+    def train_epoch(self, epoch: int) -> tuple[float, float, float, float]:
         """Run one training epoch.
 
         Returns:
-            Tuple of (total_loss, residual_loss, boundary_loss).
+            Tuple of (total_loss, residual_loss, boundary_loss, grad_norm).
         """
-        loss, l_res, l_dir = 0.0, 0.0, 0.0
+        loss, l_res, l_dir, b_grad_norm = 0.0, 0.0, 0.0, 0.0
         self.sampler.precompute_coordinate_samples()
 
         all_losses = []
+        grad_norms = []
 
         for i in range(0, len(self.train_set), self.config.batch_size):
             train_batch = self.train_set[i : i + self.config.batch_size]
             inputs = self.sampler.sample_flux_input(plasma_configs=train_batch)
-            self.state, loss, l_res, l_dir, per_config_loss = self.train_step(
+            self.state, loss, l_res, l_dir, per_config_loss, b_grad_norm = self.train_step(
                 state=self.state,
                 inputs=inputs,
                 weight_boundary_condition=self.config.weight_boundary_condition,
             )
             all_losses.append(per_config_loss)
+            grad_norms.append(b_grad_norm)
+
+        avg_grad_norm = float(jnp.mean(jnp.array(grad_norms)))
 
         if epoch % RESAMPLING_FREQUENCY == 0 and epoch > 0:
             self.train_set = self.sampler.resample_train_set(
@@ -452,16 +464,19 @@ class NetworkManager:
                 per_config_losses=all_losses,
             )
 
-        return float(loss), float(l_res), float(l_dir)
+        return float(loss), float(l_res), float(l_dir), avg_grad_norm
 
     def _init_live_display(self) -> Live:
         """Set up Rich table, progress bar, and accumulators for live training display."""
         self._table = Table(title="Training Metrics", show_header=True, header_style="bold cyan")
         self._table.add_column("Epoch", justify="right", style="cyan")
-        self._table.add_column("Loss", justify="right", style="magenta")
+        self._table.add_column("LR", justify="right", style="yellow")
+        self._table.add_column("||∇L||", justify="right", style="magenta")
+        self._table.add_column(
+            "Loss = Residual + w*Boundary", justify="right", style="magenta", no_wrap=True
+        )
         self._table.add_column("Val Loss", justify="right", style="green")
-        self._table.add_column("Residual", justify="right")
-        self._table.add_column("Boundary", justify="right")
+        self._table.add_column("Time/Ep", justify="right")
 
         self._progress = Progress(
             TextColumn("[bold cyan]{task.description}"),
@@ -476,6 +491,8 @@ class NetworkManager:
         self._accumulated_loss = 0.0
         self._accumulated_residual = 0.0
         self._accumulated_boundary = 0.0
+        self._accumulated_grad_norm = 0.0
+        self._accumulated_time = 0.0
 
         return Live(
             Panel(Group(self._table, self._progress), border_style="cyan"),
@@ -485,48 +502,73 @@ class NetworkManager:
         )
 
     def _log_metric(
-        self, epoch: int, loss: float, residual: float, boundary: float, val_loss: float | None
+        self,
+        epoch: int,
+        loss: float,
+        residual: float,
+        boundary: float,
+        val_loss: float | None,
+        lr: float,
+        grad_norm: float,
+        epoch_time: float,
     ) -> None:
         self._accumulated_loss += loss
         self._accumulated_residual += residual
         self._accumulated_boundary += boundary
+        self._accumulated_grad_norm += grad_norm
+        self._accumulated_time += epoch_time
 
         val_loss_str = f"{val_loss:.3f}" if val_loss is not None else "-"
+        lr_str = f"{lr:.2e}"
 
         if (epoch + 1) % LOG_FREQUENCY == 0:
             moving_avg_loss = self._accumulated_loss / LOG_FREQUENCY
             moving_avg_residual = self._accumulated_residual / LOG_FREQUENCY
             moving_avg_boundary = self._accumulated_boundary / LOG_FREQUENCY
+            moving_avg_grad_norm = self._accumulated_grad_norm / LOG_FREQUENCY
+            moving_avg_time = self._accumulated_time / LOG_FREQUENCY
 
             self.training_log.append(
                 {
                     "epoch": epoch + 1,
+                    "lr": lr,
                     "moving_avg_loss": moving_avg_loss,
                     "val_loss": val_loss,
                     "residual": moving_avg_residual,
                     "boundary": moving_avg_boundary,
+                    "grad_norm": moving_avg_grad_norm,
+                    "epoch_time": moving_avg_time,
                 }
             )
 
+            w = self.config.weight_boundary_condition
+            loss_str = f"{moving_avg_loss:>9.3f} = {moving_avg_residual:>6.3f} + {w:g}*{moving_avg_boundary:>8.3f}"
             self._table.add_row(
                 f"{epoch + 1}/{self.epochs}",
-                f"{moving_avg_loss:.3f}",
+                lr_str,
+                f"{moving_avg_grad_norm:.3f}",
+                loss_str,
                 val_loss_str,
-                f"{moving_avg_residual:.3f}",
-                f"{moving_avg_boundary:.3f}",
+                f"{moving_avg_time:.2f}s",
             )
 
             self._accumulated_loss = 0.0
             self._accumulated_residual = 0.0
             self._accumulated_boundary = 0.0
+            self._accumulated_grad_norm = 0.0
+            self._accumulated_time = 0.0
         else:
+            count = (epoch + 1) % LOG_FREQUENCY
             self.training_log.append(
                 {
                     "epoch": epoch + 1,
-                    "moving_avg_loss": self._accumulated_loss / ((epoch + 1) % LOG_FREQUENCY),
+                    "lr": lr,
+                    "moving_avg_loss": self._accumulated_loss / count,
                     "val_loss": val_loss,
-                    "residual": self._accumulated_residual / ((epoch + 1) % LOG_FREQUENCY),
-                    "boundary": self._accumulated_boundary / ((epoch + 1) % LOG_FREQUENCY),
+                    "residual": self._accumulated_residual / count,
+                    "boundary": self._accumulated_boundary / count,
+                    "grad_norm": self._accumulated_grad_norm / count,
+                    "epoch_time": self._accumulated_time / count,
                 }
             )
 
@@ -538,11 +580,18 @@ class NetworkManager:
         val_configs = self._create_validation_configs()
         with live as self._live:
             for epoch in range(self.epochs):
-                loss, residual, boundary = self.train_epoch(epoch)
+                start_time = time.perf_counter()
+                loss, residual, boundary, grad_norm = self.train_epoch(epoch)
+                epoch_time = time.perf_counter() - start_time
+
                 val_loss = None
                 if (epoch + 1) % VALIDATION_FREQUENCY == 0:
                     val_loss = self._calculate_validation_loss(val_configs)
-                self._log_metric(epoch, loss, residual, boundary, val_loss)
+
+                lr = float(self._lr_schedule(self.state.step))
+                self._log_metric(
+                    epoch, loss, residual, boundary, val_loss, lr, grad_norm, epoch_time
+                )
 
         if save_to_disk:
             self.to_disk()
