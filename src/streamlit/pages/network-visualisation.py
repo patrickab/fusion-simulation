@@ -76,7 +76,7 @@ def render_geometry_sampling_tab():  # noqa
     selected_samples = [data[idx] for idx in indices]
     geometries = [sample["geom"] for sample in selected_samples]
     fig = plot_rz_samples(geometries, selected_samples)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def render_flux_predictions_tab() -> None:
@@ -113,7 +113,7 @@ def render_flux_predictions_tab() -> None:
             st.session_state.manager, configs, backend="plotly", resolution=PLOT_GRID_RESOLUTION
         )
         apply_grid_layout(fig_flux, len(configs), height_per_row=500)
-        st.plotly_chart(fig_flux, use_container_width=True, key="heatmap_chart_flux")
+        st.plotly_chart(fig_flux, width="stretch", key="heatmap_chart_flux")
 
     if mode in ["GS Residual", "Both"]:
         st.subheader("Grad-Shafranov Residual")
@@ -121,7 +121,7 @@ def render_flux_predictions_tab() -> None:
             st.session_state.manager, configs, resolution=PLOT_GRID_RESOLUTION
         )
         apply_grid_layout(fig_res, len(configs), height_per_row=500)
-        st.plotly_chart(fig_res, use_container_width=True, key="heatmap_chart_res")
+        st.plotly_chart(fig_res, width="stretch", key="heatmap_chart_res")
 
 
 def render_3d_topology_tab():  # noqa
@@ -212,10 +212,10 @@ def render_network_actions() -> None:
 
     col1, col2, col3 = st.columns(3)
 
-    if col1.button("Archive", use_container_width=True):
+    if col1.button("Archive", width="stretch"):
         handle_archive()
 
-    if col2.button("Rename", use_container_width=True):
+    if col2.button("Rename", width="stretch"):
         st.session_state.rename_mode = not st.session_state.get("rename_mode", False)
 
     if st.session_state.get("rename_mode", False):
@@ -223,7 +223,7 @@ def render_network_actions() -> None:
         if st.button("Save Name"):
             handle_rename(new_name)
 
-    if col3.button("Delete", use_container_width=True, type="primary"):
+    if col3.button("Delete", width="stretch", type="primary"):
         handle_delete()
 
 
