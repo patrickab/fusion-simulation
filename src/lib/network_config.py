@@ -19,8 +19,8 @@ class HyperParams(BaseModel):
     weight_boundary_condition: float = 10.0
     sigma_residual_adaptive_sampling: float = 0.05
     batch_size: int = 64
-    n_rz_inner_samples: int = 2048
-    n_rz_boundary_samples: int = 256
+    n_rz_inner_samples: int = 512
+    n_rz_boundary_samples: int = 128
     n_train: int = 1024
     warmup_epochs: int = 100
     decay_epochs: int = 500
