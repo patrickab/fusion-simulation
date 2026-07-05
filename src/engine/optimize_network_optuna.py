@@ -6,6 +6,7 @@ computed every val_eval_frequency epochs for pruning decisions.
 """
 
 import argparse
+from collections import deque
 import json
 import os
 
@@ -121,7 +122,10 @@ class OptunaProgressDisplay:
 
     def __init__(self, config: SearchSpaceConfig, prior_trials: int = 0) -> None:
         self.config = config
-        self._trials_data, self._best_configs = [], []
+        # ponytail: rolling window, not full history — an ever-growing table eventually
+        # taller than the terminal desyncs Rich's cursor-based redraw on scroll
+        self._trials_data: deque[dict[str, Any]] = deque(maxlen=15)
+        self._best_configs = []
         self._best_loss, self._start_time = float("inf"), datetime.now()
         self._counts = {"pruned": 0, "failed": 0, "done": 0}
         self._trials_processed, self._prior_trials = 0, prior_trials

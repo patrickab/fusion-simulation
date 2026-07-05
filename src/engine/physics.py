@@ -3,7 +3,6 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
-import optax
 
 from src.lib.geometry_config import PlasmaConfig
 
@@ -19,6 +18,7 @@ def toroidal_field_flux_function(
     psi_axis: float,
     F_axis: float,
     exponent: float = 1.0,
+    flux_scale: float = 1.0,
 ) -> jnp.ndarray:
     """Compute the toroidal field flux function F(ψ) = R B_φ.
 
@@ -36,13 +36,16 @@ def toroidal_field_flux_function(
         psi_edge: Flux at the plasma boundary.
         F_axis: Value of F at the magnetic axis (R * B_phi).
         exponent: Profile shape parameter (1.0 = linear).
+        flux_scale: Characteristic flux magnitude for this config (F_axis * a),
+            used to floor the clamp below relative to the config's own scale.
 
     Returns:
         Calculated F(ψ) values.
     """
-    # Ensure numerical stability: clamp depth to 1.0 to prevent gradient explosion
+    # Ensure numerical stability: clamp depth relative to this config's flux
+    # scale (a fixed 1.0 Weber floor over/under-clamps configs far from that scale).
     # Use abs() to handle initial random weights where psi_axis > PSI_EDGE
-    flux_depth = jnp.maximum(jnp.abs(PSI_EDGE - psi_axis), 1.0)
+    flux_depth = jnp.maximum(jnp.abs(PSI_EDGE - psi_axis), 1e-3 * jnp.abs(flux_scale))
 
     psi_norm = (psi - psi_axis) / flux_depth
     # Use softplus for C-infinity continuity (smooth gradients for Shafranov operator)
@@ -56,6 +59,7 @@ def pressure_profile(
     psi_axis: float,
     p0: float,
     alpha: float = 1.0,
+    flux_scale: float = 1.0,
 ) -> jnp.ndarray:
     """Pressure profile: p(ψ).
 
@@ -66,12 +70,15 @@ def pressure_profile(
         psi_axis: Flux at the magnetic axis.
         p0: Pressure at the magnetic axis.
         alpha: Profile shape parameter.
+        flux_scale: Characteristic flux magnitude for this config (F_axis * a),
+            used to floor the clamp below relative to the config's own scale.
 
     Returns:
         Calculated pressure p(ψ).
     """
-    # Ensure numerical stability: clamp depth to 1.0 to prevent gradient explosion
-    flux_depth = jnp.maximum(jnp.abs(PSI_EDGE - psi_axis), 1.0)
+    # Ensure numerical stability: clamp depth relative to this config's flux
+    # scale (a fixed 1.0 Weber floor over/under-clamps configs far from that scale).
+    flux_depth = jnp.maximum(jnp.abs(PSI_EDGE - psi_axis), 1e-3 * jnp.abs(flux_scale))
 
     psi_norm = (psi - psi_axis) / flux_depth
     # Use softplus for C-infinity continuity
@@ -170,15 +177,19 @@ def grad_shafranov_residual(
     """
     delta_star, psi = shafranov_operator_and_psi(psi_fn, params, R, Z, config)
 
+    flux_scale = config.State.F_axis * config.Geometry.a
+
     dp_dpsi = jax.jvp(
-        lambda p: pressure_profile(p, psi_axis, config.State.p0, config.State.pressure_alpha),
+        lambda p: pressure_profile(
+            p, psi_axis, config.State.p0, config.State.pressure_alpha, flux_scale
+        ),
         (psi,),
         (jnp.ones_like(psi),),
     )[1]
 
     F_val, dF_dpsi = jax.jvp(
         lambda p: toroidal_field_flux_function(
-            p, psi_axis, config.State.F_axis, config.State.field_exponent
+            p, psi_axis, config.State.F_axis, config.State.field_exponent, flux_scale
         ),
         (psi,),
         (jnp.ones_like(psi),),
@@ -199,9 +210,9 @@ def pinn_loss_function(
     R_interior: jnp.ndarray,
     Z_interior: jnp.ndarray,
     batch_config: PlasmaConfig,
-    weight_boundary_condition: float,
+    weight_boundary_condition: float,  # noqa: ARG001
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Computes the total PINN loss: L_total = L_residual + w * L_boundary
+    """Computes the total PINN loss: L_total = L_residual.
 
     Uses a double-vectorization strategy.
     Processes entire tensor batches of plasma configs in parallel.
@@ -210,43 +221,48 @@ def pinn_loss_function(
     Design Reasoning:
     1. Outer Vmap: Iterates over the batch of different plasma configurations.
     2. Inner Vmap: Iterates over the spatial samples (interior and boundary).
+
+    Note: weight_boundary_condition is now unused for gradients — psi_fn
+    hard-enforces the boundary condition via its envelope (see
+    network.denormalize_psi). Kept in the signature/HyperParams so callers and
+    archived checkpoint JSONs don't need updating.
     """
 
     def single_config_loss(
         R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig
     ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        # 1. Axis Estimation
+        # 1. Axis Estimation: mean of the lowest few samples rather than a
+        # single min, so the estimate isn't dictated by one noisy collocation
+        # point (which also made it batch/resampling-density dependent).
         psi_int = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R, Z)
-        psi_axis = jax.lax.stop_gradient(jnp.min(psi_int))
+        n_axis = max(1, psi_int.shape[0] // 20)
+        psi_axis = jax.lax.stop_gradient(jnp.mean(jnp.sort(psi_int)[:n_axis]))
 
         # 2. PDE Residual Loss
         residual_fn = jax.vmap(
             lambda r, z: grad_shafranov_residual(psi_fn, params, r, z, psi_axis, config)
         )
         res_vals = residual_fn(R, Z)
-        loss_res = jnp.mean(optax.huber_loss(res_vals, delta=1.0))
+        loss_res = jnp.mean(res_vals**2)
 
-        # 3. Boundary Condition Loss (Dirichlet & Neumann)
+        # 3. Boundary Condition (Dirichlet, diagnostic only): psi_fn hard-enforces
+        # psi=0 at the edge via its envelope (see network.denormalize_psi), so this
+        # no longer drives gradients — kept as a check that the constraint holds.
+        # (No Neumann/tangential check here: differentiating through the boundary's
+        # piecewise-linear angle LUT is numerically noisy wherever boundary points
+        # bunch up in angle for strongly shaped boundaries, and the Dirichlet check
+        # alone already confirms the envelope is doing its job.)
         R_b, Z_b = config.Boundary.R, config.Boundary.Z
-        dR_dt, dZ_dt = config.Boundary.dR_dtheta, config.Boundary.dZ_dtheta
-
-        batched_psi = jax.vmap(lambda r, z: psi_fn(params, r, z, config))
-        psi_b, dpsi_dt = jax.jvp(batched_psi, (R_b, Z_b), (dR_dt, dZ_dt))
-
-        # Dirichlet: ψ = 0 at plasma edge
-        loss_dir = jnp.mean((psi_b - PSI_EDGE) ** 2)
-        # Neumann: dψ/dn = 0 at plasma edge (approximated via directional derivative along tangent)
-        loss_neu = jnp.mean(dpsi_dt**2)
-
-        loss_boundary = loss_dir + loss_neu
+        psi_b = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R_b, Z_b)
+        loss_boundary = jax.lax.stop_gradient(jnp.mean((psi_b - PSI_EDGE) ** 2))
 
         return loss_res, loss_boundary
 
     losses = jax.vmap(single_config_loss)(R_interior, Z_interior, batch_config)
     loss_res = jnp.mean(losses[0])
     loss_boundary = jnp.mean(losses[1])
-    per_config_loss = losses[0] + weight_boundary_condition * losses[1]
-    total = loss_res + weight_boundary_condition * loss_boundary
+    per_config_loss = losses[0]
+    total = loss_res
     return total, loss_res, loss_boundary, per_config_loss
 
 
@@ -289,8 +305,9 @@ def get_b_field(
     psi_vals = jax.vmap(scalar_psi)(R_arr, Z_arr)
     psi_axis = scalar_psi(config.Geometry.R0, 0.0)
 
+    flux_scale = config.State.F_axis * config.Geometry.a
     F_val = toroidal_field_flux_function(
-        psi_vals, psi_axis, config.State.F_axis, config.State.field_exponent
+        psi_vals, psi_axis, config.State.F_axis, config.State.field_exponent, flux_scale
     )
     Bphi = F_val / R_arr
 
