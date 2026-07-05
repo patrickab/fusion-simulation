@@ -1,4 +1,5 @@
 import argparse
+from collections import deque
 from datetime import datetime
 import os
 from pathlib import Path
@@ -20,7 +21,11 @@ from rich.table import Table
 from scipy.stats import qmc
 
 from src.engine.physics import pinn_loss_function
-from src.engine.plasma import calculate_poloidal_boundary, get_poloidal_points
+from src.engine.plasma import (
+    boundary_normalized_radius,
+    calculate_poloidal_boundary,
+    get_poloidal_points,
+)
 from src.lib.config import Filepaths
 from src.lib.geometry_config import (
     PlasmaConfig,
@@ -34,6 +39,20 @@ console = Console()
 logger = get_logger(
     name="Network",
 )
+
+
+def denormalize_psi(
+    psi_n: jnp.ndarray, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig
+) -> jnp.ndarray:
+    """Map raw network output to physical psi.
+
+    Hard-enforces psi=0 (and, since the envelope is theta-independent along
+    the boundary, dpsi/dtheta=0) at the plasma edge via a multiplicative
+    envelope, so boundary conditions hold by construction instead of via a
+    soft loss penalty.
+    """
+    envelope = 1.0 - boundary_normalized_radius(R, Z, cfg.Boundary) ** 2
+    return envelope * psi_n.squeeze() * cfg.State.F_axis * cfg.Geometry.a
 
 
 # --- Network (simple MLP) ---
@@ -84,6 +103,7 @@ RESAMPLING_FREQUENCY = 10  # Resample training set every N epochs
 LOG_FREQUENCY = 10  # Log training metrics every N epochs
 N_VALIDATION_SIZE = 128  # Number of validation plasma configs
 VALIDATION_FREQUENCY = 5 * LOG_FREQUENCY  # Evaluate validation set every N epochs
+LIVE_TABLE_MAX_ROWS = 15  # cap rows shown in the live table; unbounded growth desyncs Rich's redraw once it overflows the terminal, corrupting scrollback
 
 
 class Sampler:
@@ -354,7 +374,7 @@ class NetworkManager:
             inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
             p_n, r_n, z_n = inp.normalize()
             psi_n = apply_fn(p, r=r_n, z=z_n, **p_n)
-            return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
+            return denormalize_psi(psi_n, R, Z, cfg)
 
         total, l_res, l_dir, l_per_cfg = pinn_loss_function(
             psi_fn,
@@ -466,17 +486,25 @@ class NetworkManager:
 
         return float(loss), float(l_res), float(l_dir), avg_grad_norm
 
-    def _init_live_display(self) -> Live:
-        """Set up Rich table, progress bar, and accumulators for live training display."""
-        self._table = Table(title="Training Metrics", show_header=True, header_style="bold cyan")
-        self._table.add_column("Epoch", justify="right", style="cyan")
-        self._table.add_column("LR", justify="right", style="yellow")
-        self._table.add_column("||∇L||", justify="right", style="magenta")
-        self._table.add_column(
+    def _new_table(self) -> Table:
+        table = Table(title="Training Metrics", show_header=True, header_style="bold cyan")
+        table.add_column("Epoch", justify="right", style="cyan")
+        table.add_column("LR", justify="right", style="yellow")
+        table.add_column("||∇L||", justify="right", style="magenta")
+        table.add_column(
             "Loss = Residual + w*Boundary", justify="right", style="magenta", no_wrap=True
         )
-        self._table.add_column("Val Loss", justify="right", style="green")
-        self._table.add_column("Time/Ep", justify="right")
+        table.add_column("Val Loss", justify="right", style="green")
+        table.add_column("Time/Ep", justify="right")
+        return table
+
+    def _init_live_display(self) -> Live:
+        """Set up Rich table, progress bar, and accumulators for live training display."""
+        # ponytail: fixed-size rolling window, not the full history — an unbounded table
+        # eventually taller than the terminal desyncs Rich's cursor-based redraw, corrupting
+        # the display whenever the user scrolls
+        self._table_rows: deque[tuple[str, ...]] = deque(maxlen=LIVE_TABLE_MAX_ROWS)
+        self._table = self._new_table()
 
         self._progress = Progress(
             TextColumn("[bold cyan]{task.description}"),
@@ -543,14 +571,17 @@ class NetworkManager:
 
             w = self.config.weight_boundary_condition
             loss_str = f"{moving_avg_loss:>9.3f} = {moving_avg_residual:>6.3f} + {w:g}*{moving_avg_boundary:>8.3f}"
-            self._table.add_row(
+            self._table_rows.append((
                 f"{epoch + 1}/{self.epochs}",
                 lr_str,
                 f"{moving_avg_grad_norm:.3f}",
                 loss_str,
                 val_loss_str,
                 f"{moving_avg_time:.2f}s",
-            )
+            ))
+            self._table = self._new_table()
+            for row in self._table_rows:
+                self._table.add_row(*row)
 
             self._accumulated_loss = 0.0
             self._accumulated_residual = 0.0
@@ -629,7 +660,7 @@ class NetworkManager:
             inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
             p_n, r_n, z_n = inp.normalize()
             psi_n = apply_fn(p, r=r_n, z=z_n, **p_n)
-            return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
+            return denormalize_psi(psi_n, R, Z, cfg)
 
         return psi_fn
 
