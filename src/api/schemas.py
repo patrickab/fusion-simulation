@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class CoilConfigIn(BaseModel):
@@ -23,6 +23,7 @@ class GeometryRequest(BaseModel):
 class SampleRequest(BaseModel):
     seed: int = 0
     sample_size: int = 4
+    kpi_sample_size: int = Field(default=16_384, ge=16, le=65_536)
 
 
 class BFieldRequest(BaseModel):
@@ -34,7 +35,7 @@ class BFieldRequest(BaseModel):
 class GridRequest(BaseModel):
     seed: int = 0
     sample_size: int = 4
-    resolution: int = 100
+    resolution: int = Field(default=100, ge=4, le=400)
 
 
 class RenameRequest(BaseModel):
@@ -47,4 +48,5 @@ class BenchmarkRequest(BaseModel):
     mode: str = "Both"  # "Flux Prediction" | "GS Residual" | "Both"
     seed: int = 0
     sample_size: int = 4
-    resolution: int = 80
+    resolution: int = Field(default=100, ge=4, le=400)
+    kpi_sample_size: int = Field(default=16_384, ge=16, le=65_536)

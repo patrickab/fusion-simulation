@@ -13,7 +13,7 @@ import { useStore } from '../store'
 import { GridHeatmap, SampleScatter, type Range2 } from '../plots'
 import { Scene } from '../three/Scene'
 import { FieldLines, PlasmaWireframe } from '../three/Reactor3D'
-import { plasmaGradient, plasmaPlotlyScale } from '../three/colormap'
+import { plasmaGradient } from '../three/colormap'
 import { Colorbar, JsonBlock, Panel, Popover, Section, Segmented, Slider, Spinner, Stat } from '../ui'
 
 const VIEW_MODES = ['New Benchmarks', 'Archive', 'All'] as const
@@ -38,6 +38,7 @@ export function NetworkView() {
   const [tab, setTab] = useState<Tab>('sampling')
   const [seed, setSeed] = useState(0)
   const [sampleSize, setSampleSize] = useState(4)
+  const [kpiSampleSize, setKpiSampleSize] = useState(16_384)
   const [nLines, setNLines] = useState(50)
   const [resolution, setResolution] = useState(120)
 
@@ -51,8 +52,8 @@ export function NetworkView() {
   const dSeed = useDebounced(seed, 400)
   const dLines = useDebounced(nLines, 400)
   const dResolution = useDebounced(resolution, 400)
-  const sampleKey = network ? `sample:${network}:${dSeed}:${sampleSize}` : null
-  const sample = useApi<SampleResponse>(sampleKey, () => api.sample(network!, dSeed, sampleSize))
+  const sampleKey = network ? `sample:${network}:${dSeed}:${sampleSize}:${kpiSampleSize}` : null
+  const sample = useApi<SampleResponse>(sampleKey, () => api.sample(network!, dSeed, sampleSize, kpiSampleSize))
   const config = useApi<Record<string, unknown>>(network ? `config:${network}` : null, () => api.config(network!))
 
   const refresh = () => {
@@ -124,6 +125,18 @@ export function NetworkView() {
               {[1, 2, 4, 6, 8].map((n) => (
                 <option key={n} value={n}>
                   {n}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="ctl">
+            <span className="ctl-row">
+              <span>KPI points</span>
+            </span>
+            <select className="select" value={kpiSampleSize} onChange={(e) => setKpiSampleSize(Number(e.target.value))}>
+              {[1024, 4096, 16384, 65536].map((n) => (
+                <option key={n} value={n}>
+                  {n.toLocaleString()}
                 </option>
               ))}
             </select>
@@ -212,11 +225,16 @@ function KpiStats({ sample }: { sample: ReturnType<typeof useApi<SampleResponse>
   const m = sample.data.metrics
   return (
     <div className="stats">
-      <Stat label="avg loss" value={fmtExp(m.avg_loss)} />
-      <Stat label="interior" value={fmtExp(m.interior_loss)} />
-      <Stat label="boundary" value={fmtExp(m.boundary_loss)} />
-      <Stat label="max loss" value={fmtExp(m.max_loss)} />
-      <Stat label="max residual" value={fmtExp(m.max_residual)} />
+      <Stat label="median" value={fmtExp(m.loss_median)} />
+      <Stat label="mean" value={fmtExp(m.loss_mean)} />
+      <Stat label="p95" value={fmtExp(m.loss_p95)} />
+      <Stat label="p05" value={fmtExp(m.loss_p05)} />
+      <Stat label="core median" value={fmtExp(m.core_loss_median)} />
+      <Stat label="core mean" value={fmtExp(m.core_loss_mean)} />
+      <Stat label="core p95" value={fmtExp(m.core_loss_p95)} />
+      <Stat label="core p05" value={fmtExp(m.core_loss_p05)} />
+      <Stat label="edge p95" value={fmtExp(m.edge_loss_p95)} />
+      <Stat label="boundary leak" value={fmtExp(m.boundary_leak_max)} />
     </div>
   )
 }
@@ -237,14 +255,8 @@ function GridTab({
   sample: ReturnType<typeof useApi<SampleResponse>>
 }) {
   const grids = useApi<Grid2D[]>(`${kind}:${network}:${seed}:${sampleSize}:${resolution}`, () =>
-    api[kind](network, seed, sampleSize, resolution),
+    api.grid(network, kind, seed, sampleSize, resolution),
   )
-
-  // ponytail: fixed scales matched to the legacy plot_flux_heatmap/plot_gs_residual_heatmap
-  // (src/lib/visualization.py) — same absolute zmin/zmax across samples, not per-batch min/max
-  // Residual grids are log10|R_GS| (src/api/network.py), matching model_evaluation.py's
-  // reference montage: -2..1 covers converged-to-diverging orders of magnitude.
-  const { zmin, zmax } = kind === 'residual' ? { zmin: -2, zmax: 1 } : { zmin: 0, zmax: 90 }
 
   return (
     <div className="scroll" style={{ position: 'relative' }}>
@@ -265,9 +277,7 @@ function GridTab({
                 <div className="caption">sample {i}</div>
                 <GridHeatmap
                   grid={g}
-                  colorscale={kind === 'residual' ? plasmaPlotlyScale : 'Viridis'}
-                  zmin={zmin}
-                  zmax={zmax}
+                  quantity={kind}
                 />
               </div>
             ))}

@@ -1,17 +1,19 @@
 """Checkpoint sampling, flux/residual grids, and B-field grids for the Network view."""
 
-import math
-
-import jax
 import jax.numpy as jnp
 import numpy as np
 
-from src.engine.model_evaluation import compute_gs_residual_on_points
+from src.engine.model_evaluation import (
+    DEFAULT_KPI_SAMPLE_SIZE,
+    GridQuantity,
+    PlasmaGridBatch,
+    evaluate_plasma_grids,
+    evaluate_plasma_kpis,
+)
 from src.engine.network import NetworkManager, Sampler
 from src.engine.physics import get_b_field_cartesian
-from src.engine.plasma import boundary_normalized_radius, is_point_in_plasma
-from src.lib.geometry_config import CylindricalCoordinates, PlasmaGeometry, PlasmaState
-from src.lib.network_config import FluxInput
+from src.engine.plasma import boundary_normalized_radius
+from src.lib.geometry_config import PlasmaGeometry, PlasmaState
 from src.streamlit.network_utils import to_plasma_config
 
 
@@ -63,7 +65,12 @@ def _seeded_samples(
     return data, geom_3d, state_3d
 
 
-def build_sample_response(manager: NetworkManager, seed: int, sample_size: int) -> dict:
+def build_sample_response(
+    manager: NetworkManager,
+    seed: int,
+    sample_size: int,
+    kpi_sample_size: int = DEFAULT_KPI_SAMPLE_SIZE,
+) -> dict:
     data, geom_3d, state_3d = _seeded_samples(manager, seed, sample_size)
 
     configs = [to_plasma_config(d["geom"], d["state"]) for d in data]
@@ -86,7 +93,7 @@ def build_sample_response(manager: NetworkManager, seed: int, sample_size: int) 
         for d in data
     ]
 
-    metrics = _compute_metrics(manager, data, configs)
+    metrics = evaluate_plasma_kpis(manager, configs, sample_size=kpi_sample_size)
 
     return {
         "samples": samples,
@@ -106,123 +113,57 @@ def build_sample_response(manager: NetworkManager, seed: int, sample_size: int) 
     }
 
 
-def _compute_metrics(manager: NetworkManager, data: list[dict], configs: list) -> dict:
-    geometry = jnp_tree_stack([c.Geometry for c in configs])
-    boundary = jnp_tree_stack([c.Boundary for c in configs])
-    state = jnp_tree_stack([c.State for c in configs])
-    batched_config = configs[0].__class__(Geometry=geometry, Boundary=boundary, State=state)
-
-    flux_input = FluxInput(
-        R_sample=jnp.stack([d["iR"] for d in data]),
-        Z_sample=jnp.stack([d["iZ"] for d in data]),
-        config=batched_config,
-    )
-
-    total, l_res, l_dir, l_per_cfg = manager.eval_step(
-        manager.state, flux_input, manager.config.weight_boundary_condition
-    )
-
-    max_res = 0.0
-    for i, cfg in enumerate(configs):
-        res_vals = compute_gs_residual_on_points(
-            manager, cfg, flux_input.R_sample[i], flux_input.Z_sample[i]
-        )
-        max_res = max(max_res, float(jnp.max(jnp.abs(res_vals))))
-
-    return {
-        "avg_loss": float(total),
-        "interior_loss": float(l_res),
-        "boundary_loss": float(l_dir),
-        "max_loss": float(jnp.max(l_per_cfg)),
-        "max_residual": max_res,
-    }
+def build_kpis(
+    manager: NetworkManager,
+    seed: int,
+    sample_size: int,
+    kpi_sample_size: int = DEFAULT_KPI_SAMPLE_SIZE,
+) -> dict[str, float]:
+    data, _, _ = _seeded_samples(manager, seed, sample_size)
+    configs = [to_plasma_config(d["geom"], d["state"]) for d in data]
+    return evaluate_plasma_kpis(manager, configs, sample_size=kpi_sample_size)
 
 
-def jnp_tree_stack(items: list) -> object:
-    """Stack a list of identically-shaped flax dataclasses along a new batch axis 0."""
-    return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *items)
+def _serialize_grid_batch(grids: PlasmaGridBatch, quantity: GridQuantity) -> list[dict]:
+    """Convert shared JAX grid data into the frontend's JSON contract."""
+    return [
+        {
+            "theta": np.asarray(grids.theta).tolist(),
+            "rho": np.asarray(grids.rho).tolist(),
+            "R": np.asarray(grids.R[i]).tolist(),
+            "Z": np.asarray(grids.Z[i]).tolist(),
+            "values": np.asarray(grids.values[quantity][i]).tolist(),
+            "boundary_R": np.asarray(grids.boundary_R[i]).tolist(),
+            "boundary_Z": np.asarray(grids.boundary_Z[i]).tolist(),
+        }
+        for i in range(grids.R.shape[0])
+    ]
 
 
-def _grid_bounds(geoms: list[PlasmaGeometry]) -> tuple[list[float], list[float]]:
-    r_min = min(g.R0 - g.a * 1.2 for g in geoms)
-    r_max = max(g.R0 + g.a * 1.2 for g in geoms)
-    z_max = max(g.kappa * g.a * 1.2 for g in geoms)
-    r_mid, extent = (r_min + r_max) / 2, max(r_max - r_min, 2 * z_max)
-    return [r_mid - extent / 2, r_mid + extent / 2], [-extent / 2, extent / 2]
+def build_plasma_grids(
+    manager: NetworkManager,
+    seed: int,
+    sample_size: int,
+    resolution: int,
+    quantities: tuple[GridQuantity, ...],
+) -> dict[GridQuantity, list[dict]]:
+    """Evaluate requested quantities once and serialize them for API consumers."""
+    data, _, _ = _seeded_samples(manager, seed, sample_size)
+    configs = [to_plasma_config(d["geom"], d["state"]) for d in data]
+    grids = evaluate_plasma_grids(manager, configs, resolution, quantities)
+    return {quantity: _serialize_grid_batch(grids, quantity) for quantity in quantities}
 
 
 def build_flux_grids(
     manager: NetworkManager, seed: int, sample_size: int, resolution: int
 ) -> list[dict]:
-    data, _, _ = _seeded_samples(manager, seed, sample_size)
-    configs = [to_plasma_config(d["geom"], d["state"]) for d in data]
-
-    r_lims, z_lims = _grid_bounds([c.Geometry for c in configs])
-    R = jnp.linspace(*r_lims, resolution)
-    Z = jnp.linspace(*z_lims, resolution)
-    R_grid, Z_grid = jnp.meshgrid(R, Z)
-    coords_flat = CylindricalCoordinates(
-        R=R_grid.flatten(), Z=Z_grid.flatten(), phi=jnp.zeros_like(R_grid.flatten())
-    )
-
-    grids = []
-    for cfg in configs:
-        mask = is_point_in_plasma(coords_flat, cfg.Boundary)
-        psi = jnp.full(mask.shape, jnp.nan)
-        if mask.any():
-            val = manager.get_psi(coords_flat.R[mask], coords_flat.Z[mask], cfg)
-            psi = psi.at[mask].set(val.flatten())
-
-        grids.append(
-            {
-                "R": np.asarray(R).tolist(),
-                "Z": np.asarray(Z).tolist(),
-                "values": _nan_to_none_grid(np.asarray(psi).reshape(resolution, resolution)),
-                "boundary_R": np.asarray(cfg.Boundary.R).tolist(),
-                "boundary_Z": np.asarray(cfg.Boundary.Z).tolist(),
-            }
-        )
-    return grids
+    return build_plasma_grids(manager, seed, sample_size, resolution, ("flux",))["flux"]
 
 
 def build_residual_grids(
     manager: NetworkManager, seed: int, sample_size: int, resolution: int
 ) -> list[dict]:
-    data, _, _ = _seeded_samples(manager, seed, sample_size)
-    configs = [to_plasma_config(d["geom"], d["state"]) for d in data]
-
-    r_lims, z_lims = _grid_bounds([c.Geometry for c in configs])
-    R = jnp.linspace(*r_lims, resolution)
-    Z = jnp.linspace(*z_lims, resolution)
-    R_grid, Z_grid = jnp.meshgrid(R, Z)
-    coords_flat = CylindricalCoordinates(
-        R=R_grid.flatten(), Z=Z_grid.flatten(), phi=jnp.zeros_like(R_grid.flatten())
-    )
-
-    grids = []
-    for cfg in configs:
-        mask = is_point_in_plasma(coords_flat, cfg.Boundary)
-        residual = jnp.full(mask.shape, jnp.nan)
-        if mask.any():
-            R_masked = coords_flat.R[mask]
-            Z_masked = coords_flat.Z[mask]
-            res_vals = compute_gs_residual_on_points(manager, cfg, R_masked, Z_masked)
-            residual = residual.at[mask].set(res_vals.flatten())
-
-        grids.append(
-            {
-                "R": np.asarray(R).tolist(),
-                "Z": np.asarray(Z).tolist(),
-                "values": _nan_to_none_grid(np.asarray(residual).reshape(resolution, resolution)),
-                "boundary_R": np.asarray(cfg.Boundary.R).tolist(),
-                "boundary_Z": np.asarray(cfg.Boundary.Z).tolist(),
-            }
-        )
-    return grids
-
-
-def _nan_to_none_grid(grid: np.ndarray) -> list[list[float | None]]:
-    return [[None if math.isnan(v) else float(v) for v in row] for row in grid]
+    return build_plasma_grids(manager, seed, sample_size, resolution, ("residual",))["residual"]
 
 
 def build_bfield_grid(

@@ -3,14 +3,20 @@
 from collections.abc import Iterator
 import json
 
-from src.api.network import build_flux_grids, build_residual_grids
+from src.api.network import build_kpis, build_plasma_grids
 from src.api.state import get_manager
 from src.lib.config import Filepaths
 from src.streamlit.network_utils import filter_networks_by_commit
 
 
 def run_benchmark(
-    networks: list[str], commit: str | None, mode: str, seed: int, sample_size: int, resolution: int
+    networks: list[str],
+    commit: str | None,
+    mode: str,
+    seed: int,
+    sample_size: int,
+    resolution: int,
+    kpi_sample_size: int,
 ) -> Iterator[str]:
     filtered = filter_networks_by_commit(networks, commit)
     if not filtered:
@@ -26,10 +32,17 @@ def run_benchmark(
         manager = get_manager(name)
         row: dict = {"type": "row", "network": name, "config": json.loads(config_path.read_text())}
 
-        if mode in ("Flux Prediction", "Both"):
-            row["flux_grids"] = build_flux_grids(manager, seed, sample_size, resolution)
-        if mode in ("GS Residual", "Both"):
-            row["residual_grids"] = build_residual_grids(manager, seed, sample_size, resolution)
+        quantities = {
+            "Flux Prediction": ("flux",),
+            "GS Residual": ("residual",),
+            "Both": ("flux", "residual"),
+        }[mode]
+        grids = build_plasma_grids(manager, seed, sample_size, resolution, quantities)
+        row["kpis"] = build_kpis(manager, seed, sample_size, kpi_sample_size)
+        if "flux" in grids:
+            row["flux_grids"] = grids["flux"]
+        if "residual" in grids:
+            row["residual_grids"] = grids["residual"]
 
         yield _sse_event(row)
 

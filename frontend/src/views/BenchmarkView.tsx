@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { api, benchmarkStream, useApi, type BenchmarkEvent } from '../api'
 import { GridHeatmap } from '../plots'
-import { plasmaGradient, plasmaPlotlyScale } from '../three/colormap'
+import { plasmaGradient } from '../three/colormap'
 import { Colorbar, Panel, Section, Segmented, Slider, Spinner, Stat, Toggle } from '../ui'
 
 const MODES = ['Flux Prediction', 'GS Residual', 'Both'] as const
@@ -19,6 +19,7 @@ export function BenchmarkView() {
   const [mode, setMode] = useState<(typeof MODES)[number]>('Both')
   const [seed, setSeed] = useState(0)
   const [resolution, setResolution] = useState(100)
+  const [kpiSampleSize, setKpiSampleSize] = useState(16_384)
   const [rows, setRows] = useState<Row[]>([])
   const [running, setRunning] = useState(false)
   const [error, setError] = useState<string>()
@@ -56,6 +57,7 @@ export function BenchmarkView() {
         seed,
         sample_size: 4,
         resolution,
+        kpi_sample_size: kpiSampleSize,
       }
       for await (const ev of benchmarkStream(body, ac.signal)) {
         if (ev.type === 'row' || ev.type === 'row_error') setRows((r) => [...r, ev])
@@ -96,6 +98,18 @@ export function BenchmarkView() {
           </div>
           <Slider label="Seed" value={seed} min={0} max={1000} onChange={setSeed} />
           <Slider label="Resolution" value={resolution} min={40} max={200} step={20} onChange={setResolution} />
+          <label className="ctl">
+            <span className="ctl-row">
+              <span>KPI points</span>
+            </span>
+            <select className="select" value={kpiSampleSize} onChange={(e) => setKpiSampleSize(Number(e.target.value))}>
+              {[1024, 4096, 16384, 65536].map((n) => (
+                <option key={n} value={n}>
+                  {n.toLocaleString()}
+                </option>
+              ))}
+            </select>
+          </label>
         </Section>
         <Section title="Run">
           {running ? (
@@ -136,15 +150,6 @@ export function BenchmarkView() {
   )
 }
 
-// ponytail: fixed scales matched to the legacy plot_flux_heatmap/plot_gs_residual_heatmap
-// (src/lib/visualization.py) — same absolute zmin/zmax across samples, not per-batch min/max
-// (axis ranges are no longer shared across samples — each grid keeps its own true aspect)
-// Residual grids are log10|R_GS| (src/api/network.py), matching model_evaluation.py's
-// reference montage: -2..1 covers converged-to-diverging orders of magnitude.
-function gridScales(residual: boolean) {
-  return residual ? { zmin: -2, zmax: 1 } : { zmin: 0, zmax: 90 }
-}
-
 function BenchRow({ row }: { row: Extract<Row, { type: 'row' }> }) {
   const cfg = row.config
   const chips = ['hidden_dims', 'learning_rate_max', 'n_train', 'n_epochs']
@@ -160,6 +165,11 @@ function BenchRow({ row }: { row: Extract<Row, { type: 'row' }> }) {
           </span>
         ))}
       </div>
+      <div className="stats">
+        {Object.entries(row.kpis).map(([key, value]) => (
+          <Stat key={key} label={key.replaceAll('_', ' ')} value={value.toExponential(2)} />
+        ))}
+      </div>
       {row.flux_grids && row.flux_grids.length > 0 && (
         <>
           <div className="stats">
@@ -167,7 +177,7 @@ function BenchRow({ row }: { row: Extract<Row, { type: 'row' }> }) {
           </div>
           <div className="bench-grids">
             {row.flux_grids.map((g, i) => (
-              <GridHeatmap key={i} grid={g} {...gridScales(false)} />
+              <GridHeatmap key={i} grid={g} quantity="flux" />
             ))}
           </div>
         </>
@@ -179,7 +189,7 @@ function BenchRow({ row }: { row: Extract<Row, { type: 'row' }> }) {
           </div>
           <div className="bench-grids">
             {row.residual_grids.map((g, i) => (
-              <GridHeatmap key={i} grid={g} colorscale={plasmaPlotlyScale} {...gridScales(true)} />
+              <GridHeatmap key={i} grid={g} quantity="residual" />
             ))}
           </div>
           <Colorbar title="log₁₀|R_GS|" gradient={plasmaGradient} range={[-2, 1]} />
