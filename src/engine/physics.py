@@ -3,6 +3,7 @@ from typing import Callable
 
 import jax
 import jax.numpy as jnp
+import optax
 
 from src.lib.geometry_config import PlasmaConfig
 
@@ -211,6 +212,7 @@ def pinn_loss_function(
     Z_interior: jnp.ndarray,
     batch_config: PlasmaConfig,
     weight_boundary_condition: float,  # noqa: ARG001
+    huber_delta: float,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """Computes the total PINN loss: L_total = L_residual.
 
@@ -243,7 +245,13 @@ def pinn_loss_function(
             lambda r, z: grad_shafranov_residual(psi_fn, params, r, z, psi_axis, config)
         )
         res_vals = residual_fn(R, Z)
-        loss_res = jnp.mean(res_vals**2)
+        # huber_delta == 0 selects plain MSE; jnp.where evaluates both branches,
+        # which is negligible next to the residual computation itself.
+        loss_res = jnp.where(
+            huber_delta > 0,
+            jnp.mean(optax.losses.huber_loss(res_vals, delta=huber_delta)),
+            jnp.mean(res_vals**2),
+        )
 
         # 3. Boundary Condition (Dirichlet, diagnostic only): psi_fn hard-enforces
         # psi=0 at the edge via its envelope (see network.denormalize_psi), so this
