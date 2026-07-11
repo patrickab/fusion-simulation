@@ -13,6 +13,27 @@ class HyperParams(BaseModel):
     """Central configuration for the experiment."""
 
     hidden_dims: tuple[int, ...] = (128, 128, 128, 128)
+    # 0.0 → MSE PDE loss; >0 → optax Huber loss with this delta. Ablation 1
+    # (kinked LUT boundary) had Huber winning clearly; grid 2 (smooth Fourier
+    # boundary envelope) closed the gap — mse core_med 0.388 vs huber 0.420
+    # plain, huber 0.383 vs mse 0.502 with nff=64 — confirming the kinked
+    # boundary, not the loss, was ablation 1's real culprit. Kept as a toggle
+    # since the two losses are now close enough to depend on architecture.
+    huber_delta: float = 1.0
+    # random Fourier features on (r, z); 0 = plain MLP. nff=64 gave the best
+    # core median in grid 2 (2026-07-11) at the cost of a noisier boundary
+    # shell (edge_p95/bnd_leak both ~2-3x higher) — tolerated per the
+    # core-first selection rule, and is the CLI default for new training runs
+    # (src/engine/network.py --fourier-features). The dataclass default must
+    # stay 0 though: any saved checkpoint whose .json predates this field (or
+    # any HyperParams() built without one) falls back to this value, and a
+    # mismatched nff makes flax reject the checkpoint's params shape outright.
+    n_fourier_features: int = 0
+    fourier_sigma: float = 2.0
+    # L-BFGS polish steps on a fixed batch after AdamW; 0 = off. Grid 2 showed
+    # no consistent gain (made plain-huber worse: 0.460 vs 0.420) for
+    # 1.5-8min/run extra cost — not worth defaulting on.
+    lbfgs_steps: int = 0
     learning_rate_max: float = 2e-3
     learning_rate_min: float = 5e-5
     weight_decay: float = 1e-7
