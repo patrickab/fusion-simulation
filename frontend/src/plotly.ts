@@ -1,7 +1,13 @@
-// ponytail: cartesian partial bundle (scatter + heatmap only) — full plotly.js is ~4 MB heavier.
-import Plotly from 'plotly.js-cartesian-dist-min'
+// ponytail: custom bundle with exactly the traces we render — the prebuilt
+// cartesian dist lacks carpet/contourcarpet, and the full dist is ~4 MB heavier.
+import Plotly from 'plotly.js/lib/core'
+import scatter from 'plotly.js/lib/scatter'
+import carpet from 'plotly.js/lib/carpet'
+import contourcarpet from 'plotly.js/lib/contourcarpet'
 import factory from 'react-plotly.js/factory'
 import type { Config, Layout } from 'plotly.js'
+
+Plotly.register([scatter, carpet, contourcarpet] as Parameters<typeof Plotly.register>[0])
 
 // CJS default-interop: under Vite dev the module object itself can land in `factory`
 const createPlotlyComponent = (factory as unknown as { default?: typeof factory }).default ?? factory

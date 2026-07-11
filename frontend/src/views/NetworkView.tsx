@@ -13,7 +13,7 @@ import { useStore } from '../store'
 import { GridHeatmap, SampleScatter, type Range2 } from '../plots'
 import { Scene } from '../three/Scene'
 import { FieldLines, PlasmaWireframe } from '../three/Reactor3D'
-import { plasmaGradient } from '../three/colormap'
+import { plasmaGradient, plasmaPlotlyScale } from '../three/colormap'
 import { Colorbar, JsonBlock, Panel, Popover, Section, Segmented, Slider, Spinner, Stat } from '../ui'
 
 const VIEW_MODES = ['New Benchmarks', 'Archive', 'All'] as const
@@ -39,6 +39,7 @@ export function NetworkView() {
   const [seed, setSeed] = useState(0)
   const [sampleSize, setSampleSize] = useState(4)
   const [nLines, setNLines] = useState(50)
+  const [resolution, setResolution] = useState(120)
 
   const networks = useApi<string[]>(`networks:${viewMode}:${bump}`, () => api.networks(viewMode))
 
@@ -49,6 +50,7 @@ export function NetworkView() {
 
   const dSeed = useDebounced(seed, 400)
   const dLines = useDebounced(nLines, 400)
+  const dResolution = useDebounced(resolution, 400)
   const sampleKey = network ? `sample:${network}:${dSeed}:${sampleSize}` : null
   const sample = useApi<SampleResponse>(sampleKey, () => api.sample(network!, dSeed, sampleSize))
   const config = useApi<Record<string, unknown>>(network ? `config:${network}` : null, () => api.config(network!))
@@ -127,6 +129,9 @@ export function NetworkView() {
             </select>
           </label>
           {tab === 'topology' && <Slider label="Field lines" value={nLines} min={1} max={50} onChange={setNLines} />}
+          {(tab === 'flux' || tab === 'residual') && (
+            <Slider label="Resolution" value={resolution} min={40} max={200} step={20} onChange={setResolution} />
+          )}
         </Section>
       </Panel>
       <div className="view-main">
@@ -142,9 +147,11 @@ export function NetworkView() {
         ) : (
           <>
             {tab === 'sampling' && <SamplingTab sample={sample} />}
-            {tab === 'flux' && <GridTab kind="flux" network={network} seed={dSeed} sampleSize={sampleSize} sample={sample} />}
+            {tab === 'flux' && (
+              <GridTab kind="flux" network={network} seed={dSeed} sampleSize={sampleSize} resolution={dResolution} sample={sample} />
+            )}
             {tab === 'residual' && (
-              <GridTab kind="residual" network={network} seed={dSeed} sampleSize={sampleSize} sample={sample} />
+              <GridTab kind="residual" network={network} seed={dSeed} sampleSize={sampleSize} resolution={dResolution} sample={sample} />
             )}
             {tab === 'topology' && (
               <TopologyTab network={network} seed={dSeed} sampleSize={sampleSize} nLines={dLines} sample={sample} />
@@ -219,52 +226,55 @@ function GridTab({
   network,
   seed,
   sampleSize,
+  resolution,
   sample,
 }: {
   kind: 'flux' | 'residual'
   network: string
   seed: number
   sampleSize: number
+  resolution: number
   sample: ReturnType<typeof useApi<SampleResponse>>
 }) {
-  const resolution = 100
   const grids = useApi<Grid2D[]>(`${kind}:${network}:${seed}:${sampleSize}:${resolution}`, () =>
     api[kind](network, seed, sampleSize, resolution),
   )
 
   // ponytail: fixed scales matched to the legacy plot_flux_heatmap/plot_gs_residual_heatmap
   // (src/lib/visualization.py) — same absolute zmin/zmax across samples, not per-batch min/max
-  const { zmin, zmax } = kind === 'residual' ? { zmin: -0.5, zmax: 0.5 } : { zmin: 0, zmax: 90 }
-
-  let xr: Range2 | undefined
-  let yr: Range2 | undefined
-  if (grids.data?.length) {
-    const { R, Z } = grids.data[0] // all grids share one linspace
-    xr = [R[0], R[R.length - 1]]
-    yr = [Z[0], Z[Z.length - 1]]
-  }
+  // Residual grids are log10|R_GS| (src/api/network.py), matching model_evaluation.py's
+  // reference montage: -2..1 covers converged-to-diverging orders of magnitude.
+  const { zmin, zmax } = kind === 'residual' ? { zmin: -2, zmax: 1 } : { zmin: 0, zmax: 90 }
 
   return (
     <div className="scroll" style={{ position: 'relative' }}>
-      {grids.loading && <Spinner />}
       {grids.error && <div className="error">{grids.error}</div>}
       <KpiStats sample={sample} />
       <div className="grid">
-        {(grids.data ?? []).map((g, i) => (
-          <div className="card" key={i}>
-            <div className="caption">sample {i}</div>
-            <GridHeatmap
-              grid={g}
-              colorscale={kind === 'residual' ? 'RdBu' : 'Viridis'}
-              reversescale={kind === 'residual'}
-              zmin={zmin}
-              zmax={zmax}
-              xr={xr}
-              yr={yr}
-            />
-          </div>
-        ))}
+        {grids.loading
+          ? Array.from({ length: sampleSize }, (_, i) => (
+              <div className="card" key={i}>
+                <div className="caption">sample {i}</div>
+                <div className="plot-square">
+                  <Spinner center />
+                </div>
+              </div>
+            ))
+          : (grids.data ?? []).map((g, i) => (
+              <div className="card" key={i}>
+                <div className="caption">sample {i}</div>
+                <GridHeatmap
+                  grid={g}
+                  colorscale={kind === 'residual' ? plasmaPlotlyScale : 'Viridis'}
+                  zmin={zmin}
+                  zmax={zmax}
+                />
+              </div>
+            ))}
       </div>
+      {kind === 'residual' && (
+        <Colorbar title="log₁₀|R_GS|" gradient={plasmaGradient} range={[-2, 1]} />
+      )}
     </div>
   )
 }

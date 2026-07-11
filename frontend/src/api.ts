@@ -34,9 +34,11 @@ export interface SampleResponse {
 }
 
 export interface Grid2D {
-  R: number[]
-  Z: number[]
-  values: (number | null)[][]
+  theta: number[]
+  rho: number[]
+  R: number[][]
+  Z: number[][]
+  values: number[][]
   boundary_R: number[]
   boundary_Z: number[]
 }

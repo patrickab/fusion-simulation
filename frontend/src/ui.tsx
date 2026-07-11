@@ -143,14 +143,14 @@ export function JsonBlock({ obj }: { obj: unknown }) {
 }
 
 // ponytail: skip the indicator for fast local fetches (<200ms) so it doesn't just flash on/off on view switch
-export function Spinner() {
+export function Spinner({ center = false }: { center?: boolean }) {
   const [show, setShow] = useState(false)
   useEffect(() => {
     const t = setTimeout(() => setShow(true), 200)
     return () => clearTimeout(t)
   }, [])
   return show ? (
-    <div className="spinner-wrap">
+    <div className={center ? 'spinner-center' : 'spinner-wrap'}>
       <div className="spinner" />
     </div>
   ) : null
