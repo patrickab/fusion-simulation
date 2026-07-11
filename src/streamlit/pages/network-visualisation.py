@@ -291,7 +291,7 @@ def render_metrics() -> None:
 
     # Compute evaluation metrics
     total, l_res, l_dir, l_per_cfg = manager.eval_step(
-        manager.state, flux_input, manager.config.weight_boundary_condition
+        manager.state, flux_input, manager.config.weight_boundary_condition, manager.config.huber_delta
     )
 
     # Compute max pointwise residual across all sampled configurations
