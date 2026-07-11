@@ -1,5 +1,6 @@
 import argparse
 from collections import deque
+from contextlib import nullcontext
 from datetime import datetime
 import os
 from pathlib import Path
@@ -58,6 +59,11 @@ def denormalize_psi(
 # --- Network (simple MLP) ---
 class FluxPINN(nn.Module):
     hidden_dims: tuple[int, ...]
+    # Random Fourier features on the spatial (r, z) inputs to counter spectral
+    # bias (Wang et al. 2021). 0 disables; the projection matrix is drawn from
+    # a fixed PRNG key so train and reload see the identical embedding.
+    n_fourier_features: int = 0
+    fourier_sigma: float = 2.0
 
     @nn.compact
     def __call__(
@@ -88,6 +94,13 @@ class FluxPINN(nn.Module):
         target_shape = r.shape
         inputs = [r, z, r0, a, kappa, delta, p0, f_axis, alpha, exponent]
         x = jnp.stack([jnp.broadcast_to(input, target_shape) for input in inputs], axis=-1)
+
+        if self.n_fourier_features > 0:
+            proj_matrix = self.fourier_sigma * jax.random.normal(
+                jax.random.PRNGKey(0), (2, self.n_fourier_features)
+            )
+            proj = 2.0 * jnp.pi * (x[..., :2] @ proj_matrix)
+            x = jnp.concatenate([x, jnp.cos(proj), jnp.sin(proj)], axis=-1)
 
         for dim in self.hidden_dims:
             x = nn.Dense(features=dim, dtype=jnp.float32)(x)
@@ -273,13 +286,22 @@ class Sampler:
 
 # --- Manager for Training / Inference ---
 class NetworkManager:
-    def __init__(self, config: HyperParams, seed: int = BASE_SEED) -> None:
+    def __init__(
+        self,
+        config: HyperParams,
+        seed: int = BASE_SEED,
+        n_validation_size: int = N_VALIDATION_SIZE,
+    ) -> None:
         self.config = config
         self.seed = seed
+        self.n_validation_size = n_validation_size
         self.model = FluxPINN(
             hidden_dims=config.hidden_dims,
+            n_fourier_features=config.n_fourier_features,
+            fourier_sigma=config.fourier_sigma,
         )
         self.sampler: Sampler = Sampler(config, seed=self.seed)
+        self._validation_sampler: Sampler | None = None
         self.state = self._init_state()
 
         self._psi_fn_jit = jax.jit(self.make_psi_fn())
@@ -364,6 +386,7 @@ class NetworkManager:
         apply_fn: Callable,
         inputs: FluxInput,
         weight_boundary_condition: float,
+        huber_delta: float,
     ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
         """Pure function to compute physics loss. Reusable for both training and evaluation."""
 
@@ -383,6 +406,7 @@ class NetworkManager:
             inputs.Z_sample,
             inputs.config,
             weight_boundary_condition=weight_boundary_condition,
+            huber_delta=huber_delta,
         )
         return total, (l_res, l_dir, l_per_cfg)
 
@@ -392,10 +416,11 @@ class NetworkManager:
         state: train_state.TrainState,
         inputs: FluxInput,
         weight_boundary_condition: float,
+        huber_delta: float,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Fast, gradient-free evaluation step returning all loss components."""
         total, (l_res, l_dir, l_per_cfg) = NetworkManager.compute_loss(
-            state.params, state.apply_fn, inputs, weight_boundary_condition
+            state.params, state.apply_fn, inputs, weight_boundary_condition, huber_delta
         )
         return total, l_res, l_dir, l_per_cfg
 
@@ -403,7 +428,7 @@ class NetworkManager:
         """Create fixed validation plasma configs using Sobol sampling."""
         lower, upper = DomainBounds.get_bounds()
         sobol = qmc.Sobol(d=len(lower), scramble=True, seed=BASE_SEED + 123)
-        samples = sobol.random(N_VALIDATION_SIZE)
+        samples = sobol.random(self.n_validation_size)
         return np.array(qmc.scale(samples, lower, upper), dtype=np.float32)
 
     def _calculate_validation_loss(self, val_configs: np.ndarray) -> float:
@@ -412,13 +437,15 @@ class NetworkManager:
         total_loss = 0.0
         n_chunks = 0
         weight_bc = self.config.weight_boundary_condition
-        self.sampler.precompute_coordinate_samples()
+        if self._validation_sampler is None:
+            self._validation_sampler = Sampler(self.config, seed=self.seed + 1_000)
+        sampler = self._validation_sampler
 
         for i in range(0, len(val_configs), chunk_size):
             end = min(i + chunk_size, len(val_configs))
             batch = jnp.array(val_configs[i:end], dtype=jnp.float32)
-            inputs = self.sampler.sample_flux_input(plasma_configs=batch)
-            loss, _, _, _ = self.eval_step(self.state, inputs, weight_bc)
+            inputs = sampler.sample_flux_input(plasma_configs=batch)
+            loss, _, _, _ = self.eval_step(self.state, inputs, weight_bc, self.config.huber_delta)
             total_loss += float(loss)
             n_chunks += 1
 
@@ -430,6 +457,7 @@ class NetworkManager:
         state: train_state.TrainState,
         inputs: FluxInput,
         weight_boundary_condition: float,
+        huber_delta: float,
     ) -> tuple[
         train_state.TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray
     ]:
@@ -443,7 +471,7 @@ class NetworkManager:
         ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
             """Wrap compute loss to enable gradient computation"""
             return NetworkManager.compute_loss(
-                params, state.apply_fn, inputs, weight_boundary_condition
+                params, state.apply_fn, inputs, weight_boundary_condition, huber_delta
             )
 
         (loss, (l_res, l_dir, l_per_cfg)), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(
@@ -471,6 +499,7 @@ class NetworkManager:
                 state=self.state,
                 inputs=inputs,
                 weight_boundary_condition=self.config.weight_boundary_condition,
+                huber_delta=self.config.huber_delta,
             )
             all_losses.append(per_config_loss)
             grad_norms.append(b_grad_norm)
@@ -571,14 +600,16 @@ class NetworkManager:
 
             w = self.config.weight_boundary_condition
             loss_str = f"{moving_avg_loss:>9.3f} = {moving_avg_residual:>6.3f} + {w:g}*{moving_avg_boundary:>8.3f}"
-            self._table_rows.append((
-                f"{epoch + 1}/{self.epochs}",
-                lr_str,
-                f"{moving_avg_grad_norm:.3f}",
-                loss_str,
-                val_loss_str,
-                f"{moving_avg_time:.2f}s",
-            ))
+            self._table_rows.append(
+                (
+                    f"{epoch + 1}/{self.epochs}",
+                    lr_str,
+                    f"{moving_avg_grad_norm:.3f}",
+                    loss_str,
+                    val_loss_str,
+                    f"{moving_avg_time:.2f}s",
+                )
+            )
             self._table = self._new_table()
             for row in self._table_rows:
                 self._table.add_row(*row)
@@ -606,10 +637,18 @@ class NetworkManager:
         self._progress.update(self._epoch_task, advance=1)
         self._live.update(Panel(Group(self._table, self._progress), border_style="cyan"))
 
-    def train(self, save_to_disk: bool = True) -> None:
-        live = self._init_live_display()
+    def train(
+        self,
+        save_to_disk: bool = True,
+        validation_callback: Callable[[int, float | None], None] | None = None,
+        show_progress: bool = True,
+    ) -> float:
+        live = self._init_live_display() if show_progress else nullcontext()
         val_configs = self._create_validation_configs()
-        with live as self._live:
+        val_loss = None
+        with live as active_live:
+            if show_progress:
+                self._live = active_live
             for epoch in range(self.epochs):
                 start_time = time.perf_counter()
                 loss, residual, boundary, grad_norm = self.train_epoch(epoch)
@@ -618,14 +657,62 @@ class NetworkManager:
                 val_loss = None
                 if (epoch + 1) % VALIDATION_FREQUENCY == 0:
                     val_loss = self._calculate_validation_loss(val_configs)
+                if validation_callback is not None:
+                    validation_callback(epoch + 1, val_loss)
 
-                lr = float(self._lr_schedule(self.state.step))
-                self._log_metric(
-                    epoch, loss, residual, boundary, val_loss, lr, grad_norm, epoch_time
-                )
+                if show_progress:
+                    lr = float(self._lr_schedule(self.state.step))
+                    self._log_metric(
+                        epoch, loss, residual, boundary, val_loss, lr, grad_norm, epoch_time
+                    )
+
+        if self.config.lbfgs_steps > 0:
+            self.lbfgs(self.config.lbfgs_steps)
+            val_loss = self._calculate_validation_loss(val_configs)
+
+        if val_loss is None:
+            val_loss = self._calculate_validation_loss(val_configs)
 
         if save_to_disk:
             self.to_disk()
+        return val_loss
+
+    def lbfgs(self, steps: int) -> None:
+        """Polish AdamW-trained params with L-BFGS on one fixed batch.
+
+        Classic PINN two-stage optimization. Full-batch L-BFGS does not fit in
+        VRAM, so this uses a single fixed training batch — same memory
+        footprint as one train_step. ponytail: fixed-batch polish can overfit
+        those configs; the held-out KPI eval is the guard.
+        """
+        self.sampler.precompute_coordinate_samples()
+        batch = self.train_set[: self.config.batch_size]
+        inputs = self.sampler.sample_flux_input(plasma_configs=batch)
+        weight_bc, huber_delta = self.config.weight_boundary_condition, self.config.huber_delta
+
+        def loss_fn(params: any) -> jnp.ndarray:
+            total, _ = NetworkManager.compute_loss(
+                params, self.state.apply_fn, inputs, weight_bc, huber_delta
+            )
+            return total
+
+        opt = optax.lbfgs()
+
+        @jax.jit
+        def step(params: any, opt_state: any) -> tuple[any, any, jnp.ndarray]:
+            value, grad = optax.value_and_grad_from_state(loss_fn)(params, state=opt_state)
+            updates, opt_state = opt.update(
+                grad, opt_state, params, value=value, grad=grad, value_fn=loss_fn
+            )
+            return optax.apply_updates(params, updates), opt_state, value
+
+        params = self.state.params
+        opt_state = opt.init(params)
+        for i in range(steps):
+            params, opt_state, value = step(params, opt_state)
+            if (i + 1) % 20 == 0 or i == 0:
+                logger.info(f"L-BFGS polish step {i + 1}/{steps}: loss {float(value):.6f}")
+        self.state = self.state.replace(params=params)
 
     def get_psi(self, R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig) -> jnp.ndarray:
         """Evaluate magnetic flux psi at physical coordinates.
@@ -670,17 +757,41 @@ if __name__ == "__main__":
     parser.add_argument(
         "--test", action="store_true", help="Run with minimal parameters for rapid iteration"
     )
+    parser.add_argument("--lr", type=float, default=None, help="Override learning_rate_max")
+    parser.add_argument(
+        "--fourier-features",
+        type=int,
+        default=64,
+        help="Random Fourier features on (r,z); 0 = off (default 64, per grid-2 ablation)",
+    )
+    parser.add_argument(
+        "--lbfgs", type=int, default=0, help="L-BFGS polish steps after AdamW; 0 = off"
+    )
+    parser.add_argument(
+        "--huber-delta",
+        type=float,
+        default=1.0,
+        help="PDE loss: >0 = Huber with this delta (default 1.0), 0.0 = MSE",
+    )
     args = parser.parse_args()
 
     try:
         if not args.test:
-            config = HyperParams()
+            config = HyperParams(
+                huber_delta=args.huber_delta,
+                n_fourier_features=args.fourier_features,
+                lbfgs_steps=args.lbfgs,
+            )
+            if args.lr is not None:
+                config = config.replace(learning_rate_max=args.lr)
             manager = NetworkManager(config)
             manager.train(save_to_disk=True)
         else:
             globals()["N_VALIDATION_SIZE"] = 16
             globals()["VALIDATION_FREQUENCY"] = 20
             config = HyperParams(
+                huber_delta=args.huber_delta,
+                lbfgs_steps=args.lbfgs,
                 hidden_dims=(32, 32),
                 batch_size=8,
                 n_rz_inner_samples=64,
