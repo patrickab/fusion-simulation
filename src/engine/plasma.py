@@ -113,13 +113,22 @@ def boundary_normalized_radius(
     Z: jnp.ndarray,
     boundary: PlasmaBoundary,
 ) -> jnp.ndarray:
-    """Radius of (R, Z) relative to the boundary curve; exactly 1.0 on the boundary.
+    """Radius of (R, Z) relative to the boundary curve; ~1.0 on the boundary.
 
-    Interpolates the boundary's precomputed (R, Z) polyline by poloidal angle
-    (same technique as is_point_in_plasma). Used both for inside/outside tests
-    and as the hard-boundary-condition envelope in network.denormalize_psi.
+    Represents the boundary radius r(alpha) as a truncated Fourier series
+    fitted to the precomputed boundary points (ridge-regularized least
+    squares). Unlike the previous piecewise-linear angle interpolation, the
+    series is smooth in alpha, so second derivatives of the hard-BC envelope
+    (which enter the GS operator) carry no interpolation-kink noise — that
+    noise dominated the PDE residual near strongly shaped boundary tips.
 
-    Complexity: O(log N) per point due to binary search interpolation.
+    The fit is exact only up to truncation error (~1e-4 relative for the
+    worst-case D-shape at 32 harmonics; more harmonics hit float32
+    conditioning), so psi=0 is enforced on the fitted curve; the
+    model_evaluation boundary-leakage KPI tracks the effect.
+
+    Under an inner vmap over points the fit depends only on the (unbatched)
+    boundary, so it is computed once per config, not per point.
     """
     dR = R - boundary.R_center
     dZ = Z - boundary.Z_center
@@ -132,13 +141,20 @@ def boundary_normalized_radius(
     r_geom = jnp.sqrt(dR_boundary**2 + dZ_boundary**2)
     alpha_geom = jnp.arctan2(dZ_boundary, dR_boundary)
 
-    # Sort by angle to ensure valid interpolation input
-    sort_indices = jnp.argsort(alpha_geom)
-    alpha_geom = alpha_geom[sort_indices]
-    r_geom = r_geom[sort_indices]
+    n_harmonics = min(32, boundary.R.shape[0] // 4)
+    k = jnp.arange(1, n_harmonics + 1)
 
-    # period=2pi ensures correct wrapping for angles near -pi/pi.
-    r_boundary = jnp.interp(alpha_test, alpha_geom, r_geom, period=2 * jnp.pi)
+    def basis(alpha: jnp.ndarray) -> jnp.ndarray:
+        angles = alpha[..., None] * k
+        return jnp.concatenate(
+            [jnp.ones_like(alpha)[..., None], jnp.cos(angles), jnp.sin(angles)], axis=-1
+        )
+
+    design = basis(alpha_geom)
+    gram = design.T @ design + 1e-6 * jnp.eye(2 * n_harmonics + 1)
+    coeffs = jnp.linalg.solve(gram, design.T @ r_geom)
+
+    r_boundary = basis(alpha_test) @ coeffs
     return r_test / r_boundary
 
 
