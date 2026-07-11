@@ -46,3 +46,10 @@ export function plasma(t: number): [number, number, number] {
 export const plasmaGradient = `linear-gradient(90deg, ${STOPS.map(
   ([t, [r, g, b]]) => `rgb(${r},${g},${b}) ${t * 100}%`,
 ).join(', ')})`
+
+// Same stops as a Plotly `colorscale` array, for heatmaps (e.g. log|R_GS|) that
+// want the same dark->bright sequential map as the 3D field-line legend.
+export const plasmaPlotlyScale: [number, string][] = STOPS.map(([t, [r, g, b]]) => [
+  t,
+  `rgb(${r},${g},${b})`,
+])

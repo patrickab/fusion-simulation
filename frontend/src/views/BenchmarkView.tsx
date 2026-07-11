@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { api, benchmarkStream, useApi, type BenchmarkEvent, type Grid2D } from '../api'
-import { GridHeatmap, type Range2 } from '../plots'
-import { Panel, Section, Segmented, Slider, Spinner, Stat, Toggle } from '../ui'
+import { api, benchmarkStream, useApi, type BenchmarkEvent } from '../api'
+import { GridHeatmap } from '../plots'
+import { plasmaGradient, plasmaPlotlyScale } from '../three/colormap'
+import { Colorbar, Panel, Section, Segmented, Slider, Spinner, Stat, Toggle } from '../ui'
 
 const MODES = ['Flux Prediction', 'GS Residual', 'Both'] as const
 const MODE_LABELS = { 'Flux Prediction': 'Flux', 'GS Residual': 'Residual', Both: 'Both' } as const
@@ -17,7 +18,7 @@ export function BenchmarkView() {
   const [commit, setCommit] = useState('All')
   const [mode, setMode] = useState<(typeof MODES)[number]>('Both')
   const [seed, setSeed] = useState(0)
-  const [resolution, setResolution] = useState(80)
+  const [resolution, setResolution] = useState(100)
   const [rows, setRows] = useState<Row[]>([])
   const [running, setRunning] = useState(false)
   const [error, setError] = useState<string>()
@@ -94,7 +95,7 @@ export function BenchmarkView() {
             <Segmented options={MODES} value={mode} onChange={setMode} labels={MODE_LABELS} small />
           </div>
           <Slider label="Seed" value={seed} min={0} max={1000} onChange={setSeed} />
-          <Slider label="Resolution" value={resolution} min={40} max={160} step={20} onChange={setResolution} />
+          <Slider label="Resolution" value={resolution} min={40} max={200} step={20} onChange={setResolution} />
         </Section>
         <Section title="Run">
           {running ? (
@@ -137,10 +138,11 @@ export function BenchmarkView() {
 
 // ponytail: fixed scales matched to the legacy plot_flux_heatmap/plot_gs_residual_heatmap
 // (src/lib/visualization.py) — same absolute zmin/zmax across samples, not per-batch min/max
-function gridScales(grids: Grid2D[], centered: boolean) {
-  const zscale = centered ? { zmin: -0.5, zmax: 0.5 } : { zmin: 0, zmax: 90 }
-  const { R, Z } = grids[0] // all grids share one linspace
-  return { ...zscale, xr: [R[0], R[R.length - 1]] as Range2, yr: [Z[0], Z[Z.length - 1]] as Range2 }
+// (axis ranges are no longer shared across samples — each grid keeps its own true aspect)
+// Residual grids are log10|R_GS| (src/api/network.py), matching model_evaluation.py's
+// reference montage: -2..1 covers converged-to-diverging orders of magnitude.
+function gridScales(residual: boolean) {
+  return residual ? { zmin: -2, zmax: 1 } : { zmin: 0, zmax: 90 }
 }
 
 function BenchRow({ row }: { row: Extract<Row, { type: 'row' }> }) {
@@ -165,7 +167,7 @@ function BenchRow({ row }: { row: Extract<Row, { type: 'row' }> }) {
           </div>
           <div className="bench-grids">
             {row.flux_grids.map((g, i) => (
-              <GridHeatmap key={i} grid={g} {...gridScales(row.flux_grids!, false)} />
+              <GridHeatmap key={i} grid={g} {...gridScales(false)} />
             ))}
           </div>
         </>
@@ -177,9 +179,10 @@ function BenchRow({ row }: { row: Extract<Row, { type: 'row' }> }) {
           </div>
           <div className="bench-grids">
             {row.residual_grids.map((g, i) => (
-              <GridHeatmap key={i} grid={g} colorscale="RdBu" reversescale {...gridScales(row.residual_grids!, true)} />
+              <GridHeatmap key={i} grid={g} colorscale={plasmaPlotlyScale} {...gridScales(true)} />
             ))}
           </div>
+          <Colorbar title="log₁₀|R_GS|" gradient={plasmaGradient} range={[-2, 1]} />
         </>
       )}
     </div>
