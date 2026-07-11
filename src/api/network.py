@@ -9,7 +9,7 @@ import numpy as np
 from src.engine.model_evaluation import compute_gs_residual_on_points
 from src.engine.network import NetworkManager, Sampler
 from src.engine.physics import get_b_field_cartesian
-from src.engine.plasma import is_point_in_plasma
+from src.engine.plasma import boundary_normalized_radius, is_point_in_plasma
 from src.lib.geometry_config import CylindricalCoordinates, PlasmaGeometry, PlasmaState
 from src.lib.network_config import FluxInput
 from src.streamlit.network_utils import to_plasma_config
@@ -232,10 +232,13 @@ def build_bfield_grid(
     config = to_plasma_config(geom_3d, state_3d)
 
     R0, a, kappa = float(geom_3d.R0), float(geom_3d.a), float(geom_3d.kappa)
-    extent = R0 + a + 1.0
-    z_extent = (a * kappa) + 1.0
+    # Tight box: field lines live inside the plasma, so padding is wasted resolution.
+    extent = R0 + a + 0.5
+    z_extent = (a * kappa) + 0.5
 
-    nx = ny = nz = 30
+    # 48³ keeps the tracer's psi-drift (trilinear interpolation error, O(h²))
+    # at the few-percent level; 30³ drifted ~10% of the axis flux per line.
+    nx = ny = nz = 48
     xs = np.linspace(-extent, extent, nx)
     ys = np.linspace(-extent, extent, ny)
     zs = np.linspace(-z_extent, z_extent, nz)
@@ -249,7 +252,19 @@ def build_bfield_grid(
         jnp.array(Z.flatten()),
         config,
     )
-    vectors = np.asarray(vectors)
+    vectors = np.array(vectors)  # copy: asarray on a jax array is read-only
+
+    # Outside the boundary psi is meaningless extrapolation, and the hard-BC
+    # envelope makes |B| spike ~7x there, bleeding into edge cells through the
+    # tracer's trilinear interpolation. Zeroing it keeps edge cells clean and
+    # terminates streamlines at the plasma edge (|B| < threshold stops the JS
+    # integrator). 1.05 margin so boundary-straddling cells keep their inside nodes.
+    rho = boundary_normalized_radius(
+        jnp.array(np.sqrt(X.flatten() ** 2 + Y.flatten() ** 2)),
+        jnp.array(Z.flatten()),
+        config.Boundary,
+    )
+    vectors[np.asarray(rho) > 1.05] = 0.0
 
     seed_points = np.stack(
         [np.linspace(R0 - a * 0.9, R0 + a * 0.9, n_lines), np.zeros(n_lines), np.zeros(n_lines)],
