@@ -72,7 +72,7 @@ def delete_network(name: str) -> dict:
 @app.post("/api/network/{name:path}/sample")
 def network_sample(name: str, body: SampleRequest) -> dict:
     manager = state.get_manager(name)
-    return network.build_sample_response(manager, body.seed, body.sample_size)
+    return network.build_sample_response(manager, body.seed, body.sample_size, body.kpi_sample_size)
 
 
 @app.post("/api/network/{name:path}/flux")
@@ -111,7 +111,13 @@ def reactor_geometry(body: GeometryRequest) -> dict:
 def run_benchmark(body: BenchmarkRequest) -> StreamingResponse:
     return StreamingResponse(
         benchmark.run_benchmark(
-            body.networks, body.commit, body.mode, body.seed, body.sample_size, body.resolution
+            body.networks,
+            body.commit,
+            body.mode,
+            body.seed,
+            body.sample_size,
+            body.resolution,
+            body.kpi_sample_size,
         ),
         media_type="text/event-stream",
     )

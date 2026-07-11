@@ -2,11 +2,16 @@
 import { useEffect, useState } from 'react'
 
 export interface Metrics {
-  avg_loss: number
-  interior_loss: number
-  boundary_loss: number
-  max_loss: number
-  max_residual: number
+  loss_median: number
+  loss_mean: number
+  loss_p95: number
+  loss_p05: number
+  core_loss_median: number
+  core_loss_mean: number
+  core_loss_p95: number
+  core_loss_p05: number
+  edge_loss_p95: number
+  boundary_leak_max: number
 }
 
 export interface Sample {
@@ -32,6 +37,8 @@ export interface SampleResponse {
   geom3d: Geom3D
   state3d: { p0: number; F_axis: number; pressure_alpha: number; field_exponent: number }
 }
+
+export type GridQuantity = 'flux' | 'residual'
 
 export interface Grid2D {
   theta: number[]
@@ -62,7 +69,7 @@ export interface BFieldResponse {
 }
 
 export type BenchmarkEvent =
-  | { type: 'row'; network: string; config: Record<string, unknown>; flux_grids?: Grid2D[]; residual_grids?: Grid2D[] }
+  | { type: 'row'; network: string; config: Record<string, unknown>; kpis: Metrics; flux_grids?: Grid2D[]; residual_grids?: Grid2D[] }
   | { type: 'row_error'; network: string; message: string }
   | { type: 'error'; message: string }
   | { type: 'done' }
@@ -91,12 +98,14 @@ export const api = {
   rename: (name: string, newName: string) =>
     post<{ name: string }>(`/api/network/${enc(name)}/rename`, { new_name: newName }),
   remove: (name: string) => fetch(`/api/network/${enc(name)}`, { method: 'DELETE' }).then((r) => toJson(r)),
-  sample: (name: string, seed: number, sampleSize: number) =>
-    post<SampleResponse>(`/api/network/${enc(name)}/sample`, { seed, sample_size: sampleSize }),
-  flux: (name: string, seed: number, sampleSize: number, resolution: number) =>
-    post<Grid2D[]>(`/api/network/${enc(name)}/flux`, { seed, sample_size: sampleSize, resolution }),
-  residual: (name: string, seed: number, sampleSize: number, resolution: number) =>
-    post<Grid2D[]>(`/api/network/${enc(name)}/residual`, { seed, sample_size: sampleSize, resolution }),
+  sample: (name: string, seed: number, sampleSize: number, kpiSampleSize: number) =>
+    post<SampleResponse>(`/api/network/${enc(name)}/sample`, {
+      seed,
+      sample_size: sampleSize,
+      kpi_sample_size: kpiSampleSize,
+    }),
+  grid: (name: string, quantity: GridQuantity, seed: number, sampleSize: number, resolution: number) =>
+    post<Grid2D[]>(`/api/network/${enc(name)}/${quantity}`, { seed, sample_size: sampleSize, resolution }),
   bfield: (name: string, seed: number, sampleSize: number, nLines: number) =>
     post<BFieldResponse>(`/api/network/${enc(name)}/bfield`, { seed, sample_size: sampleSize, n_lines: nLines }),
   geometry: (body: GeometryRequest) => post<GeometryResponse>('/api/geometry', body),
@@ -110,6 +119,7 @@ export async function* benchmarkStream(
     seed: number
     sample_size: number
     resolution: number
+    kpi_sample_size: number
   },
   signal: AbortSignal,
 ): AsyncGenerator<BenchmarkEvent> {

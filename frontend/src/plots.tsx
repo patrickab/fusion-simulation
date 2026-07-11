@@ -1,7 +1,8 @@
 import type { ReactNode } from 'react'
-import type { ColorScale, Data, Layout } from 'plotly.js'
+import type { Data, Layout } from 'plotly.js'
 import { Plot, baseConfig, baseLayout } from './plotly'
-import type { GeometryResponse, Grid2D, Sample } from './api'
+import type { GeometryResponse, Grid2D, GridQuantity, Sample } from './api'
+import { plasmaPlotlyScale } from './three/colormap'
 
 export type Range2 = [number, number]
 
@@ -35,16 +36,10 @@ function PlotSquare({ children, aspect = 1 }: { children: ReactNode; aspect?: nu
 
 export function GridHeatmap({
   grid,
-  colorscale = 'Viridis',
-  reversescale = false,
-  zmin,
-  zmax,
+  quantity,
 }: {
   grid: Grid2D
-  colorscale?: ColorScale
-  reversescale?: boolean
-  zmin?: number
-  zmax?: number
+  quantity: GridQuantity
 }) {
   const boundary = orderBoundary(grid.boundary_R, grid.boundary_Z)
   // grid.R/Z are 2D — one physical (R, Z) point per (theta, rho) sample, all of
@@ -59,8 +54,9 @@ export function GridHeatmap({
   // coerced back to the default 'start' and litters the plot with labels
   const noAxisLines = { showgrid: false, showline: false, showticklabels: 'none', startline: false, endline: false }
   const flatV = grid.values.flat()
-  const lo = zmin ?? Math.min(...flatV)
-  const hi = zmax ?? Math.max(...flatV)
+  const { colorscale, lo, hi } = quantity === 'residual'
+    ? { colorscale: plasmaPlotlyScale, lo: -2, hi: 1 }
+    : { colorscale: 'Viridis', lo: 0, hi: 90 }
   const data: Data[] = [
     {
       type: 'carpet',
@@ -79,7 +75,6 @@ export function GridHeatmap({
       b: grid.rho,
       z: grid.values,
       colorscale,
-      reversescale,
       zmin: lo,
       zmax: hi,
       // contourcarpet has no 'heatmap' coloring (unlike contour) — 48 fill
