@@ -1,9 +1,4 @@
-"""Optuna-based hyperparameter optimization with physics-based validation.
-
-Uses a fixed validation set of Sobol-sampled plasma configs to evaluate generalization.
-Validation loss uses forward pass only (no gradient computation) via make_psi_fn,
-computed every val_eval_frequency epochs for pruning decisions.
-"""
+"""Optuna hyperparameter search using the standard network training path."""
 
 import argparse
 from collections import deque
@@ -18,10 +13,8 @@ from pathlib import Path
 from typing import Any
 
 import jax
-import jax.numpy as jnp
-import numpy as np
 import optuna
-from optuna.pruners import HyperbandPruner
+from optuna.pruners import HyperbandPruner, NopPruner
 from optuna.samplers import TPESampler
 from rich import box
 from rich.console import Console, Group
@@ -29,23 +22,18 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
-from scipy.stats import qmc
 
 from src.engine.network import NetworkManager
 from src.lib.logger import get_logger
-from src.lib.network_config import DomainBounds, HyperParams
+from src.lib.network_config import HyperParams
 
 logger = get_logger(name="OptunaHPO", log_dir="logs/hpo")
 console = Console(width=160)
 
-K_EXPERIMENTS = 3
-K_MOVING_AVERAGE = 4
-VALIDATION_FREQUENCY = 20
-
 
 @dataclass
 class SearchSpaceConfig:
-    """Hyperparameter search bounds for Optuna HPO."""
+    """Search bounds and fixed experiment settings."""
 
     depth_range: tuple[int, int] = (4, 5)
     width_choices: tuple[int, ...] = (128, 160, 200)
@@ -56,65 +44,24 @@ class SearchSpaceConfig:
 
     weight_boundary_condition: float = 10.0
     n_rz_inner: int = 512
+    n_rz_boundary: int = 128
+    batch_size: int = 64
+    n_train: int = 1024
     total_epochs: int = 600
     warmup_ratio: float = 0.167
-
-    batch_size: int = 32
-    n_train: int = 1024
-    n_rz_boundary: int = 128
-
     n_validate: int = 128
-    val_eval_frequency: int = VALIDATION_FREQUENCY
 
     min_epochs: int = 50
     n_trials: int = 50
-    top_k: int = K_EXPERIMENTS
+    top_k: int = 3
     n_startup_trials: int = 10
 
-
-def create_validation_configs(
-    config: SearchSpaceConfig,
-) -> dict[str, Any]:
-    """Create fixed validation plasma configs on CPU (numpy)."""
-    lower, upper = DomainBounds.get_bounds()
-
-    sobol = qmc.Sobol(d=len(lower), scramble=True, seed=123)
-    samples = sobol.random(config.n_validate)
-    plasma_configs = np.array(qmc.scale(samples, lower, upper), dtype=np.float32)
-
-    return {"plasma_configs": plasma_configs}
-
-
-def _calculate_validation_loss(
-    manager: NetworkManager,
-    val_data: dict[str, np.ndarray],
-    n_rz_inner: int,
-    n_rz_boundary: int,
-) -> float:
-    """Calculate validation loss in chunks using fast, gradient-free eval_step."""
-    plasma_configs = val_data["plasma_configs"]
-    n_configs = len(plasma_configs)
-
-    # Large chunk size to maximize GPU throughput during validation.
-    # We use a fixed large chunk as validation doesn't track gradients, saving VRAM.
-    chunk_size = 128
-    total_loss = 0.0
-    n_chunks = 0
-
-    weight_bc = manager.config.weight_boundary_condition
-    sampler = manager.sampler
-    sampler.precompute_coordinate_samples(n_rz_inner, n_rz_boundary)
-
-    for i in range(0, n_configs, chunk_size):
-        end = min(i + chunk_size, n_configs)
-        batch = jnp.array(plasma_configs[i:end], dtype=jnp.float32)
-        inputs = sampler.sample_flux_input(plasma_configs=batch)
-
-        loss, _, _, _ = manager.eval_step(manager.state, inputs, weight_bc)
-        total_loss += float(loss)
-        n_chunks += 1
-
-    return total_loss / n_chunks
+    huber_delta: float = 1.0
+    n_fourier_features: int = 64
+    lbfgs_steps: int = 0
+    study_name: str = "pinn_hpo"
+    prune_trials: bool = True
+    save_all: bool = False
 
 
 class OptunaProgressDisplay:
@@ -122,10 +69,10 @@ class OptunaProgressDisplay:
 
     def __init__(self, config: SearchSpaceConfig, prior_trials: int = 0) -> None:
         self.config = config
-        # ponytail: rolling window, not full history — an ever-growing table eventually
-        # taller than the terminal desyncs Rich's cursor-based redraw on scroll
+        # Keep a rolling window: an ever-growing table eventually exceeds the terminal height
+        # and desynchronizes Rich's cursor-based redraw when the terminal scrolls.
         self._trials_data: deque[dict[str, Any]] = deque(maxlen=15)
-        self._best_configs = []
+        self._best_configs: list[tuple[dict[str, Any], float]] = []
         self._best_loss, self._start_time = float("inf"), datetime.now()
         self._counts = {"pruned": 0, "failed": 0, "done": 0}
         self._trials_processed, self._prior_trials = 0, prior_trials
@@ -144,12 +91,15 @@ class OptunaProgressDisplay:
             "[magenta]Epochs:  ", total=self.config.total_epochs, visible=False
         )
         self._live = Live(
-            self._build_layout(), refresh_per_second=4, console=console, vertical_overflow="visible"
+            self._build_layout(),
+            refresh_per_second=4,
+            console=console,
+            vertical_overflow="visible",
         )
 
     def _get_trials_table(self) -> Table:
-        t = Table(title="Previous Trials", show_header=True, header_style="bold cyan")
-        for c in [
+        table = Table(title="Previous Trials", show_header=True, header_style="bold cyan")
+        for column in [
             "Trial",
             "Depth",
             "Width",
@@ -160,12 +110,12 @@ class OptunaProgressDisplay:
             "Val Loss",
             "Status",
         ]:
-            t.add_column(c, justify="left" if c == "Status" else "right")
-        for d in self._trials_data:
-            t.add_row(
+            table.add_column(column, justify="left" if column == "Status" else "right")
+        for data in self._trials_data:
+            table.add_row(
                 *[
-                    str(d.get(k, "?"))
-                    for k in [
+                    str(data.get(key, "?"))
+                    for key in (
                         "trial",
                         "depth",
                         "width",
@@ -175,16 +125,18 @@ class OptunaProgressDisplay:
                         "sig",
                         "loss",
                         "status",
-                    ]
+                    )
                 ]
             )
-        return t
+        return table
 
     def _get_best_table(self) -> Table:
-        t = Table(
-            title=f"Top {self.config.top_k} Configs", show_header=True, header_style="bold green"
+        table = Table(
+            title=f"Top {self.config.top_k} Configs",
+            show_header=True,
+            header_style="bold green",
         )
-        for c in [
+        for column in [
             "Rank",
             "Depth",
             "Width",
@@ -194,77 +146,74 @@ class OptunaProgressDisplay:
             "Sig Adapt Sampling",
             "Val Loss",
         ]:
-            t.add_column(c, justify="right")
-        for rank, (p, loss) in enumerate(self._best_configs, 1):
-            t.add_row(
+            table.add_column(column, justify="right")
+        for rank, (params, loss) in enumerate(self._best_configs, 1):
+            table.add_row(
                 str(rank),
-                str(p.get("depth", "?")),
-                str(p.get("width", "?")),
-                f"{p.get('lr_max', 0):.2e}",
-                f"{p.get('lr_min', 0):.2e}",
-                f"{p.get('wd', 0):.2e}",
-                f"{p.get('sig', 0):.3f}",
+                str(params.get("depth", "?")),
+                str(params.get("width", "?")),
+                f"{params.get('lr_max', 0):.2e}",
+                f"{params.get('lr_min', 0):.2e}",
+                f"{params.get('wd', 0):.2e}",
+                f"{params.get('sig', 0):.3f}",
                 f"{loss:.4f}",
             )
-        return t
+        return table
 
     def _build_layout(self) -> Panel:
         elapsed_str = str(datetime.now() - self._start_time).split(".")[0]
         summary = (
-            f"[bold]Best Val Loss:[/] {self._best_loss:.4f}  |  [bold]Elapsed:[/] {elapsed_str}\n"
-            f"Session: {self._counts['done']} done  |  {self._counts['pruned']} pruned  |  {self._counts['failed']} failed"
+            f"[bold]Best Val Loss:[/] {self._best_loss:.4f}  |  "
+            f"[bold]Elapsed:[/] {elapsed_str}\n"
+            f"Session: {self._counts['done']} done  |  {self._counts['pruned']} pruned  |  "
+            f"{self._counts['failed']} failed"
             + (f"  |  Prior: {self._prior_trials}" if self._prior_trials else "")
         )
 
-        curr_table = Table(show_header=False, box=box.SIMPLE)
+        current_table = Table(show_header=False, box=box.SIMPLE)
         if self._current_trial_info:
-            ct, p = self._current_trial_info, self._current_trial_info["params"]
-            val = ct.get("val_loss")
-            title, rows = (
-                f"Current Trial: {ct['trial']}",
-                [
-                    ("Architecture:", f"{p.get('depth')}x{p.get('width')}"),
-                    ("Max LR:", f"{p.get('lr_max', 0):.2e}"),
-                    ("Min LR:", f"{p.get('lr_min', 0):.2e}"),
-                    ("Weight Decay:", f"{p.get('wd', 0):.2e}"),
-                    ("Sigma Res:", f"{p.get('sig', 0):.3f}"),
-                    (
-                        "Recent Val Loss:",
-                        f"[bold cyan]{val:.4f}[/bold cyan]"
-                        if val is not None
-                        else "[bold cyan]--[/bold cyan]",
-                    ),
-                ],
-            )
+            current = self._current_trial_info
+            params = current["params"]
+            val_loss = current.get("val_loss")
+            title = f"Current Trial: {current['trial']}"
+            rows = [
+                ("Architecture:", f"{params.get('depth')}x{params.get('width')}"),
+                ("Max LR:", f"{params.get('lr_max', 0):.2e}"),
+                ("Min LR:", f"{params.get('lr_min', 0):.2e}"),
+                ("Weight Decay:", f"{params.get('wd', 0):.2e}"),
+                ("Sigma Res:", f"{params.get('sig', 0):.3f}"),
+                (
+                    "Recent Val Loss:",
+                    f"[bold cyan]{val_loss:.4f}[/bold cyan]"
+                    if val_loss is not None
+                    else "[bold cyan]--[/bold cyan]",
+                ),
+            ]
         else:
-            title, rows = (
-                "Current Trial: ---",
-                [
-                    (k, "---" if "Loss" not in k else "[bold cyan]---[/bold cyan]")
-                    for k in [
-                        "Architecture:",
-                        "Max LR:",
-                        "Min LR:",
-                        "Weight Decay:",
-                        "Sigma Res:",
-                        "Recent Val Loss:",
-                    ]
-                ],
-            )
+            title = "Current Trial: ---"
+            rows = [
+                (key, "---" if "Loss" not in key else "[bold cyan]---[/bold cyan]")
+                for key in (
+                    "Architecture:",
+                    "Max LR:",
+                    "Min LR:",
+                    "Weight Decay:",
+                    "Sigma Res:",
+                    "Recent Val Loss:",
+                )
+            ]
+        current_table.title = title
+        for key, value in rows:
+            current_table.add_row(key, value)
 
-        curr_table.title = title
-        for k, v in rows:
-            curr_table.add_row(k, v)
-
-        elements = [
-            self._progress,
-            summary,
-            self._get_best_table(),
-            Panel(curr_table, border_style="magenta"),
-            self._get_trials_table(),
-        ]
         return Panel(
-            Group(*elements),
+            Group(
+                self._progress,
+                summary,
+                self._get_best_table(),
+                Panel(current_table, border_style="magenta"),
+                self._get_trials_table(),
+            ),
             title="[bold cyan]PINN HPO Optimization[/bold cyan]",
             border_style="cyan",
         )
@@ -292,9 +241,7 @@ class OptunaProgressDisplay:
         self._live.update(self._build_layout())
 
     def would_qualify_for_top_k(self, loss: float) -> bool:
-        if len(self._best_configs) < self.config.top_k:
-            return True
-        return loss < self._best_configs[-1][1]
+        return len(self._best_configs) < self.config.top_k or loss < self._best_configs[-1][1]
 
     def update(
         self,
@@ -313,13 +260,12 @@ class OptunaProgressDisplay:
 
         if loss is not None:
             self._best_configs.append((params.copy(), loss))
-            self._best_configs.sort(key=lambda x: x[1])
+            self._best_configs.sort(key=lambda item: item[1])
             self._best_configs = self._best_configs[: self.config.top_k]
             self._best_loss = self._best_configs[0][1]
 
-        c = {"pruned": "yellow", "failed": "red", "done": "green"}.get(status, "white")
-        status_str = f"[{c}]{status}" + (f" @ {epoch}" if epoch is not None else "") + "[/]"
-
+        color = {"pruned": "yellow", "failed": "red", "done": "green"}.get(status, "white")
+        status_text = f"[{color}]{status}" + (f" @ {epoch}" if epoch is not None else "") + "[/]"
         self._trials_data.append(
             {
                 "trial": trial_num,
@@ -330,7 +276,7 @@ class OptunaProgressDisplay:
                 "wd": f"{params.get('wd', 0):.2e}",
                 "sig": f"{params.get('sig', 0):.3f}",
                 "loss": f"{loss:.4f}" if loss is not None else "--",
-                "status": status_str,
+                "status": status_text,
             }
         )
         self._live.update(self._build_layout())
@@ -343,69 +289,64 @@ class OptunaProgressDisplay:
         self._live.__exit__(*args)
 
 
-def check_capacity(config: SearchSpaceConfig) -> None:
-    """Verify largest architecture fits in GPU memory before starting HPO."""
-    max_depth = config.depth_range[1]
-    max_width = max(config.width_choices)
+def build_hyperparams(trial: optuna.Trial, config: SearchSpaceConfig) -> HyperParams:
+    """Sample trainable hyperparameters and apply the study's fixed settings."""
+    depth = trial.suggest_int("depth", *config.depth_range)
+    width = trial.suggest_categorical("width", config.width_choices)
+    lr_max = trial.suggest_float("lr_max", *config.lr_max_range, log=True)
+    lr_min_ratio = trial.suggest_float("lr_min_ratio", *config.lr_min_ratio_range, log=True)
 
-    test_config = HyperParams(
-        hidden_dims=tuple([max_width] * max_depth),
+    warmup_epochs = int(config.total_epochs * config.warmup_ratio)
+    return HyperParams(
+        hidden_dims=(width,) * depth,
+        learning_rate_max=lr_max,
+        learning_rate_min=lr_max * lr_min_ratio,
+        weight_decay=trial.suggest_float(
+            "weight_decay", *config.weight_decay_range, log=True
+        ),
+        weight_boundary_condition=config.weight_boundary_condition,
+        sigma_residual_adaptive_sampling=trial.suggest_float(
+            "sigma_residual", *config.sigma_residual_range
+        ),
+        n_rz_inner_samples=config.n_rz_inner,
+        n_rz_boundary_samples=config.n_rz_boundary,
+        warmup_epochs=warmup_epochs,
+        decay_epochs=config.total_epochs - warmup_epochs,
+        batch_size=config.batch_size,
+        n_train=config.n_train,
+        huber_delta=config.huber_delta,
+        n_fourier_features=config.n_fourier_features,
+        lbfgs_steps=config.lbfgs_steps,
+    )
+
+
+def check_capacity(config: SearchSpaceConfig) -> None:
+    """Verify that the largest architecture fits before starting the study."""
+    hp = HyperParams(
+        hidden_dims=(max(config.width_choices),) * config.depth_range[1],
         learning_rate_max=1e-3,
         n_rz_inner_samples=config.n_rz_inner,
         n_rz_boundary_samples=config.n_rz_boundary,
         batch_size=config.batch_size,
         warmup_epochs=10,
         decay_epochs=10,
+        huber_delta=config.huber_delta,
+        n_fourier_features=config.n_fourier_features,
     )
-
-    try:
-        manager = NetworkManager(test_config)
-        manager.train_epoch(0)
-        jax.clear_caches()
-        logger.info(f"Capacity check passed: {max_depth}x{max_width}")
-    except Exception as e:
-        logger.error(f"Capacity check failed: {e}")
-        raise RuntimeError("Reduce search space - OOM on max architecture") from e
-
-
-def build_hyperparams(trial: optuna.Trial, config: SearchSpaceConfig) -> HyperParams:
-    """Sample hyperparameters from search space using define-by-run."""
-    depth = trial.suggest_int("depth", *config.depth_range)
-    width = trial.suggest_categorical("width", config.width_choices)
-
-    lr_max = trial.suggest_float("lr_max", *config.lr_max_range, log=True)
-    lr_min_ratio = trial.suggest_float("lr_min_ratio", *config.lr_min_ratio_range, log=True)
-    weight_decay = trial.suggest_float("weight_decay", *config.weight_decay_range, log=True)
-    sigma_residual = trial.suggest_float("sigma_residual", *config.sigma_residual_range)
-    return HyperParams(
-        hidden_dims=tuple([width] * depth),
-        learning_rate_max=lr_max,
-        learning_rate_min=lr_max * lr_min_ratio,
-        weight_decay=weight_decay,
-        weight_boundary_condition=config.weight_boundary_condition,
-        sigma_residual_adaptive_sampling=sigma_residual,
-        n_rz_inner_samples=config.n_rz_inner,
-        n_rz_boundary_samples=config.n_rz_boundary,
-        warmup_epochs=int(config.total_epochs * config.warmup_ratio),
-        decay_epochs=config.total_epochs - int(config.total_epochs * config.warmup_ratio),
-        batch_size=config.batch_size,
-        n_train=config.n_train,
-    )
+    manager = NetworkManager(hp, n_validation_size=config.n_validate)
+    manager.train_epoch(0)
+    jax.clear_caches()
+    logger.info(f"Capacity check passed: {config.depth_range[1]}x{max(config.width_choices)}")
 
 
 def objective(
     trial: optuna.Trial,
     config: SearchSpaceConfig,
     display: OptunaProgressDisplay,
-    val_data: dict[str, np.ndarray],
 ) -> float:
-    """Train trial and return validation loss for unbiased HPO.
-
-    Validation loss evaluated every val_eval_frequency epochs to balance
-    generalization signal with computational overhead.
-    """
+    """Train one normally configured network and report validation loss to Optuna."""
     hp = build_hyperparams(trial, config)
-    params_for_display = {
+    display_params = {
         "depth": len(hp.hidden_dims),
         "width": hp.hidden_dims[0],
         "lr_max": hp.learning_rate_max,
@@ -413,184 +354,173 @@ def objective(
         "wd": hp.weight_decay,
         "sig": hp.sigma_residual_adaptive_sampling,
     }
+    manager = NetworkManager(hp, n_validation_size=config.n_validate)
+    total_epochs = hp.warmup_epochs + hp.decay_epochs
+    display.start_trial(trial.number + 1, display_params, total_epochs)
+    last_epoch = 0
+
+    def report(epoch: int, val_loss: float | None) -> None:
+        nonlocal last_epoch
+        last_epoch = epoch
+        display.update_epoch(epoch, val_loss)
+        if val_loss is not None:
+            trial.report(val_loss, epoch)
+            if config.prune_trials and trial.should_prune():
+                raise optuna.TrialPruned
 
     try:
-        manager = NetworkManager(hp)
-        total_epochs = hp.warmup_epochs + hp.decay_epochs
-        val_loss = float("inf")
-        val_loss_history: list[float] = []
-        display.start_trial(trial.number + 1, params_for_display, total_epochs)
-
-        for epoch in range(total_epochs):
-            manager.train_epoch(epoch)
-
-            if epoch >= config.min_epochs and epoch % config.val_eval_frequency == 0:
-                val_loss = _calculate_validation_loss(
-                    manager, val_data, config.n_rz_inner, config.n_rz_boundary
-                )
-                val_loss_history.append(val_loss)
-                if len(val_loss_history) > K_MOVING_AVERAGE:
-                    val_loss_history.pop(0)
-                avg_val_loss = sum(val_loss_history) / len(val_loss_history)
-                trial.report(avg_val_loss, epoch)
-
-                if trial.should_prune():
-                    display.update(trial.number + 1, params_for_display, None, "pruned", epoch)
-                    raise optuna.TrialPruned
-
-            # Update live epoch progress display
-            display.update_epoch(epoch + 1, val_loss if val_loss != float("inf") else None)
-
-        val_loss = _calculate_validation_loss(
-            manager, val_data, config.n_rz_inner, config.n_rz_boundary
+        val_loss = manager.train(
+            save_to_disk=config.save_all,
+            validation_callback=report,
+            show_progress=False,
         )
-        if display.would_qualify_for_top_k(val_loss):
-            manager.to_disk()
-        jax.clear_caches()
-        display.update(trial.number + 1, params_for_display, val_loss, "done", total_epochs)
+        if not config.save_all:
+            completed = sorted(
+                t.value
+                for t in trial.study.get_trials(states=(optuna.trial.TrialState.COMPLETE,))
+                if t.value is not None
+            )
+            if len(completed) < config.top_k or val_loss < completed[config.top_k - 1]:
+                manager.to_disk()
+        display.update(trial.number + 1, display_params, val_loss, "done", total_epochs)
         return val_loss
-
     except optuna.TrialPruned:
+        display.update(trial.number + 1, display_params, None, "pruned", last_epoch)
         raise
     except Exception:
-        logger.exception(f"Trial {trial.number} failed")
-        display.update(
-            trial.number + 1,
-            params_for_display,
-            None,
-            "failed",
-            epoch if "epoch" in locals() else None,
-        )
-        return float("inf")
+        display.update(trial.number + 1, display_params, None, "failed", last_epoch)
+        raise
+    finally:
+        jax.clear_caches()
 
 
-def get_warmstart_config() -> dict[str, Any]:
-    """Return best known configuration for warm-starting optimization."""
-    return {
+def get_warmstart_config(config: SearchSpaceConfig) -> dict[str, Any] | None:
+    """Return the best known configuration when it belongs to the search space."""
+    warmstart = {
         "depth": 4,
         "width": 128,
         "lr_max": 0.002,
         "lr_min_ratio": 0.025,
         "weight_decay": 1e-7,
         "sigma_residual": 0.05,
-
     }
+    if config.depth_range[0] <= warmstart["depth"] <= config.depth_range[1] and warmstart[
+        "width"
+    ] in config.width_choices:
+        return warmstart
+    return None
 
 
 def _save_top_configs(results: list[tuple[HyperParams, float]], study: optuna.Study) -> None:
-    """Persist top-k configs with full hyperparameter details to JSON."""
     output_dir = Path("logs/hpo")
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    output_file = output_dir / f"top_k_configs_{timestamp}.json"
-
-    data = {
-        "study_name": study.study_name,
-        "n_trials": len(study.trials),
-        "n_completed": sum(1 for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE),
-        "n_pruned": sum(1 for t in study.trials if t.state == optuna.trial.TrialState.PRUNED),
-        "best_loss": results[0][1] if results else None,
-        "top_k": [
-            {"rank": i + 1, "loss": loss, "config": hp.to_dict()}
-            for i, (hp, loss) in enumerate(results)
-        ],
-    }
-
-    output_file.write_text(json.dumps(data, indent=2))
-    logger.info(f"Top-k configs saved to: {output_file}")
+    output_file = output_dir / f"top_{study.study_name}_{datetime.now():%Y%m%d_%H%M}.json"
+    output_file.write_text(
+        json.dumps(
+            {
+                "study_name": study.study_name,
+                "n_trials": len(study.trials),
+                "n_completed": sum(
+                    t.state == optuna.trial.TrialState.COMPLETE for t in study.trials
+                ),
+                "n_pruned": sum(t.state == optuna.trial.TrialState.PRUNED for t in study.trials),
+                "best_loss": results[0][1] if results else None,
+                "top_k": [
+                    {"rank": rank, "loss": loss, "config": hp.to_dict()}
+                    for rank, (hp, loss) in enumerate(results, 1)
+                ],
+            },
+            indent=2,
+        )
+    )
+    logger.info(f"Top configurations saved to {output_file}")
 
 
 def run_optimization(
-    config: SearchSpaceConfig | None = None, restart: bool = False
+    config: SearchSpaceConfig | None = None,
+    restart: bool = False,
 ) -> list[tuple[HyperParams, float]]:
-    """Execute HPO study with validation-based pruning and return top-k configs."""
+    """Run or resume a study and return its best configurations."""
     config = config or SearchSpaceConfig()
     check_capacity(config)
-
-    # Disable Optuna's default stdout logging to prevent rich Live display corruption
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    val_data = create_validation_configs(config)
-
-    storage_path = Path("logs/hpo/optuna_study.db")
+    storage_path = Path("logs/hpo") / f"{config.study_name}.db"
     storage_path.parent.mkdir(parents=True, exist_ok=True)
-
     if restart and storage_path.exists():
         storage_path.unlink()
-        logger.info("Deleted existing study database")
 
     study = optuna.create_study(
-        study_name="pinn_hpo",
+        study_name=config.study_name,
         storage=f"sqlite:///{storage_path}",
         load_if_exists=not restart,
         direction="minimize",
         sampler=TPESampler(seed=42, n_startup_trials=config.n_startup_trials),
-        pruner=HyperbandPruner(
-            min_resource=config.min_epochs,
-            max_resource=config.total_epochs,
-            reduction_factor=2,
+        pruner=(
+            HyperbandPruner(
+                min_resource=config.min_epochs,
+                max_resource=config.total_epochs,
+                reduction_factor=2,
+            )
+            if config.prune_trials
+            else NopPruner()
         ),
     )
+    if not study.trials:
+        warmstart = get_warmstart_config(config)
+        if warmstart is not None:
+            study.enqueue_trial(warmstart)
 
-    if len(study.trials) == 0:
-        study.enqueue_trial(get_warmstart_config())
-
-    prior_trials = sum(1 for t in study.trials if t.state != optuna.trial.TrialState.WAITING)
-    remaining_trials = max(0, config.n_trials - prior_trials)
-    if remaining_trials == 0:
-        logger.info(
-            f"Study already has {prior_trials} trials (target: {config.n_trials}). Nothing to run."
+    prior_trials = sum(t.state != optuna.trial.TrialState.WAITING for t in study.trials)
+    with OptunaProgressDisplay(config, prior_trials=prior_trials) as display:
+        study.optimize(
+            lambda trial: objective(trial, config, display),
+            n_trials=max(0, config.n_trials - prior_trials),
+            catch=(Exception,),
         )
-        display = OptunaProgressDisplay(config, prior_trials=prior_trials)
-    else:
-        display = OptunaProgressDisplay(config, prior_trials=prior_trials)
-        with display:
-            study.optimize(
-                lambda trial: objective(trial, config, display, val_data),
-                n_trials=remaining_trials,
-                show_progress_bar=False,
-            )
 
-    complete_trials = sorted(
-        [
+    complete = sorted(
+        (
             t
             for t in study.trials
-            if t.state == optuna.trial.TrialState.COMPLETE and t.value < float("inf")
-        ],
-        key=lambda t: t.value,
+            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+        ),
+        key=lambda trial: trial.value,
     )[: config.top_k]
-
-    results = [(build_hyperparams(t, config), t.value) for t in complete_trials]
-
-    console.print("\n" + "=" * 80)
-    console.print("[bold green]HPO COMPLETE - TOP CONFIGURATIONS[/bold green]")
-    console.print("=" * 80)
-    for i, (hp, loss) in enumerate(results, 1):
-        console.print(f"\n[bold]Rank {i}:[/] Val Loss: {loss:.4f}")
-        console.print(f"  Architecture:  {len(hp.hidden_dims)}x{hp.hidden_dims[0]}")
-        console.print(f"  LR max:        {hp.learning_rate_max:.2e}")
-        console.print(f"  LR min:        {hp.learning_rate_min:.2e}")
-        console.print(f"  Weight decay:  {hp.weight_decay:.2e}")
-        console.print(f"  Sigma:         {hp.sigma_residual_adaptive_sampling:.3f}")
-        console.print(f"  Warmup epochs: {hp.warmup_epochs}")
-    console.print("\n" + "=" * 80 + "\n")
-
+    results = [(build_hyperparams(trial, config), trial.value) for trial in complete]
+    for rank, (hp, loss) in enumerate(results, 1):
+        architecture = f"{len(hp.hidden_dims)}x{hp.hidden_dims[0]}"
+        logger.info(
+            f"Rank {rank}: loss={loss:.6f}, architecture={architecture}, "
+            f"lr={hp.learning_rate_max:.2e}"
+        )
     _save_top_configs(results, study)
     return results
 
 
-if __name__ == "__main__":
+def main() -> None:
     parser = argparse.ArgumentParser(description="Optuna HPO for PINN")
-    parser.add_argument(
-        "--restart-experiment", action="store_true", help="Delete existing study and start fresh"
-    )
-    parser.add_argument(
-        "--test", action="store_true", help="Run with minimal parameters for rapid iteration"
-    )
+    parser.add_argument("--restart-experiment", action="store_true")
+    parser.add_argument("--test", action="store_true")
+    parser.add_argument("--variant", choices=("mse", "huber_ff64_lbfgs"))
+    parser.add_argument("--n-trials", type=int)
+    parser.add_argument("--full-trials", action="store_true")
+    parser.add_argument("--save-all", action="store_true")
     args = parser.parse_args()
 
     config = SearchSpaceConfig()
+    if args.variant == "mse":
+        config.huber_delta = 0.0
+        config.n_fourier_features = 0
+        config.study_name = "pinn_hpo_mse"
+    elif args.variant == "huber_ff64_lbfgs":
+        config.lbfgs_steps = 300
+        config.study_name = "pinn_hpo_huber_ff64_lbfgs"
+    if args.n_trials is not None:
+        config.n_trials = args.n_trials
+    config.prune_trials = not args.full_trials
+    config.save_all = args.save_all
+
     if args.test:
         config.batch_size = 8
         config.n_train = 64
@@ -605,8 +535,8 @@ if __name__ == "__main__":
         config.n_startup_trials = 2
         args.restart_experiment = True
 
-    try:
-        run_optimization(config, restart=args.restart_experiment)
-    except KeyboardInterrupt:
-        logger.info("\nOptimization interrupted. Study saved to SQLite.")
-        jax.clear_caches()
+    run_optimization(config, restart=args.restart_experiment)
+
+
+if __name__ == "__main__":
+    main()
