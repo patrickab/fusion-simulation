@@ -1,5 +1,7 @@
+import contextlib
 import math
 from pathlib import Path
+import shutil
 
 import jax.numpy as jnp
 import plotly.graph_objects as go
@@ -7,6 +9,10 @@ import plotly.graph_objects as go
 from src.engine.plasma import calculate_poloidal_boundary
 from src.lib.config import Filepaths
 from src.lib.geometry_config import PlasmaConfig, PlasmaGeometry, PlasmaState, RotationalAngles
+
+# Roots searched for run dirs, in priority order. Add a new root here and
+# both resolve_run_directory() and get_available_networks() pick it up.
+RUN_ROOTS: list[Path] = [Filepaths.BENCHMARKS, Filepaths.BENCHMARK_ARCHIVE]
 
 
 def _scan_run_dirs(base: Path) -> list[Path]:
@@ -52,6 +58,29 @@ def filter_networks_by_commit(networks: list[str], commit: str | None) -> list[s
     return [n for n in networks if n.startswith(f"{commit}/")]
 
 
+def resolve_run_directory(name: str) -> Path:
+    """Resolve a 'commit/run' network name to its run dir, checking all RUN_ROOTS."""
+    for root in RUN_ROOTS:
+        p = root / name
+        if p.is_dir():
+            return p
+    raise FileNotFoundError(f"Run dir not found: {name}")
+
+
+def move_run_dir(old_name: str, new_path: Path) -> Path:
+    """Move a run dir to a new path, cleaning up the parent if it becomes empty.
+
+    ``old_name`` is a 'commit/run' name; ``new_path`` is the full target dir.
+    Returns the new path.
+    """
+    old_path = resolve_run_directory(old_name)
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(old_path), str(new_path))
+    with contextlib.suppress(OSError):
+        old_path.parent.rmdir()
+    return new_path
+
+
 def to_plasma_config(geom: PlasmaGeometry, state: PlasmaState) -> PlasmaConfig:
     boundary = calculate_poloidal_boundary(
         jnp.linspace(0, 2 * jnp.pi, RotationalAngles.n_theta), geom
@@ -63,13 +92,3 @@ def apply_grid_layout(fig: go.Figure, n_items: int, height_per_row: int = 400) -
     n_cols = min(n_items, 4)
     n_rows = math.ceil(n_items / n_cols)
     fig.update_layout(height=height_per_row * n_rows, margin={"l": 10, "r": 10, "t": 30, "b": 10})
-
-
-def move_network_files(old_name: str, new_path_stem: Path) -> None:
-    """Move a run dir to a new path (archive/rename)."""
-    old_path = Filepaths.BENCHMARKS / old_name
-    if old_path.exists():
-        new_path_stem.mkdir(parents=True, exist_ok=True)
-        for f in old_path.iterdir():
-            f.rename(new_path_stem / f.name)
-        old_path.rmdir()

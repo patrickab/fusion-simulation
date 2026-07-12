@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { api, benchmarkFileUrl, benchmarkStream, useApi, type BenchmarkEvent } from '../api'
+import { api, benchmarkFileUrl, benchmarkStream, useApi, useDebounced, type BenchmarkEvent, type Grid2D } from '../api'
 import { GridHeatmap } from '../plots'
 import { plasmaGradient } from '../three/colormap'
 import { Colorbar, Panel, Section, Segmented, Slider, Spinner, Stat, Toggle } from '../ui'
@@ -14,12 +14,13 @@ const commitOf = (name: string) => name.split('/')[0]
 
 export function BenchmarkView() {
   const networks = useApi<string[]>('networks:All', () => api.networks('All'))
+  const cfg = useApi('config', api.config)
+  const evalConfigCount = cfg.data?.eval_config_count ?? 8
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [commit, setCommit] = useState('All')
   const [mode, setMode] = useState<(typeof MODES)[number]>('Both')
   const [seed, setSeed] = useState(0)
-  const [resolution, setResolution] = useState(100)
-  const [kpiSampleSize, setKpiSampleSize] = useState(16_384)
+  const [resolution, setResolution] = useState(50)
   const [rows, setRows] = useState<Row[]>([])
   const [running, setRunning] = useState(false)
   const [error, setError] = useState<string>()
@@ -55,9 +56,8 @@ export function BenchmarkView() {
         commit: commit === 'All' ? null : commit,
         mode,
         seed,
-        sample_size: 4,
+        sample_size: evalConfigCount,
         resolution,
-        kpi_sample_size: kpiSampleSize,
       }
       for await (const ev of benchmarkStream(body, ac.signal)) {
         if (ev.type === 'row' || ev.type === 'row_error') setRows((r) => [...r, ev])
@@ -97,19 +97,7 @@ export function BenchmarkView() {
             <Segmented options={MODES} value={mode} onChange={setMode} labels={MODE_LABELS} small />
           </div>
           <Slider label="Seed" value={seed} min={0} max={1000} onChange={setSeed} />
-          <Slider label="Resolution" value={resolution} min={40} max={200} step={20} onChange={setResolution} />
-          <label className="ctl">
-            <span className="ctl-row">
-              <span>KPI points</span>
-            </span>
-            <select className="select" value={kpiSampleSize} onChange={(e) => setKpiSampleSize(Number(e.target.value))}>
-              {[1024, 4096, 16384, 65536].map((n) => (
-                <option key={n} value={n}>
-                  {n.toLocaleString()}
-                </option>
-              ))}
-            </select>
-          </label>
+          <Slider label="Resolution" value={resolution} min={50} max={300} step={25} onChange={setResolution} />
         </Section>
         <Section title="Run">
           {running ? (
@@ -162,33 +150,67 @@ function SavedBenchmarks() {
         <details className="bench-saved" key={commit}>
           <summary>{commit}</summary>
           {Object.entries(runs).map(([run, files]) => (
-            <div className="bench-row" key={run}>
-              <div className="bench-head">
-                <span className="name">{run}</span>
-                {files
-                  .filter((f) => !f.endsWith('.png'))
-                  .map((f) => (
-                    <a className="chip" key={f} href={benchmarkFileUrl(commit, run, f)} target="_blank" rel="noreferrer">
-                      {f}
-                    </a>
-                  ))}
-              </div>
-              {files
-                .filter((f) => f.endsWith('.png'))
-                .map((f) => (
-                  <img
-                    key={f}
-                    src={benchmarkFileUrl(commit, run, f)}
-                    alt={`${run} ${f}`}
-                    loading="lazy"
-                    style={{ maxWidth: '100%' }}
-                  />
-                ))}
-            </div>
+            <StoredRun key={run} commit={commit} run={run} files={files} />
           ))}
         </details>
       ))}
     </details>
+  )
+}
+
+function StoredRun({ commit, run, files }: { commit: string; run: string; files: string[] }) {
+  const networkName = `${commit}/${run}`
+  const cfg = useApi('config', api.config)
+  const evalConfigCount = cfg.data?.eval_config_count ?? 8
+  const [seed, setSeed] = useState(0)
+  const [resolution, setResolution] = useState(50)
+  const dSeed = useDebounced(seed, 400)
+  const dResolution = useDebounced(resolution, 400)
+  const kpis = useApi<Record<string, number>>(
+    files.includes('kpis.json') ? `stored-kpis:${commit}/${run}` : null,
+    () => api.storedKpis(commit, run),
+  )
+  const grids = useApi<Grid2D[]>(
+    `stored-run:${networkName}:${dSeed}:${dResolution}`,
+    () => api.grid(networkName, 'residual', dSeed, evalConfigCount, dResolution),
+  )
+  const dataFiles = files.filter((f) => !f.endsWith('.png') && f !== 'kpis.json')
+  return (
+    <div className="bench-row">
+      <div className="bench-head">
+        <span className="name">{run}</span>
+        {dataFiles.map((f) => (
+          <a className="chip" key={f} href={benchmarkFileUrl(commit, run, f)} target="_blank" rel="noreferrer">
+            {f}
+          </a>
+        ))}
+      </div>
+      <div className="ctl" style={{ gap: '1rem', flexWrap: 'wrap' }}>
+        <Slider label="Seed" value={seed} min={0} max={1000} onChange={setSeed} />
+        <Slider label="Resolution" value={resolution} min={50} max={300} step={25} onChange={setResolution} />
+      </div>
+      {kpis.data && (
+        <div className="stats">
+          {Object.entries(kpis.data)
+            .filter(([k]) => k.startsWith('loss_') || k.startsWith('core_') || k === 'edge_loss_p95' || k === 'boundary_leak_max')
+            .map(([key, value]) => (
+              <Stat key={key} label={key.replaceAll('_', ' ')} value={Number(value).toExponential(2)} />
+            ))}
+        </div>
+      )}
+      {grids.loading && <Spinner />}
+      {grids.error && <div className="error">{grids.error}</div>}
+      {grids.data && (
+        <>
+          <div className="bench-grids">
+            {grids.data.map((g, i) => (
+              <GridHeatmap key={i} grid={g} quantity="residual" />
+            ))}
+          </div>
+          <Colorbar title="log₁₀|R_GS|" gradient={plasmaGradient} range={[-2, 1]} />
+        </>
+      )}
+    </div>
   )
 }
 

@@ -1,5 +1,6 @@
 """Configuration module for this repository."""
 
+import functools
 import os
 import pathlib
 from pathlib import Path
@@ -11,8 +12,13 @@ import jax.numpy as jnp
 import numpy as np
 
 
+@functools.lru_cache(maxsize=1)
 def current_commit() -> str:
-    """Short git commit hash of HEAD, used to partition benchmark/HPO artifacts."""
+    """Short git commit hash of HEAD, used to partition benchmark/HPO artifacts.
+
+    Memoized: shells out to git only once per process — a commit made during a
+    long study would otherwise change the path mid-run.
+    """
     return os.popen("git rev-parse --short HEAD").read().strip() or "no_git"
 
 

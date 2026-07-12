@@ -1,5 +1,6 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import datetime
 import json
 from pathlib import Path
 from typing import Literal
@@ -12,10 +13,46 @@ from scipy.stats import qmc
 from src.engine.network import BASE_SEED, NetworkManager
 from src.engine.physics import grad_shafranov_residual
 from src.engine.plasma import get_poloidal_points
+from src.lib.config import current_commit
 from src.lib.geometry_config import PlasmaConfig
+from src.lib.network_config import HyperParams
 
 GridQuantity = Literal["flux", "residual"]
 DEFAULT_KPI_SAMPLE_SIZE = 16_384
+EVAL_CONFIG_COUNT = 8
+EVAL_RESOLUTION = 200
+
+
+def build_kpi_record(
+    manager: NetworkManager,
+    kpis: Mapping[str, float],
+    n_configs: int,
+    n_points: int,
+    core_rho: float,
+    network_name: str | None = None,
+) -> dict:
+    """Assemble the kpis.json record dict shared by training and CLI eval.
+
+    When network_name is None (training path), derive it from the current
+    commit + the manager's artifact_stem. When provided (CLI path), use it
+    directly — the manager may not have artifact_stem set if loaded from disk.
+    """
+    hp = manager.config
+    if network_name is None:
+        network_name = f"{current_commit()}/{manager.artifact_stem}"
+    loss_label = f"huber={hp.huber_delta:g}" if hp.huber_delta > 0 else "mse"
+    return {
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "network": network_name,
+        "loss": loss_label,
+        "lr_max": hp.learning_rate_max,
+        "n_fourier_features": hp.n_fourier_features,
+        "lbfgs_steps": hp.lbfgs_steps,
+        "n_configs": n_configs,
+        "n_points": n_points,
+        "core_rho": core_rho,
+        **kpis,
+    }
 
 
 @dataclass(frozen=True)
@@ -227,10 +264,12 @@ def plot_plasma_grid_montage(
     n_configs = grids.R.shape[0]
     n_cols = min(4, n_configs)
     n_rows = (n_configs + n_cols - 1) // n_cols
+    # Extra height for the KPI table below the montage
+    kpi_table_height = 1.0 if kpis else 0.0
     fig, axes = plt.subplots(
         n_rows,
         n_cols,
-        figsize=(4 * n_cols, 4 * n_rows),
+        figsize=(4 * n_cols, 4 * n_rows + kpi_table_height),
         squeeze=False,
         layout="constrained",
     )
@@ -271,13 +310,47 @@ def plot_plasma_grid_montage(
         fig.colorbar(image, ax=axes, shrink=0.8, label=color["label"])
 
     parameter_text = ", ".join(f"{key}={metadata[key]}" for key in display_parameters)
-    kpi_items = [f"{key}={value:.3e}" for key, value in (kpis or {}).items()]
-    kpi_text = "\n".join(", ".join(kpi_items[i : i + 5]) for i in range(0, len(kpi_items), 5))
-    heading = "\n".join(part for part in (title, parameter_text, kpi_text) if part)
+    heading = "\n".join(part for part in (title, parameter_text) if part)
     if heading:
         fig.suptitle(heading, fontsize=10)
+
+    if kpis:
+        _add_kpi_table(fig, kpis)
+
     fig.savefig(output_path, dpi=110)
     plt.close(fig)
+
+
+def _add_kpi_table(fig: object, kpis: Mapping[str, float]) -> None:
+    """Render KPIs as a 2-row (All/Core) x 4-col (mean/median/p95/p05) table."""
+    stats = ["mean", "median", "p95", "p05"]
+    rows = ["All", "Core"]
+    cell_text: list[list[str]] = []
+    for row in rows:
+        prefix = "core_" if row == "Core" else ""
+        cell_text.append([f"{kpis.get(f'{prefix}loss_{s}', float('nan')):.3e}" for s in stats])
+
+    ax = fig.add_axes([0.12, -0.02, 0.76, 0.10])
+    ax.axis("off")
+    table = ax.table(
+        cellText=cell_text,
+        rowLabels=rows,
+        colLabels=stats,
+        cellLoc="center",
+        loc="center",
+    )
+    table.auto_set_font_size(False)
+    table.set_fontsize(9)
+    # Style header row
+    for j in range(len(stats)):
+        cell = table[0, j]
+        cell.set_facecolor("#444")
+        cell.set_text_props(color="white", weight="bold")
+    # Style data cells
+    for i in range(1, len(rows) + 1):
+        for j in range(len(stats)):
+            table[i, j].set_facecolor("#222" if i % 2 else "#333")
+            table[i, j].set_text_props(color="white", family="monospace")
 
 
 if __name__ == "__main__":
@@ -289,9 +362,8 @@ if __name__ == "__main__":
     import argparse
     from datetime import datetime
 
-    from src.lib.config import Filepaths
     from src.lib.network_config import DomainBounds, HyperParams
-    from src.streamlit.network_utils import get_available_networks
+    from src.streamlit.network_utils import get_available_networks, resolve_run_directory
 
     parser = argparse.ArgumentParser(description="Region-split |GS residual| KPIs per checkpoint")
     parser.add_argument(
@@ -329,10 +401,9 @@ if __name__ == "__main__":
         f"{'edge_p95':>9} {'bnd_leak':>9}"
     )
     for name in names:
-        run_dir = Filepaths.BENCHMARKS / name
-        if not run_dir.is_dir():
-            run_dir = Filepaths.BENCHMARK_ARCHIVE / name
-        if not run_dir.is_dir():
+        try:
+            run_dir = resolve_run_directory(name)
+        except FileNotFoundError:
             print(f"  skip {name}: run dir not found")
             continue
         config_path = run_dir / "config.json"
@@ -356,24 +427,13 @@ if __name__ == "__main__":
             + " ".join(f"{value:>9.4f}" for value in kpis.values())
         )
 
-        # kpis.json: one key per line, readable from the terminal at a glance.
+        # kpis.json: valid JSON, one key per line (indent=2) for terminal readability.
         # Overwritten each run (latest eval wins); the eval params are included
         # so the file is self-describing without needing config.json alongside.
-        record = {
-            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "network": name,
-            "loss": loss_label,
-            "lr_max": hp.learning_rate_max,
-            "n_fourier_features": hp.n_fourier_features,
-            "lbfgs_steps": hp.lbfgs_steps,
-            "n_configs": args.n_configs,
-            "n_points": args.n_points,
-            "core_rho": args.core_rho,
-            **kpis,
-        }
-        (run_dir / "kpis.json").write_text(
-            "\n".join(f'"{k}": {json.dumps(v)},' for k, v in record.items()) + "\n"
+        record = build_kpi_record(
+            manager, kpis, args.n_configs, args.n_points, args.core_rho, network_name=name
         )
+        (run_dir / "kpis.json").write_text(json.dumps(record, indent=2) + "\n")
 
         if args.no_plots:
             continue

@@ -1,7 +1,6 @@
 import json
 
 from src.engine.network import NetworkManager
-from src.lib.config import Filepaths
 from src.lib.geometry_config import PlasmaConfig
 from src.lib.network_config import HyperParams
 from src.lib.visualization import (
@@ -13,6 +12,7 @@ from src.streamlit.network_utils import (
     filter_networks_by_commit,
     get_available_commits,
     get_available_networks,
+    resolve_run_directory,
     to_plasma_config,
 )
 from src.streamlit.utils import reseed_network_visualisation
@@ -24,7 +24,7 @@ PLOT_GRID_RESOLUTION = 80
 
 
 def render_benchmark_row(network_name: str, configs: list[PlasmaConfig], mode: str) -> None:
-    run_dir = Filepaths.BENCHMARKS / network_name
+    run_dir = resolve_run_directory(network_name)
     config_path = run_dir / "config.json"
 
     if not config_path.exists():
@@ -58,7 +58,9 @@ def render_benchmark_row(network_name: str, configs: list[PlasmaConfig], mode: s
 
             if mode in ["GS Residual", "Both"]:
                 st.write("**Grad-Shafranov Residual**")
-                fig_res = plot_gs_residual_heatmap(manager, configs, resolution=PLOT_GRID_RESOLUTION)
+                fig_res = plot_gs_residual_heatmap(
+                    manager, configs, resolution=PLOT_GRID_RESOLUTION
+                )
                 apply_grid_layout(fig_res, len(configs))
                 st.plotly_chart(fig_res, width="stretch", key=f"res_{network_name}")
 
@@ -67,7 +69,7 @@ def init_session_state(networks: list[str]) -> None:
     if "manager" not in st.session_state:
         config = HyperParams()
         if networks:
-            config_path = Filepaths.BENCHMARKS / networks[0] / "config.json"
+            config_path = resolve_run_directory(networks[0]) / "config.json"
             if config_path.exists():
                 config = HyperParams.from_json(config_path)
         st.session_state.manager = NetworkManager(config)

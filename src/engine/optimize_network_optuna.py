@@ -417,7 +417,9 @@ def objective(
         "wd": hp.weight_decay,
         "sig": hp.sigma_residual_adaptive_sampling,
     }
-    manager = NetworkManager(hp, n_validation_size=config.n_validate)
+    manager = NetworkManager(
+        hp, n_validation_size=config.n_validate, test_mode=not config.save_checkpoints
+    )
     total_epochs = hp.warmup_epochs + hp.decay_epochs
     display.start_trial(trial.number + 1, display_params, total_epochs)
     display.current_manager = manager

@@ -38,9 +38,8 @@ export function NetworkView() {
   const [tab, setTab] = useState<Tab>('sampling')
   const [seed, setSeed] = useState(0)
   const [sampleSize, setSampleSize] = useState(4)
-  const [kpiSampleSize, setKpiSampleSize] = useState(16_384)
+  const [resolution, setResolution] = useState(50)
   const [nLines, setNLines] = useState(50)
-  const [resolution, setResolution] = useState(120)
 
   const networks = useApi<string[]>(`networks:${viewMode}:${bump}`, () => api.networks(viewMode))
 
@@ -51,10 +50,9 @@ export function NetworkView() {
 
   const dSeed = useDebounced(seed, 400)
   const dLines = useDebounced(nLines, 400)
-  const dResolution = useDebounced(resolution, 400)
-  const sampleKey = network ? `sample:${network}:${dSeed}:${sampleSize}:${kpiSampleSize}` : null
-  const sample = useApi<SampleResponse>(sampleKey, () => api.sample(network!, dSeed, sampleSize, kpiSampleSize))
-  const config = useApi<Record<string, unknown>>(network ? `config:${network}` : null, () => api.config(network!))
+  const sampleKey = network ? `sample:${network}:${dSeed}:${sampleSize}` : null
+  const sample = useApi<SampleResponse>(sampleKey, () => api.sample(network!, dSeed, sampleSize))
+  const config = useApi<Record<string, unknown>>(network ? `config:${network}` : null, () => api.config_file(network!))
 
   const refresh = () => {
     invalidate()
@@ -122,28 +120,16 @@ export function NetworkView() {
               <span>Sample size</span>
             </span>
             <select className="select" value={sampleSize} onChange={(e) => setSampleSize(Number(e.target.value))}>
-              {[1, 2, 4, 6, 8].map((n) => (
+              {[1, 2, 4, 8].map((n) => (
                 <option key={n} value={n}>
                   {n}
                 </option>
               ))}
             </select>
           </label>
-          <label className="ctl">
-            <span className="ctl-row">
-              <span>KPI points</span>
-            </span>
-            <select className="select" value={kpiSampleSize} onChange={(e) => setKpiSampleSize(Number(e.target.value))}>
-              {[1024, 4096, 16384, 65536].map((n) => (
-                <option key={n} value={n}>
-                  {n.toLocaleString()}
-                </option>
-              ))}
-            </select>
-          </label>
           {tab === 'topology' && <Slider label="Field lines" value={nLines} min={1} max={50} onChange={setNLines} />}
           {(tab === 'flux' || tab === 'residual') && (
-            <Slider label="Resolution" value={resolution} min={40} max={200} step={20} onChange={setResolution} />
+            <Slider label="Resolution" value={resolution} min={50} max={300} step={25} onChange={setResolution} />
           )}
         </Section>
       </Panel>
@@ -161,10 +147,10 @@ export function NetworkView() {
           <>
             {tab === 'sampling' && <SamplingTab sample={sample} />}
             {tab === 'flux' && (
-              <GridTab kind="flux" network={network} seed={dSeed} sampleSize={sampleSize} resolution={dResolution} sample={sample} />
+              <GridTab kind="flux" network={network} seed={dSeed} sampleSize={sampleSize} resolution={resolution} sample={sample} />
             )}
             {tab === 'residual' && (
-              <GridTab kind="residual" network={network} seed={dSeed} sampleSize={sampleSize} resolution={dResolution} sample={sample} />
+              <GridTab kind="residual" network={network} seed={dSeed} sampleSize={sampleSize} resolution={resolution} sample={sample} />
             )}
             {tab === 'topology' && (
               <TopologyTab network={network} seed={dSeed} sampleSize={sampleSize} nLines={dLines} sample={sample} />
@@ -254,8 +240,10 @@ function GridTab({
   resolution: number
   sample: ReturnType<typeof useApi<SampleResponse>>
 }) {
-  const grids = useApi<Grid2D[]>(`${kind}:${network}:${seed}:${sampleSize}:${resolution}`, () =>
-    api.grid(network, kind, seed, sampleSize, resolution),
+  const dResolution = useDebounced(resolution, 400)
+  const grids = useApi<Grid2D[]>(
+    `${kind}:${network}:${seed}:${sampleSize}:${dResolution}`,
+    () => api.grid(network, kind, seed, sampleSize, dResolution),
   )
 
   return (
