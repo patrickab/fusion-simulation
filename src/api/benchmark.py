@@ -4,8 +4,7 @@ from collections.abc import Iterator
 import json
 
 from src.api.network import build_kpis, build_plasma_grids
-from src.api.state import get_manager
-from src.lib.config import Filepaths
+from src.api.state import get_manager, resolve_run_directory
 from src.streamlit.network_utils import filter_networks_by_commit
 
 
@@ -24,7 +23,8 @@ def run_benchmark(
         return
 
     for name in reversed(filtered):
-        config_path = (Filepaths.NETWORKS / name).with_suffix(".json")
+        run_dir = resolve_run_directory(name)
+        config_path = run_dir / "config.json"
         if not config_path.exists():
             yield _sse_event({"type": "row_error", "network": name, "message": "Missing config"})
             continue

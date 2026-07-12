@@ -4,7 +4,6 @@ from contextlib import nullcontext, suppress
 from datetime import datetime
 import functools
 import logging
-import os
 from pathlib import Path
 import shutil
 import time
@@ -333,8 +332,8 @@ class NetworkManager:
             upper_bounds=self.sampler._domain_upper_bounds,
         )
         self.training_log: list[dict] = []
-        # Run identity (pinn_<timestamp>_<commit>); fixed at train() start so the
-        # checkpoint files and the per-run benchmark dir share one name.
+        # Run identity (pinn_<timestamp>); the commit is the parent dir in the
+        # benchmark tree, so it's not duplicated in the stem.
         self.artifact_stem: str | None = None
 
     @staticmethod
@@ -343,14 +342,13 @@ class NetworkManager:
         # minute resolution and silently overwrote each other's artifacts.
         # ponytail: same-second parallel runs on one machine would still collide.
         timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-        latest_commit = os.popen("git rev-parse --short HEAD").read().strip() or "no_git"
-        return f"pinn_{timestamp}_{latest_commit}"
+        return f"pinn_{timestamp}"
 
     def run_dir(self) -> Path:
-        """Per-run benchmark dir: logs/benchmarks/<commit>/<run>."""
+        """Per-run benchmark dir: data/benchmarks/<commit>/<run>."""
         if self.artifact_stem is None:
             self.artifact_stem = self._new_artifact_stem()
-        return Filepaths.BENCHMARKS / self.artifact_stem.split("_")[-1] / self.artifact_stem
+        return Filepaths.BENCHMARKS / current_commit() / self.artifact_stem
 
     def discard_unsaved_run(self) -> None:
         """Delete the benchmark run dir unless this run's checkpoint was saved.
@@ -360,23 +358,23 @@ class NetworkManager:
         """
         if self.artifact_stem is None:
             return
-        if (Path(Filepaths.NETWORKS) / f"{self.artifact_stem}.flax").exists():
-            return
         run_dir = self.run_dir()
+        if (run_dir / "network.flax").exists():
+            return
         shutil.rmtree(run_dir, ignore_errors=True)
         with suppress(OSError):  # drop the commit dir when now empty
             run_dir.parent.rmdir()
 
     def to_disk(self) -> str:
-        output_dir = Path(Filepaths.NETWORKS)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
         if self.artifact_stem is None:
             self.artifact_stem = self._new_artifact_stem()
-        artifact_stem = self.artifact_stem
-        artifact_flax_path = output_dir / f"{artifact_stem}.flax"
-        artifact_json_path = output_dir / f"{artifact_stem}.json"
-        artifact_log_path = output_dir / f"{artifact_stem}.csv"
+
+        run_dir = self.run_dir()
+        run_dir.mkdir(parents=True, exist_ok=True)
+
+        artifact_flax_path = run_dir / "network.flax"
+        artifact_json_path = run_dir / "config.json"
+        artifact_log_path = run_dir / "training.csv"
 
         artifact_flax_path.write_bytes(flax.serialization.to_bytes(self.state.params))
         self.config.to_json(path=str(artifact_json_path))
@@ -394,14 +392,7 @@ class NetworkManager:
                         f"{entry['grad_norm']:.6f},{entry['epoch_time']:.4f}\n"
                     )
 
-        # A saved checkpoint always has a complete benchmark run dir; the
-        # model_evaluation CLI later adds KPI rows and the montage PNG.
-        run_dir = self.run_dir()
-        run_dir.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(artifact_json_path, run_dir / "config.json")
-        if artifact_log_path.exists():
-            shutil.copyfile(artifact_log_path, run_dir / "training.csv")
-        return artifact_stem
+        return self.artifact_stem
 
     def from_disk(self, pinn_path) -> any:  # noqa
         """Load Flax model parameters from disk."""
