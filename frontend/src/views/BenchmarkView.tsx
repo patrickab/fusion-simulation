@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { api, benchmarkFileUrl, benchmarkStream, useApi, useDebounced, type BenchmarkEvent, type Grid2D } from '../api'
+import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { api, benchmarkFileUrl, benchmarkStream, kpiEntries, useApi, useDebounced, type BenchmarkEvent, type Grid2D } from '../api'
 import { GridHeatmap } from '../plots'
 import { plasmaGradient } from '../three/colormap'
 import { Colorbar, Panel, Section, Segmented, Slider, Spinner, Stat, Toggle } from '../ui'
@@ -139,22 +139,36 @@ export function BenchmarkView() {
   )
 }
 
+// One run at a time, picked via selectbox — a mounted StoredRun fires a residual
+// evaluation on the backend, so nothing mounts until it is explicitly selected.
 function SavedBenchmarks() {
   const tree = useApi('benchmarks', api.benchmarks)
+  const [selected, setSelected] = useState('')
   const commits = Object.entries(tree.data ?? {}).filter(([, runs]) => Object.keys(runs).length > 0)
   if (commits.length === 0) return null
+  const [commit, run] = selected.split('/')
+  const files = tree.data?.[commit]?.[run]
   return (
-    <details className="bench-saved">
-      <summary>Saved benchmarks ({commits.length} commits)</summary>
-      {commits.map(([commit, runs]) => (
-        <details className="bench-saved" key={commit}>
-          <summary>{commit}</summary>
-          {Object.entries(runs).map(([run, files]) => (
-            <StoredRun key={run} commit={commit} run={run} files={files} />
+    <div className="bench-saved">
+      <label className="ctl">
+        <span className="ctl-row">
+          <span>Saved benchmarks</span>
+        </span>
+        <select className="select" value={selected} onChange={(e) => setSelected(e.target.value)}>
+          <option value="">— select a run —</option>
+          {commits.map(([c, runs]) => (
+            <optgroup key={c} label={c}>
+              {Object.keys(runs).map((r) => (
+                <option key={r} value={`${c}/${r}`}>
+                  {r}
+                </option>
+              ))}
+            </optgroup>
           ))}
-        </details>
-      ))}
-    </details>
+        </select>
+      </label>
+      {files && <StoredRun key={selected} commit={commit} run={run} files={files} />}
+    </div>
   )
 }
 
@@ -166,9 +180,8 @@ function StoredRun({ commit, run, files }: { commit: string; run: string; files:
   const [resolution, setResolution] = useState(50)
   const dSeed = useDebounced(seed, 400)
   const dResolution = useDebounced(resolution, 400)
-  const kpis = useApi<Record<string, number>>(
-    files.includes('kpis.json') ? `stored-kpis:${commit}/${run}` : null,
-    () => api.storedKpis(commit, run),
+  const kpis = useApi(files.includes('kpis.json') ? `kpis:${networkName}` : null, () =>
+    api.kpis(networkName),
   )
   const grids = useApi<Grid2D[]>(
     `stored-run:${networkName}:${dSeed}:${dResolution}`,
@@ -191,11 +204,9 @@ function StoredRun({ commit, run, files }: { commit: string; run: string; files:
       </div>
       {kpis.data && (
         <div className="stats">
-          {Object.entries(kpis.data)
-            .filter(([k]) => k.startsWith('loss_') || k.startsWith('core_') || k === 'edge_loss_p95' || k === 'boundary_leak_max')
-            .map(([key, value]) => (
-              <Stat key={key} label={key.replaceAll('_', ' ')} value={Number(value).toExponential(2)} />
-            ))}
+          {kpiEntries(kpis.data).map(([key, value]) => (
+            <Stat key={key} label={key.replaceAll('_', ' ')} value={value.toExponential(2)} />
+          ))}
         </div>
       )}
       {grids.loading && <Spinner />}
@@ -214,7 +225,9 @@ function StoredRun({ commit, run, files }: { commit: string; run: string; files:
   )
 }
 
-function BenchRow({ row }: { row: Extract<Row, { type: 'row' }> }) {
+// memo: each streamed SSE row re-renders the list — without it, appending row N
+// re-diffs every already-rendered row's carpet heatmaps (row objects never mutate)
+const BenchRow = memo(function BenchRow({ row }: { row: Extract<Row, { type: 'row' }> }) {
   const cfg = row.config
   const chips = ['hidden_dims', 'learning_rate_max', 'n_train', 'n_epochs']
     .filter((k) => cfg[k] !== undefined)
@@ -230,7 +243,7 @@ function BenchRow({ row }: { row: Extract<Row, { type: 'row' }> }) {
         ))}
       </div>
       <div className="stats">
-        {Object.entries(row.kpis).map(([key, value]) => (
+        {kpiEntries(row.kpis).map(([key, value]) => (
           <Stat key={key} label={key.replaceAll('_', ' ')} value={value.toExponential(2)} />
         ))}
       </div>
@@ -261,4 +274,4 @@ function BenchRow({ row }: { row: Extract<Row, { type: 'row' }> }) {
       )}
     </div>
   )
-}
+})

@@ -13,7 +13,7 @@ from fastapi.staticfiles import StaticFiles
 from src.api import benchmark, geometry, network, state
 from src.api.schemas import (
     BenchmarkRequest,
-    BFieldRequest,
+    FieldLinesRequest,
     GeometryRequest,
     GridRequest,
     RenameRequest,
@@ -79,6 +79,19 @@ def network_config(name: str) -> dict:
     return json.loads(config_path.read_text())
 
 
+@app.get("/api/network/{name:path}/kpis")
+def network_kpis(name: str) -> dict:
+    """Stored post-training KPIs (kpis.json) — never recomputed at request time."""
+    try:
+        run_dir = resolve_run_directory(name)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Run dir not found: {name}") from None
+    kpis_path = run_dir / "kpis.json"
+    if not kpis_path.exists():
+        raise HTTPException(404, f"No KPIs stored for {name}")
+    return json.loads(kpis_path.read_text())
+
+
 @app.post("/api/network/{name:path}/archive")
 def archive_network(name: str) -> dict:
     try:
@@ -120,7 +133,7 @@ def delete_network(name: str) -> dict:
 @app.post("/api/network/{name:path}/sample")
 def network_sample(name: str, body: SampleRequest) -> dict:
     manager = state.get_manager(name)
-    return network.build_sample_response(manager, body.seed, body.sample_size, body.kpi_sample_size)
+    return network.build_sample_response(manager, body.seed, body.sample_size)
 
 
 @app.post("/api/network/{name:path}/flux")
@@ -135,10 +148,10 @@ def network_residual(name: str, body: GridRequest) -> list[dict]:
     return network.build_residual_grids(manager, body.seed, body.sample_size, body.resolution)
 
 
-@app.post("/api/network/{name:path}/bfield")
-def network_bfield(name: str, body: BFieldRequest) -> dict:
+@app.post("/api/network/{name:path}/fieldlines")
+def network_fieldlines(name: str, body: FieldLinesRequest) -> dict:
     manager = state.get_manager(name)
-    return network.build_bfield_grid(manager, body.seed, body.sample_size, body.n_lines)
+    return network.build_field_lines(manager, body.seed, body.sample_size, body.n_lines)
 
 
 @app.post("/api/geometry")
@@ -165,7 +178,6 @@ def run_benchmark(body: BenchmarkRequest) -> StreamingResponse:
             body.seed,
             body.sample_size,
             body.resolution,
-            body.kpi_sample_size,
         ),
         media_type="text/event-stream",
     )

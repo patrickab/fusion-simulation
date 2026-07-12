@@ -1,6 +1,7 @@
 import argparse
 from collections import deque
 from contextlib import nullcontext, suppress
+import csv
 from datetime import datetime
 import functools
 import json
@@ -621,7 +622,8 @@ class NetworkManager:
 
         return float(loss), float(l_res), float(l_dir), avg_grad_norm
 
-    def _new_table(self) -> Table:
+    @staticmethod
+    def _new_table() -> Table:
         table = Table(title="Training Metrics", show_header=True, header_style="bold cyan")
         table.add_column("Epoch", justify="right", style="cyan")
         table.add_column("LR", justify="right", style="yellow")
@@ -687,9 +689,6 @@ class NetworkManager:
         self._accumulated_grad_norm += grad_norm
         self._accumulated_time += epoch_time
 
-        val_loss_str = f"{val_loss:.3f}" if val_loss is not None else "-"
-        lr_str = f"{lr:.2e}"
-
         if (epoch + 1) % LOG_FREQUENCY == 0:
             moving_avg_loss = self._accumulated_loss / LOG_FREQUENCY
             moving_avg_residual = self._accumulated_residual / LOG_FREQUENCY
@@ -710,15 +709,17 @@ class NetworkManager:
                 }
             )
 
-            w = self.config.weight_boundary_condition
-            loss_str = f"{moving_avg_loss:>9.3f} = {moving_avg_residual:>6.3f} + {w:g}*{moving_avg_boundary:>8.3f}"
-            row = (
-                f"{epoch + 1}/{self.epochs}",
-                lr_str,
-                f"{moving_avg_grad_norm:.3f}",
-                loss_str,
-                val_loss_str,
-                f"{moving_avg_time:.2f}s",
+            row = _metrics_row(
+                epoch=epoch + 1,
+                total_epochs=self.epochs,
+                lr=lr,
+                grad_norm=moving_avg_grad_norm,
+                loss=moving_avg_loss,
+                residual=moving_avg_residual,
+                boundary=moving_avg_boundary,
+                weight_bc=self.config.weight_boundary_condition,
+                val_loss=val_loss,
+                epoch_time=moving_avg_time,
             )
             self._table_rows.append(row)
             if self.metrics_row_sink is not None:
@@ -798,12 +799,6 @@ class NetworkManager:
                         validation_callback(epoch + 1, val_loss)
 
                     lr = float(self._lr_schedule(self.state.step))
-                    logger.debug(
-                        f"epoch {epoch + 1}/{self.epochs} loss={loss:.6f} "
-                        f"residual={residual:.6f} boundary={boundary:.6f} "
-                        f"val_loss={'' if val_loss is None else f'{val_loss:.6f}'} "
-                        f"lr={lr:.2e} grad_norm={grad_norm:.6f} time={epoch_time:.3f}s"
-                    )
                     self._log_metric(
                         epoch, loss, residual, boundary, val_loss, lr, grad_norm, epoch_time
                     )
@@ -814,7 +809,11 @@ class NetworkManager:
 
             if val_loss is None:
                 val_loss = self._calculate_validation_loss(val_configs)
-            logger.debug(f"run {self.artifact_stem} final val_loss={val_loss:.6f}")
+            logger.debug(f"run {self.artifact_stem} final val_loss={val_loss:.3f}")
+            with open(run_dir / "train.log", "a", encoding="utf-8") as log_f:
+                Console(file=log_f, width=100, color_system=None).print(
+                    Panel(self._table, border_style="cyan")
+                )
 
             if save_to_disk:
                 self.to_disk()
@@ -891,6 +890,70 @@ class NetworkManager:
         return functools.partial(apply_psi_fn, self.model.apply)
 
 
+def _metrics_row(
+    epoch: int,
+    total_epochs: int,
+    lr: float,
+    grad_norm: float,
+    loss: float,
+    residual: float,
+    boundary: float,
+    weight_bc: float,
+    val_loss: float | None,
+    epoch_time: float,
+) -> tuple[str, ...]:
+    """One Training Metrics table row; shared by the live display and show_run replay."""
+    return (
+        f"{epoch}/{total_epochs}",
+        f"{lr:.2e}",
+        f"{grad_norm:.3f}",
+        f"{loss:>9.3f} = {residual:>6.3f} + {weight_bc:g}*{boundary:>8.3f}",
+        f"{val_loss:.3f}" if val_loss is not None else "-",
+        f"{epoch_time:.2f}s",
+    )
+
+
+def show_run(run: str) -> None:
+    """Re-render the Training Metrics table for a stored run from training.csv.
+
+    Accepts a run dir path, a 'commit/run' name, or a bare 'pinn_<timestamp>' stem.
+    """
+    run_dir = Path(run)
+    if not run_dir.is_dir():
+        candidates = [Filepaths.BENCHMARKS / run, *Filepaths.BENCHMARKS.glob(f"*/{run}")]
+        run_dir = next((p for p in candidates if p.is_dir()), run_dir)
+    csv_path = run_dir / "training.csv"
+    if not csv_path.exists():
+        raise SystemExit(f"no training.csv found for run '{run}'")
+    weight_bc = json.loads((run_dir / "config.json").read_text())["weight_boundary_condition"]
+
+    with open(csv_path) as f:
+        rows = list(csv.DictReader(f))
+    total_epochs = int(rows[-1]["epoch"])
+    table = NetworkManager._new_table()
+    for r in rows:
+        epoch = int(r["epoch"])
+        # replay exactly what the live table showed: every LOG_FREQUENCY-th
+        # epoch (full moving average), plus the final partial row if any
+        if epoch % LOG_FREQUENCY != 0 and epoch != total_epochs:
+            continue
+        table.add_row(
+            *_metrics_row(
+                epoch=epoch,
+                total_epochs=total_epochs,
+                lr=float(r["lr"]),
+                grad_norm=float(r["grad_norm"]),
+                loss=float(r["moving_avg_loss"]),
+                residual=float(r["residual"]),
+                boundary=float(r["boundary"]),
+                weight_bc=weight_bc,
+                val_loss=float(r["val_loss"]) if r["val_loss"] else None,
+                epoch_time=float(r["epoch_time"]),
+            )
+        )
+    console.print(Panel(table, border_style="cyan"))
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train PINN network")
     parser.add_argument(
@@ -912,7 +975,18 @@ if __name__ == "__main__":
         default=1.0,
         help="PDE loss: >0 = Huber with this delta (default 1.0), 0.0 = MSE",
     )
+    parser.add_argument(
+        "--show",
+        metavar="RUN",
+        default=None,
+        help="Render the stored Training Metrics table for a run "
+        "(dir path, commit/run, or pinn_<timestamp>) and exit",
+    )
     args = parser.parse_args()
+
+    if args.show:
+        show_run(args.show)
+        raise SystemExit
 
     manager = None
     try:

@@ -162,13 +162,10 @@ input[type="range"]::-moz-range-progress { background: rgba(255, 255, 255, 0.55)
 .chip { font-family: var(--mono); font-size: 10.5px; color: var(--faint); }
 .bench-grids { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 10px; }
 .bench-saved { margin: 14px 20px 0; }
-.bench-saved .bench-saved { margin: 8px 0 0 14px; }
-.bench-saved > summary { cursor: pointer; font-family: var(--mono); font-size: 12px; color: var(--muted); user-select: none; }
-.bench-saved summary .chip { margin-left: 12px; }
+.bench-saved .select { max-width: 340px; }
 .bench-saved a.chip { text-decoration: underline; text-underline-offset: 2px; }
 .bench-saved a.chip:hover { color: var(--text); }
 .bench-saved .bench-row { margin: 10px 0; }
-.bench-saved img { display: block; padding: 10px; }
 
 /* ---- feedback ---- */
 .spinner-wrap { position: absolute; top: 10px; right: 14px; z-index: 10; }

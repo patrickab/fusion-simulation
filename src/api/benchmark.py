@@ -3,7 +3,7 @@
 from collections.abc import Iterator
 import json
 
-from src.api.network import build_kpis, build_plasma_grids
+from src.api.network import build_plasma_grids
 from src.api.state import get_manager
 from src.streamlit.network_utils import filter_networks_by_commit, resolve_run_directory
 
@@ -15,7 +15,6 @@ def run_benchmark(
     seed: int,
     sample_size: int,
     resolution: int,
-    kpi_sample_size: int,
 ) -> Iterator[str]:
     filtered = filter_networks_by_commit(networks, commit)
     if not filtered:
@@ -38,7 +37,9 @@ def run_benchmark(
             "Both": ("flux", "residual"),
         }[mode]
         grids = build_plasma_grids(manager, seed, sample_size, resolution, quantities)
-        row["kpis"] = build_kpis(manager, seed, sample_size, kpi_sample_size)
+        # KPIs are precomputed post-training (kpis.json); never re-evaluated here.
+        kpis_path = run_dir / "kpis.json"
+        row["kpis"] = json.loads(kpis_path.read_text()) if kpis_path.exists() else {}
         if "flux" in grids:
             row["flux_grids"] = grids["flux"]
         if "residual" in grids:

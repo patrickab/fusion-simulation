@@ -1,18 +1,19 @@
 // Typed client for the FastAPI backend (src/api/main.py) + a tiny cached-fetch hook.
 import { useEffect, useState } from 'react'
 
-export interface Metrics {
-  loss_median: number
-  loss_mean: number
-  loss_p95: number
-  loss_p05: number
-  core_loss_median: number
-  core_loss_mean: number
-  core_loss_p95: number
-  core_loss_p05: number
-  edge_loss_p95: number
-  boundary_leak_max: number
-}
+/** Stored kpis.json record: KPI numbers plus metadata (date, network, loss label, ...). */
+export type Kpis = Record<string, number | string>
+
+/** Numeric KPI entries in display order, metadata keys dropped. */
+export const kpiEntries = (kpis: Kpis): [string, number][] =>
+  Object.entries(kpis).filter(
+    (e): e is [string, number] =>
+      typeof e[1] === 'number' &&
+      (e[0].startsWith('loss_') ||
+        e[0].startsWith('core_') ||
+        e[0] === 'edge_loss_p95' ||
+        e[0] === 'boundary_leak_max'),
+  )
 
 export interface Sample {
   R0: number
@@ -33,7 +34,6 @@ export interface Geom3D { R0: number; a: number; kappa: number; delta: number }
 
 export interface SampleResponse {
   samples: Sample[]
-  metrics: Metrics
   geom3d: Geom3D
   state3d: { p0: number; F_axis: number; pressure_alpha: number; field_exponent: number }
 }
@@ -62,14 +62,16 @@ export interface GeometryRequest extends Geom3D {
   mesh_stride?: number
 }
 
-export interface BFieldResponse {
-  grid: { nx: number; ny: number; nz: number; origin: number[]; spacing: number[] }
-  vectors: number[]
-  seed_points: number[][]
+/** Server-traced (VTK RK45) field lines: concatenated polylines + |B| per vertex. */
+export interface FieldLinesResponse {
+  points: number[] // flat xyz
+  speeds: number[]
+  line_lengths: number[]
+  b_range: [number, number]
 }
 
 export type BenchmarkEvent =
-  | { type: 'row'; network: string; config: Record<string, unknown>; kpis: Metrics; flux_grids?: Grid2D[]; residual_grids?: Grid2D[] }
+  | { type: 'row'; network: string; config: Record<string, unknown>; kpis: Kpis; flux_grids?: Grid2D[]; residual_grids?: Grid2D[] }
   | { type: 'row_error'; network: string; message: string }
   | { type: 'error'; message: string }
   | { type: 'done' }
@@ -98,6 +100,7 @@ export const api = {
     fetch(`/api/networks?view_mode=${encodeURIComponent(viewMode)}`).then((r) => toJson<string[]>(r)),
   config_file: (name: string) =>
     fetch(`/api/network/${enc(name)}/config`).then((r) => toJson<Record<string, unknown>>(r)),
+  kpis: (name: string) => fetch(`/api/network/${enc(name)}/kpis`).then((r) => toJson<Kpis>(r)),
   archive: (name: string) => fetch(`/api/network/${enc(name)}/archive`, { method: 'POST' }).then((r) => toJson(r)),
   rename: (name: string, newName: string) =>
     post<{ name: string }>(`/api/network/${enc(name)}/rename`, { new_name: newName }),
@@ -109,13 +112,11 @@ export const api = {
     }),
   grid: (name: string, quantity: GridQuantity, seed: number, sampleSize: number, resolution: number) =>
     post<Grid2D[]>(`/api/network/${enc(name)}/${quantity}`, { seed, sample_size: sampleSize, resolution }),
-  bfield: (name: string, seed: number, sampleSize: number, nLines: number) =>
-    post<BFieldResponse>(`/api/network/${enc(name)}/bfield`, { seed, sample_size: sampleSize, n_lines: nLines }),
+  fieldlines: (name: string, seed: number, sampleSize: number, nLines: number) =>
+    post<FieldLinesResponse>(`/api/network/${enc(name)}/fieldlines`, { seed, sample_size: sampleSize, n_lines: nLines }),
   geometry: (body: GeometryRequest) => post<GeometryResponse>('/api/geometry', body),
   // data/benchmarks tree: {commit: {run: [file, ...]}}
   benchmarks: () => fetch('/api/benchmarks').then((r) => toJson<Record<string, Record<string, string[]>>>(r)),
-  storedKpis: (commit: string, run: string) =>
-    fetch(benchmarkFileUrl(commit, run, 'kpis.json')).then((r) => toJson<Record<string, number>>(r)),
 }
 
 export const benchmarkFileUrl = (commit: string, run: string, file: string) =>

@@ -75,7 +75,7 @@ class SearchSpaceConfig:
     n_train: int = 1024
     total_epochs: int = 600
     warmup_ratio: float = 0.167
-    n_validate: int = 128
+    n_validate: int = 20
 
     min_epochs: int = 50
     n_trials: int = 5
@@ -705,9 +705,12 @@ class HpoApp(App):
     def _run_study(self) -> None:
         try:
             run_optimization(self._config, restart=self._restart, display=self._state)
-            self._state.events.append("[bold green]study complete[/] — press q to quit")
-        except Exception as error:  # keep the app up so the log stays inspectable
-            self._state.events.append(f"[bold red]study crashed:[/] {error!r}")
+        except Exception as error:  # optuna.log keeps the record; exit so drivers never hang
+            logger.error(f"study crashed: {error!r}")
+        finally:
+            # Always auto-exit: sequential drivers (tmux benchmark runs) must
+            # not block on a TUI waiting for 'q'. Results live in top_trials.json.
+            self.call_from_thread(self.exit)
 
 
 def _resolve_reset_choice(storage_path: Path, study_name: str, commit: str) -> bool:
@@ -746,7 +749,9 @@ def main() -> None:
         help="Resume this study's existing study.db without prompting",
     )
     parser.add_argument("--test", action="store_true")
-    parser.add_argument("--variant", choices=("mse", "huber_ff64_lbfgs"))
+    parser.add_argument(
+        "--variant", choices=("mse", "huber_ff64_lbfgs", "huber_ff64", "huber_ff128")
+    )
     parser.add_argument("--n-trials", type=int)
     parser.add_argument("--full-trials", action="store_true")
     parser.add_argument("--save-all", action="store_true")
@@ -760,6 +765,11 @@ def main() -> None:
     elif args.variant == "huber_ff64_lbfgs":
         config.lbfgs_steps = 300
         config.study_name = "pinn_hpo_huber_ff64_lbfgs"
+    elif args.variant == "huber_ff64":  # defaults already huber_delta=1.0, nff=64
+        config.study_name = "pinn_hpo_huber_ff64"
+    elif args.variant == "huber_ff128":
+        config.n_fourier_features = 128
+        config.study_name = "pinn_hpo_huber_ff128"
     if args.n_trials is not None:
         config.n_trials = args.n_trials
     config.prune_trials = not args.full_trials

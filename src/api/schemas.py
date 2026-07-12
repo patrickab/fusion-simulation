@@ -23,10 +23,9 @@ class GeometryRequest(BaseModel):
 class SampleRequest(BaseModel):
     seed: int = 0
     sample_size: int = 4
-    kpi_sample_size: int = Field(default=16_384, ge=16, le=65_536)
 
 
-class BFieldRequest(BaseModel):
+class FieldLinesRequest(BaseModel):
     seed: int = 0
     sample_size: int = 4
     n_lines: int = 24
@@ -49,4 +48,3 @@ class BenchmarkRequest(BaseModel):
     seed: int = 0
     sample_size: int = 4
     resolution: int = Field(default=100, ge=4, le=400)
-    kpi_sample_size: int = Field(default=16_384, ge=16, le=65_536)

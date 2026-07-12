@@ -1,10 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   api,
   invalidate,
+  kpiEntries,
   useApi,
   useDebounced,
-  type BFieldResponse,
+  type FieldLinesResponse,
   type GeometryResponse,
   type Grid2D,
   type SampleResponse,
@@ -27,7 +28,6 @@ const TAB_LABELS: Record<Tab, string> = {
   topology: '3D topology',
 }
 
-const fmtExp = (v: number) => v.toExponential(2)
 const short = (name: string) => name.split('/')[1] ?? name
 
 export function NetworkView() {
@@ -147,10 +147,10 @@ export function NetworkView() {
           <>
             {tab === 'sampling' && <SamplingTab sample={sample} />}
             {tab === 'flux' && (
-              <GridTab kind="flux" network={network} seed={dSeed} sampleSize={sampleSize} resolution={resolution} sample={sample} />
+              <GridTab kind="flux" network={network} seed={dSeed} sampleSize={sampleSize} resolution={resolution} />
             )}
             {tab === 'residual' && (
-              <GridTab kind="residual" network={network} seed={dSeed} sampleSize={sampleSize} resolution={resolution} sample={sample} />
+              <GridTab kind="residual" network={network} seed={dSeed} sampleSize={sampleSize} resolution={resolution} />
             )}
             {tab === 'topology' && (
               <TopologyTab network={network} seed={dSeed} sampleSize={sampleSize} nLines={dLines} sample={sample} />
@@ -163,9 +163,10 @@ export function NetworkView() {
 }
 
 function SamplingTab({ sample }: { sample: ReturnType<typeof useApi<SampleResponse>> }) {
-  let xr: Range2 | undefined
-  let yr: Range2 | undefined
-  if (sample.data) {
+  // memoized so the ranges keep their identity across re-renders — fresh arrays
+  // every render would defeat SampleScatter's memo
+  const { xr, yr } = useMemo((): { xr?: Range2; yr?: Range2 } => {
+    if (!sample.data) return {}
     let rMin = Infinity
     let rMax = -Infinity
     let zMin = Infinity
@@ -181,9 +182,8 @@ function SamplingTab({ sample }: { sample: ReturnType<typeof useApi<SampleRespon
       }
     }
     const pad = 0.06 * Math.max(rMax - rMin, zMax - zMin)
-    xr = [rMin - pad, rMax + pad]
-    yr = [zMin - pad, zMax + pad]
-  }
+    return { xr: [rMin - pad, rMax + pad], yr: [zMin - pad, zMax + pad] }
+  }, [sample.data])
   return (
     <div className="scroll" style={{ position: 'relative' }}>
       {sample.loading && <Spinner />}
@@ -206,21 +206,15 @@ function SamplingTab({ sample }: { sample: ReturnType<typeof useApi<SampleRespon
   )
 }
 
-function KpiStats({ sample }: { sample: ReturnType<typeof useApi<SampleResponse>> }) {
-  if (!sample.data) return null
-  const m = sample.data.metrics
+/** Post-training KPIs from the run's stored kpis.json — nothing recomputed. */
+function KpiStats({ network }: { network: string }) {
+  const kpis = useApi(`kpis:${network}`, () => api.kpis(network))
+  if (!kpis.data) return null
   return (
     <div className="stats">
-      <Stat label="median" value={fmtExp(m.loss_median)} />
-      <Stat label="mean" value={fmtExp(m.loss_mean)} />
-      <Stat label="p95" value={fmtExp(m.loss_p95)} />
-      <Stat label="p05" value={fmtExp(m.loss_p05)} />
-      <Stat label="core median" value={fmtExp(m.core_loss_median)} />
-      <Stat label="core mean" value={fmtExp(m.core_loss_mean)} />
-      <Stat label="core p95" value={fmtExp(m.core_loss_p95)} />
-      <Stat label="core p05" value={fmtExp(m.core_loss_p05)} />
-      <Stat label="edge p95" value={fmtExp(m.edge_loss_p95)} />
-      <Stat label="boundary leak" value={fmtExp(m.boundary_leak_max)} />
+      {kpiEntries(kpis.data).map(([key, value]) => (
+        <Stat key={key} label={key.replaceAll('_', ' ')} value={value.toExponential(2)} />
+      ))}
     </div>
   )
 }
@@ -231,14 +225,12 @@ function GridTab({
   seed,
   sampleSize,
   resolution,
-  sample,
 }: {
   kind: 'flux' | 'residual'
   network: string
   seed: number
   sampleSize: number
   resolution: number
-  sample: ReturnType<typeof useApi<SampleResponse>>
 }) {
   const dResolution = useDebounced(resolution, 400)
   const grids = useApi<Grid2D[]>(
@@ -249,7 +241,7 @@ function GridTab({
   return (
     <div className="scroll" style={{ position: 'relative' }}>
       {grids.error && <div className="error">{grids.error}</div>}
-      <KpiStats sample={sample} />
+      <KpiStats network={network} />
       <div className="grid">
         {grids.loading
           ? Array.from({ length: sampleSize }, (_, i) => (
@@ -290,29 +282,28 @@ function TopologyTab({
   nLines: number
   sample: ReturnType<typeof useApi<SampleResponse>>
 }) {
-  const field = useApi<BFieldResponse>(`bfield:${network}:${seed}:${sampleSize}:${nLines}`, () =>
-    api.bfield(network, seed, sampleSize, nLines),
+  const field = useApi<FieldLinesResponse>(`fieldlines:${network}:${seed}:${sampleSize}:${nLines}`, () =>
+    api.fieldlines(network, seed, sampleSize, nLines),
   )
   const geom = sample.data?.geom3d
   const geo = useApi<GeometryResponse>(geom ? `geo3d:${JSON.stringify(geom)}` : null, () =>
     api.geometry({ ...geom!, show_coils: false, mesh_stride: 2 }),
   )
 
-  const [bRange, setBRange] = useState<[number, number]>([0, 1])
   const loading = field.loading || geo.loading || sample.loading
   const error = field.error ?? geo.error ?? sample.error
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
-      <KpiStats sample={sample} />
+      <KpiStats network={network} />
       <div className="canvas-wrap">
         {loading && <Spinner />}
         {error && <div className="error">{error}</div>}
         <Scene radius={geom ? (geom.R0 + geom.a) * 2.4 : 22}>
           {geo.data && <PlasmaWireframe surf={geo.data.plasma3d} opacity={0.3} />}
-          {field.data && <FieldLines field={field.data} onRange={setBRange} />}
+          {field.data && <FieldLines field={field.data} />}
         </Scene>
       </div>
-      {field.data && <Colorbar title="|B| (field magnitude)" gradient={plasmaGradient} range={bRange} unit="T" />}
+      {field.data && <Colorbar title="|B| (field magnitude)" gradient={plasmaGradient} range={field.data.b_range} unit="T" />}
     </div>
   )
 }
