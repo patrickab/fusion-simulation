@@ -6,6 +6,7 @@ import shutil
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -18,13 +19,13 @@ from src.api.schemas import (
     RenameRequest,
     SampleRequest,
 )
-from src.api.state import resolve_run_directory
 from src.lib.config import Filepaths
 from src.lib.geometry_config import ToroidalCoilConfig
-from src.streamlit.network_utils import get_available_networks
+from src.streamlit.network_utils import get_available_networks, move_run_dir, resolve_run_directory
 
 app = FastAPI(title="fusion-simulation API")
 
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:5173"],
@@ -42,6 +43,17 @@ def list_networks(view_mode: str = "New Benchmarks") -> list[str]:
     return get_available_networks(view_mode)
 
 
+@app.get("/api/config")
+def get_config() -> dict:
+    """Frontend-facing constants so Python and TS share one source of truth."""
+    from src.engine.model_evaluation import EVAL_CONFIG_COUNT, EVAL_RESOLUTION
+
+    return {
+        "eval_config_count": EVAL_CONFIG_COUNT,
+        "eval_resolution": EVAL_RESOLUTION,
+    }
+
+
 @app.get("/api/benchmarks")
 def list_benchmarks() -> dict[str, dict[str, list[str]]]:
     """data/benchmarks tree: {commit: {run: [file, ...]}}."""
@@ -57,7 +69,10 @@ def list_benchmarks() -> dict[str, dict[str, list[str]]]:
 
 @app.get("/api/network/{name:path}/config")
 def network_config(name: str) -> dict:
-    run_dir = resolve_run_directory(name)
+    try:
+        run_dir = resolve_run_directory(name)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Run dir not found: {name}") from None
     config_path = run_dir / "config.json"
     if not config_path.exists():
         raise HTTPException(404, f"No config found for {name}")
@@ -66,29 +81,35 @@ def network_config(name: str) -> dict:
 
 @app.post("/api/network/{name:path}/archive")
 def archive_network(name: str) -> dict:
-    run_dir = resolve_run_directory(name)
+    try:
+        run_dir = resolve_run_directory(name)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Run dir not found: {name}") from None
     commit = run_dir.parent.name
     target = Filepaths.BENCHMARK_ARCHIVE / commit / run_dir.name
-    target.parent.mkdir(parents=True, exist_ok=True)
-    shutil.move(str(run_dir), str(target))
-    with contextlib.suppress(OSError):
-        run_dir.parent.rmdir()
+    move_run_dir(name, target)
     state.invalidate(name)
     return {"ok": True}
 
 
 @app.post("/api/network/{name:path}/rename")
 def rename_network(name: str, body: RenameRequest) -> dict:
-    run_dir = resolve_run_directory(name)
+    try:
+        run_dir = resolve_run_directory(name)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Run dir not found: {name}") from None
     new_path = run_dir.parent / body.new_name
-    shutil.move(str(run_dir), str(new_path))
+    move_run_dir(name, new_path)
     state.invalidate(name)
     return {"name": f"{new_path.parent.name}/{new_path.name}"}
 
 
 @app.delete("/api/network/{name:path}")
 def delete_network(name: str) -> dict:
-    run_dir = resolve_run_directory(name)
+    try:
+        run_dir = resolve_run_directory(name)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Run dir not found: {name}") from None
     shutil.rmtree(run_dir, ignore_errors=True)
     with contextlib.suppress(OSError):
         run_dir.parent.rmdir()

@@ -390,9 +390,7 @@ def plot_flux_heatmap(
             mask = is_point_in_plasma(coords_flat, cfg.Boundary)
             psi = jnp.full(mask.shape, jnp.nan)
             if mask.any():
-                val = manager.get_psi(
-                    coords_flat.R[mask], coords_flat.Z[mask], cfg
-                )
+                val = manager.get_psi(coords_flat.R[mask], coords_flat.Z[mask], cfg)
                 psi = psi.at[mask].set(val.flatten())
                 all_psi.append(val.flatten())
 

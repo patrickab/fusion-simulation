@@ -90,19 +90,22 @@ const post = <T,>(url: string, body: unknown): Promise<T> =>
 const enc = (name: string) => encodeURIComponent(name).replaceAll('%2F', '/')
 
 export const api = {
+  config: () =>
+    fetch('/api/config').then((r) =>
+      toJson<{ eval_config_count: number; eval_resolution: number }>(r),
+    ),
   networks: (viewMode: string) =>
     fetch(`/api/networks?view_mode=${encodeURIComponent(viewMode)}`).then((r) => toJson<string[]>(r)),
-  config: (name: string) =>
+  config_file: (name: string) =>
     fetch(`/api/network/${enc(name)}/config`).then((r) => toJson<Record<string, unknown>>(r)),
   archive: (name: string) => fetch(`/api/network/${enc(name)}/archive`, { method: 'POST' }).then((r) => toJson(r)),
   rename: (name: string, newName: string) =>
     post<{ name: string }>(`/api/network/${enc(name)}/rename`, { new_name: newName }),
   remove: (name: string) => fetch(`/api/network/${enc(name)}`, { method: 'DELETE' }).then((r) => toJson(r)),
-  sample: (name: string, seed: number, sampleSize: number, kpiSampleSize: number) =>
+  sample: (name: string, seed: number, sampleSize: number) =>
     post<SampleResponse>(`/api/network/${enc(name)}/sample`, {
       seed,
       sample_size: sampleSize,
-      kpi_sample_size: kpiSampleSize,
     }),
   grid: (name: string, quantity: GridQuantity, seed: number, sampleSize: number, resolution: number) =>
     post<Grid2D[]>(`/api/network/${enc(name)}/${quantity}`, { seed, sample_size: sampleSize, resolution }),
@@ -111,6 +114,8 @@ export const api = {
   geometry: (body: GeometryRequest) => post<GeometryResponse>('/api/geometry', body),
   // data/benchmarks tree: {commit: {run: [file, ...]}}
   benchmarks: () => fetch('/api/benchmarks').then((r) => toJson<Record<string, Record<string, string[]>>>(r)),
+  storedKpis: (commit: string, run: string) =>
+    fetch(benchmarkFileUrl(commit, run, 'kpis.json')).then((r) => toJson<Record<string, number>>(r)),
 }
 
 export const benchmarkFileUrl = (commit: string, run: string, file: string) =>
@@ -124,7 +129,6 @@ export async function* benchmarkStream(
     seed: number
     sample_size: number
     resolution: number
-    kpi_sample_size: number
   },
   signal: AbortSignal,
 ): AsyncGenerator<BenchmarkEvent> {

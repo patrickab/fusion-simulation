@@ -4,8 +4,8 @@ from collections.abc import Iterator
 import json
 
 from src.api.network import build_kpis, build_plasma_grids
-from src.api.state import get_manager, resolve_run_directory
-from src.streamlit.network_utils import filter_networks_by_commit
+from src.api.state import get_manager
+from src.streamlit.network_utils import filter_networks_by_commit, resolve_run_directory
 
 
 def run_benchmark(

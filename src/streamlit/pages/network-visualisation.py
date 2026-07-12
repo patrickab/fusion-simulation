@@ -23,7 +23,8 @@ from src.streamlit.network_utils import (
     filter_networks_by_commit,
     get_available_commits,
     get_available_networks,
-    move_network_files,
+    move_run_dir,
+    resolve_run_directory,
     to_plasma_config,
 )
 from src.streamlit.utils import reseed_network_visualisation
@@ -40,7 +41,7 @@ def _get_networks() -> list[str]:
 
 def sync_selected_network() -> None:
     """Load selected checkpoint once and reseed shared samples."""
-    run_dir = Filepaths.BENCHMARKS / st.session_state.selected_pinn
+    run_dir = resolve_run_directory(st.session_state.selected_pinn)
     config_path = run_dir / "config.json"
     new_config = HyperParams.from_json(config_path)
 
@@ -158,11 +159,10 @@ def render_3d_topology_tab():  # noqa
 
 
 def handle_archive() -> None:
-    Filepaths.BENCHMARK_ARCHIVE.mkdir(parents=True, exist_ok=True)
-    old_run_dir = Filepaths.BENCHMARKS / st.session_state.selected_pinn
+    old_run_dir = resolve_run_directory(st.session_state.selected_pinn)
     commit = old_run_dir.parent.name
-    new_path_stem = Filepaths.BENCHMARK_ARCHIVE / commit / old_run_dir.name
-    move_network_files(st.session_state.selected_pinn, new_path_stem)
+    new_path = Filepaths.BENCHMARK_ARCHIVE / commit / old_run_dir.name
+    move_run_dir(st.session_state.selected_pinn, new_path)
     _update_networks_after_action()
 
 
@@ -170,21 +170,20 @@ def handle_rename(new_name: str) -> None:
     if not new_name:
         return
 
-    old_path = Filepaths.BENCHMARKS / st.session_state.selected_pinn
-    new_path_stem = old_path.parent / new_name
+    old_path = resolve_run_directory(st.session_state.selected_pinn)
+    new_path = old_path.parent / new_name
 
-    move_network_files(st.session_state.selected_pinn, new_path_stem)
+    move_run_dir(st.session_state.selected_pinn, new_path)
 
     st.session_state.available_networks = _get_networks()
-    st.session_state._next_pinn = f"{new_path_stem.parent.name}/{new_path_stem.name}"
+    st.session_state._next_pinn = f"{new_path.parent.name}/{new_path.name}"
     st.session_state.rename_mode = False
     st.rerun()
 
 
 def handle_delete() -> None:
-    target_path = Filepaths.BENCHMARKS / st.session_state.selected_pinn
-    if target_path.is_dir():
-        shutil.rmtree(target_path, ignore_errors=True)
+    target_path = resolve_run_directory(st.session_state.selected_pinn)
+    shutil.rmtree(target_path, ignore_errors=True)
 
     st.session_state.rename_mode = False
     _update_networks_after_action()
@@ -278,7 +277,7 @@ def render_sidebar() -> None:
 
         st.divider()
 
-        pinn_path = Filepaths.BENCHMARKS / st.session_state.selected_pinn
+        pinn_path = resolve_run_directory(st.session_state.selected_pinn)
         config_path = pinn_path / "config.json"
         if config_path.exists():
             with open(config_path) as f:
@@ -292,7 +291,10 @@ def render_metrics() -> None:
 
     # Compute evaluation metrics
     total, l_res, l_dir, l_per_cfg = manager.eval_step(
-        manager.state, flux_input, manager.config.weight_boundary_condition, manager.config.huber_delta
+        manager.state,
+        flux_input,
+        manager.config.weight_boundary_condition,
+        manager.config.huber_delta,
     )
 
     # Compute max pointwise residual across all sampled configurations

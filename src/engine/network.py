@@ -3,6 +3,7 @@ from collections import deque
 from contextlib import nullcontext, suppress
 from datetime import datetime
 import functools
+import json
 import logging
 from pathlib import Path
 import shutil
@@ -311,10 +312,12 @@ class NetworkManager:
         config: HyperParams,
         seed: int = BASE_SEED,
         n_validation_size: int = N_VALIDATION_SIZE,
+        test_mode: bool = False,
     ) -> None:
         self.config = config
         self.seed = seed
         self.n_validation_size = n_validation_size
+        self.test_mode = test_mode
         self.model = FluxPINN(
             hidden_dims=config.hidden_dims,
             n_fourier_features=config.n_fourier_features,
@@ -392,12 +395,70 @@ class NetworkManager:
                         f"{entry['grad_norm']:.6f},{entry['epoch_time']:.4f}\n"
                     )
 
+        self._save_residual_plot()
         return self.artifact_stem
 
     def from_disk(self, pinn_path) -> any:  # noqa
         """Load Flax model parameters from disk."""
         with open(pinn_path, "rb") as f:
             return flax.serialization.from_bytes(self.state.params, f.read())
+
+    def _save_residual_plot(self) -> None:
+        """Generate the post-training residual montage with KPI table.
+
+        Uses EVAL_CONFIG_COUNT fresh Sobol configs at resolution 200, KPIs at
+        4096 points. Writes residual.png, residual_grids.json (for interactive
+        Plotly rendering) and kpis.json into the run dir.
+        """
+        if self.test_mode:
+            return
+        from scipy.stats import qmc
+
+        from src.engine.model_evaluation import (
+            EVAL_CONFIG_COUNT,
+            EVAL_RESOLUTION,
+            build_kpi_record,
+            evaluate_plasma_grids,
+            evaluate_plasma_kpis,
+            plot_plasma_grid_montage,
+        )
+        from src.lib.network_config import DomainBounds
+
+        lower, upper = DomainBounds.get_bounds()
+        sobol = qmc.Sobol(d=len(lower), scramble=True, seed=BASE_SEED + 200)
+        val_configs = jnp.array(
+            qmc.scale(sobol.random(EVAL_CONFIG_COUNT), np.asarray(lower), np.asarray(upper)),
+            dtype=jnp.float32,
+        )
+        inputs = self.sampler.sample_flux_input(plasma_configs=val_configs)
+        configs = [inputs.config[i] for i in range(EVAL_CONFIG_COUNT)]
+
+        kpis = evaluate_plasma_kpis(self, configs, sample_size=4096)
+        grids = evaluate_plasma_grids(
+            self, configs, resolution=EVAL_RESOLUTION, quantities=("residual",)
+        )
+        run_dir = self.run_dir()
+
+        plot_plasma_grid_montage(
+            grids,
+            run_dir / "residual.png",
+            quantity="residual",
+            title=self.artifact_stem,
+            metadata=self.config.to_dict(),
+            display_parameters=(
+                "huber_delta",
+                "learning_rate_max",
+                "n_fourier_features",
+                "lbfgs_steps",
+            ),
+            kpis=kpis,
+        )
+
+        # Store KPIs as valid JSON (indent=2 for terminal readability).
+        record = build_kpi_record(self, kpis, EVAL_CONFIG_COUNT, 4096, 0.85)
+        (run_dir / "kpis.json").write_text(json.dumps(record, indent=2) + "\n")
+
+        logger.info(f"residual plot saved to {run_dir}")
 
     def _init_state(self) -> train_state.TrainState:
         """Initialize the training state with dummy data."""
@@ -863,7 +924,7 @@ if __name__ == "__main__":
             )
             if args.lr is not None:
                 config = config.replace(learning_rate_max=args.lr)
-            manager = NetworkManager(config)
+            manager = NetworkManager(config, test_mode=args.test)
             manager.train(save_to_disk=True)
         else:
             globals()["N_VALIDATION_SIZE"] = 16
@@ -879,7 +940,7 @@ if __name__ == "__main__":
                 warmup_epochs=20,
                 decay_epochs=20,
             )
-            manager = NetworkManager(config)
+            manager = NetworkManager(config, test_mode=args.test)
             manager.train(save_to_disk=False)
     except KeyboardInterrupt:
         pass
