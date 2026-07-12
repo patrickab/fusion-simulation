@@ -1,9 +1,12 @@
 import argparse
 from collections import deque
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from datetime import datetime
+import functools
+import logging
 import os
 from pathlib import Path
+import shutil
 import time
 from typing import Callable, Literal
 
@@ -27,7 +30,7 @@ from src.engine.plasma import (
     calculate_poloidal_boundary,
     get_poloidal_points,
 )
-from src.lib.config import Filepaths
+from src.lib.config import Filepaths, current_commit
 from src.lib.geometry_config import (
     PlasmaConfig,
     PlasmaGeometry,
@@ -54,6 +57,20 @@ def denormalize_psi(
     """
     envelope = 1.0 - boundary_normalized_radius(R, Z, cfg.Boundary) ** 2
     return envelope * psi_n.squeeze() * cfg.State.F_axis * cfg.Geometry.a
+
+
+def apply_psi_fn(
+    apply_fn: Callable, params: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig
+) -> jnp.ndarray:
+    """Adapter converting neural network output to physical psi flux.
+
+    Shared by training, inference, and evaluation call sites; bind ``apply_fn``
+    with ``functools.partial`` to get a ``(params, R, Z, cfg) -> psi`` callable.
+    """
+    inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
+    p_n, r_n, z_n = inp.normalize()
+    psi_n = apply_fn(params, r=r_n, z=z_n, **p_n)
+    return denormalize_psi(psi_n, R, Z, cfg)
 
 
 # --- Network (simple MLP) ---
@@ -286,6 +303,10 @@ class Sampler:
 
 # --- Manager for Training / Inference ---
 class NetworkManager:
+    # Optional consumer of finalized metrics-table rows (the HPO TUI appends them
+    # to its sequential per-trial log). None = CLI mode, table rendering only.
+    metrics_row_sink: Callable[[tuple[str, ...]], None] | None = None
+
     def __init__(
         self,
         config: HyperParams,
@@ -312,15 +333,47 @@ class NetworkManager:
             upper_bounds=self.sampler._domain_upper_bounds,
         )
         self.training_log: list[dict] = []
+        # Run identity (pinn_<timestamp>_<commit>); fixed at train() start so the
+        # checkpoint files and the per-run benchmark dir share one name.
+        self.artifact_stem: str | None = None
 
-    def to_disk(self) -> None:
-        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
+    @staticmethod
+    def _new_artifact_stem() -> str:
+        # Second resolution: fast runs (HPO --test trials take ~8s) collided at
+        # minute resolution and silently overwrote each other's artifacts.
+        # ponytail: same-second parallel runs on one machine would still collide.
+        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         latest_commit = os.popen("git rev-parse --short HEAD").read().strip() or "no_git"
+        return f"pinn_{timestamp}_{latest_commit}"
 
+    def run_dir(self) -> Path:
+        """Per-run benchmark dir: logs/benchmarks/<commit>/<run>."""
+        if self.artifact_stem is None:
+            self.artifact_stem = self._new_artifact_stem()
+        return Filepaths.BENCHMARKS / self.artifact_stem.split("_")[-1] / self.artifact_stem
+
+    def discard_unsaved_run(self) -> None:
+        """Delete the benchmark run dir unless this run's checkpoint was saved.
+
+        A run dir exists iff its checkpoint was kept: --test, pruned, failed
+        and aborted runs leave nothing behind.
+        """
+        if self.artifact_stem is None:
+            return
+        if (Path(Filepaths.NETWORKS) / f"{self.artifact_stem}.flax").exists():
+            return
+        run_dir = self.run_dir()
+        shutil.rmtree(run_dir, ignore_errors=True)
+        with suppress(OSError):  # drop the commit dir when now empty
+            run_dir.parent.rmdir()
+
+    def to_disk(self) -> str:
         output_dir = Path(Filepaths.NETWORKS)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        artifact_stem = f"pinn_{timestamp}_{latest_commit}"
+        if self.artifact_stem is None:
+            self.artifact_stem = self._new_artifact_stem()
+        artifact_stem = self.artifact_stem
         artifact_flax_path = output_dir / f"{artifact_stem}.flax"
         artifact_json_path = output_dir / f"{artifact_stem}.json"
         artifact_log_path = output_dir / f"{artifact_stem}.csv"
@@ -340,6 +393,15 @@ class NetworkManager:
                         f"{vl},{entry['residual']:.6f},{entry['boundary']:.6f},"
                         f"{entry['grad_norm']:.6f},{entry['epoch_time']:.4f}\n"
                     )
+
+        # A saved checkpoint always has a complete benchmark run dir; the
+        # model_evaluation CLI later adds KPI rows and the montage PNG.
+        run_dir = self.run_dir()
+        run_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(artifact_json_path, run_dir / "config.json")
+        if artifact_log_path.exists():
+            shutil.copyfile(artifact_log_path, run_dir / "training.csv")
+        return artifact_stem
 
     def from_disk(self, pinn_path) -> any:  # noqa
         """Load Flax model parameters from disk."""
@@ -389,15 +451,7 @@ class NetworkManager:
         huber_delta: float,
     ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
         """Pure function to compute physics loss. Reusable for both training and evaluation."""
-
-        # Define psi_fn locally for JIT stability.
-        # Using _make_psi_fn() would create new function objects per step, risking cache misses.
-        def psi_fn(p: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
-            """Adapter converting neural network output to physical psi flux."""
-            inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
-            p_n, r_n, z_n = inp.normalize()
-            psi_n = apply_fn(p, r=r_n, z=z_n, **p_n)
-            return denormalize_psi(psi_n, R, Z, cfg)
+        psi_fn = functools.partial(apply_psi_fn, apply_fn)
 
         total, l_res, l_dir, l_per_cfg = pinn_loss_function(
             psi_fn,
@@ -527,8 +581,8 @@ class NetworkManager:
         table.add_column("Time/Ep", justify="right")
         return table
 
-    def _init_live_display(self) -> Live:
-        """Set up Rich table, progress bar, and accumulators for live training display."""
+    def _init_metrics_display(self) -> None:
+        """Set up Rich table, progress bar, and accumulators for the training display."""
         # ponytail: fixed-size rolling window, not the full history — an unbounded table
         # eventually taller than the terminal desyncs Rich's cursor-based redraw, corrupting
         # the display whenever the user scrolls
@@ -551,8 +605,14 @@ class NetworkManager:
         self._accumulated_grad_norm = 0.0
         self._accumulated_time = 0.0
 
+    def training_renderable(self) -> Panel:
+        """Current metrics table + progress bar; rendered by Live or the HPO TUI."""
+        return Panel(Group(self._table, self._progress), border_style="cyan")
+
+    def _init_live_display(self) -> Live:
+        self._init_metrics_display()
         return Live(
-            Panel(Group(self._table, self._progress), border_style="cyan"),
+            self.training_renderable(),
             refresh_per_second=10,
             console=console,
             vertical_overflow="visible",
@@ -600,19 +660,22 @@ class NetworkManager:
 
             w = self.config.weight_boundary_condition
             loss_str = f"{moving_avg_loss:>9.3f} = {moving_avg_residual:>6.3f} + {w:g}*{moving_avg_boundary:>8.3f}"
-            self._table_rows.append(
-                (
-                    f"{epoch + 1}/{self.epochs}",
-                    lr_str,
-                    f"{moving_avg_grad_norm:.3f}",
-                    loss_str,
-                    val_loss_str,
-                    f"{moving_avg_time:.2f}s",
-                )
+            row = (
+                f"{epoch + 1}/{self.epochs}",
+                lr_str,
+                f"{moving_avg_grad_norm:.3f}",
+                loss_str,
+                val_loss_str,
+                f"{moving_avg_time:.2f}s",
             )
-            self._table = self._new_table()
+            self._table_rows.append(row)
+            if self.metrics_row_sink is not None:
+                self.metrics_row_sink(row)
+            # build fully, then swap: the TUI thread may render self._table mid-update
+            table = self._new_table()
             for row in self._table_rows:
-                self._table.add_row(*row)
+                table.add_row(*row)
+            self._table = table
 
             self._accumulated_loss = 0.0
             self._accumulated_residual = 0.0
@@ -635,7 +698,8 @@ class NetworkManager:
             )
 
         self._progress.update(self._epoch_task, advance=1)
-        self._live.update(Panel(Group(self._table, self._progress), border_style="cyan"))
+        if self._live is not None:
+            self._live.update(self.training_renderable())
 
     def train(
         self,
@@ -643,39 +707,70 @@ class NetworkManager:
         validation_callback: Callable[[int, float | None], None] | None = None,
         show_progress: bool = True,
     ) -> float:
-        live = self._init_live_display() if show_progress else nullcontext()
-        val_configs = self._create_validation_configs()
-        val_loss = None
-        with live as active_live:
+        self.artifact_stem = self._new_artifact_stem()
+        run_dir = self.run_dir()
+        run_dir.mkdir(parents=True, exist_ok=True)
+        # Full per-run log file; DEBUG epoch lines land here but not on the
+        # Rich console handler (which stays at INFO next to the live table).
+        file_handler = logging.FileHandler(run_dir / "train.log")
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        previous_level = logger.level
+        logger.setLevel(logging.DEBUG)
+        logger.addHandler(file_handler)
+        logger.debug(f"run {self.artifact_stem} hyperparams: {self.config.to_dict()}")
+
+        try:
+            # Metrics (table + training_log CSV) are always tracked; Live only owns the
+            # terminal in CLI mode. The HPO TUI renders training_renderable() itself.
+            self._live = None
             if show_progress:
-                self._live = active_live
-            for epoch in range(self.epochs):
-                start_time = time.perf_counter()
-                loss, residual, boundary, grad_norm = self.train_epoch(epoch)
-                epoch_time = time.perf_counter() - start_time
-
-                val_loss = None
-                if (epoch + 1) % VALIDATION_FREQUENCY == 0:
-                    val_loss = self._calculate_validation_loss(val_configs)
-                if validation_callback is not None:
-                    validation_callback(epoch + 1, val_loss)
-
+                live = self._init_live_display()
+            else:
+                self._init_metrics_display()
+                live = nullcontext()
+            val_configs = self._create_validation_configs()
+            val_loss = None
+            with live as active_live:
                 if show_progress:
+                    self._live = active_live
+                for epoch in range(self.epochs):
+                    start_time = time.perf_counter()
+                    loss, residual, boundary, grad_norm = self.train_epoch(epoch)
+                    epoch_time = time.perf_counter() - start_time
+
+                    val_loss = None
+                    if (epoch + 1) % VALIDATION_FREQUENCY == 0:
+                        val_loss = self._calculate_validation_loss(val_configs)
+                    if validation_callback is not None:
+                        validation_callback(epoch + 1, val_loss)
+
                     lr = float(self._lr_schedule(self.state.step))
+                    logger.debug(
+                        f"epoch {epoch + 1}/{self.epochs} loss={loss:.6f} "
+                        f"residual={residual:.6f} boundary={boundary:.6f} "
+                        f"val_loss={'' if val_loss is None else f'{val_loss:.6f}'} "
+                        f"lr={lr:.2e} grad_norm={grad_norm:.6f} time={epoch_time:.3f}s"
+                    )
                     self._log_metric(
                         epoch, loss, residual, boundary, val_loss, lr, grad_norm, epoch_time
                     )
 
-        if self.config.lbfgs_steps > 0:
-            self.lbfgs(self.config.lbfgs_steps)
-            val_loss = self._calculate_validation_loss(val_configs)
+            if self.config.lbfgs_steps > 0:
+                self.lbfgs(self.config.lbfgs_steps)
+                val_loss = self._calculate_validation_loss(val_configs)
 
-        if val_loss is None:
-            val_loss = self._calculate_validation_loss(val_configs)
+            if val_loss is None:
+                val_loss = self._calculate_validation_loss(val_configs)
+            logger.debug(f"run {self.artifact_stem} final val_loss={val_loss:.6f}")
 
-        if save_to_disk:
-            self.to_disk()
-        return val_loss
+            if save_to_disk:
+                self.to_disk()
+            return val_loss
+        finally:
+            logger.removeHandler(file_handler)
+            file_handler.close()
+            logger.setLevel(previous_level)
 
     def lbfgs(self, steps: int) -> None:
         """Polish AdamW-trained params with L-BFGS on one fixed batch.
@@ -741,15 +836,7 @@ class NetworkManager:
         Returns:
             Callable[(params, R, Z, config) -> psi] for physics calculations.
         """
-        apply_fn = self.model.apply
-
-        def psi_fn(p: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
-            inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
-            p_n, r_n, z_n = inp.normalize()
-            psi_n = apply_fn(p, r=r_n, z=z_n, **p_n)
-            return denormalize_psi(psi_n, R, Z, cfg)
-
-        return psi_fn
+        return functools.partial(apply_psi_fn, self.model.apply)
 
 
 if __name__ == "__main__":
@@ -775,6 +862,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
+    manager = None
     try:
         if not args.test:
             config = HyperParams(
@@ -791,7 +879,7 @@ if __name__ == "__main__":
             globals()["VALIDATION_FREQUENCY"] = 20
             config = HyperParams(
                 huber_delta=args.huber_delta,
-                lbfgs_steps=args.lbfgs,
+                lbfgs_steps=64,
                 hidden_dims=(32, 32),
                 batch_size=8,
                 n_rz_inner_samples=64,
@@ -807,3 +895,6 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error(f"Execution failed with an error: {e}", exc_info=True)
         raise
+    finally:
+        if manager is not None:
+            manager.discard_unsaved_run()

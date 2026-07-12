@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { api, benchmarkStream, useApi, type BenchmarkEvent } from '../api'
+import { api, benchmarkFileUrl, benchmarkStream, useApi, type BenchmarkEvent } from '../api'
 import { GridHeatmap } from '../plots'
 import { plasmaGradient } from '../three/colormap'
 import { Colorbar, Panel, Section, Segmented, Slider, Spinner, Stat, Toggle } from '../ui'
@@ -127,6 +127,7 @@ export function BenchmarkView() {
         {running && <Spinner />}
         {error && <div className="error">{error}</div>}
         <div className="scroll">
+          <SavedBenchmarks />
           {rows.length === 0 && !running && (
             <div className="empty">Select networks and run to compare checkpoints.</div>
           )}
@@ -147,6 +148,56 @@ export function BenchmarkView() {
         </div>
       </div>
     </div>
+  )
+}
+
+function SavedBenchmarks() {
+  const tree = useApi('benchmarks', api.benchmarks)
+  const commits = Object.entries(tree.data ?? {}).filter(([, runs]) => Object.keys(runs).length > 0)
+  if (commits.length === 0) return null
+  return (
+    <details className="bench-saved">
+      <summary>Saved benchmarks ({commits.length} commits)</summary>
+      {commits.map(([commit, runs]) => (
+        <details className="bench-saved" key={commit}>
+          <summary>
+            {commit}
+            {runs['.']?.map((f) => (
+              <a className="chip" key={f} href={benchmarkFileUrl(commit, '.', f)} target="_blank" rel="noreferrer">
+                {f}
+              </a>
+            ))}
+          </summary>
+          {Object.entries(runs)
+            .filter(([run]) => run !== '.')
+            .map(([run, files]) => (
+              <div className="bench-row" key={run}>
+                <div className="bench-head">
+                  <span className="name">{run}</span>
+                  {files
+                    .filter((f) => !f.endsWith('.png'))
+                    .map((f) => (
+                      <a className="chip" key={f} href={benchmarkFileUrl(commit, run, f)} target="_blank" rel="noreferrer">
+                        {f}
+                      </a>
+                    ))}
+                </div>
+                {files
+                  .filter((f) => f.endsWith('.png'))
+                  .map((f) => (
+                    <img
+                      key={f}
+                      src={benchmarkFileUrl(commit, run, f)}
+                      alt={`${run} ${f}`}
+                      loading="lazy"
+                      style={{ maxWidth: '100%' }}
+                    />
+                  ))}
+              </div>
+            ))}
+        </details>
+      ))}
+    </details>
   )
 }
 

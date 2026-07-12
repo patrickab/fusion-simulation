@@ -1,18 +1,17 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from scipy.stats import qmc
 
-from src.engine.network import BASE_SEED, NetworkManager, denormalize_psi
+from src.engine.network import BASE_SEED, NetworkManager
 from src.engine.physics import grad_shafranov_residual
 from src.engine.plasma import get_poloidal_points
 from src.lib.geometry_config import PlasmaConfig
-from src.lib.network_config import FluxInput
 
 GridQuantity = Literal["flux", "residual"]
 DEFAULT_KPI_SAMPLE_SIZE = 16_384
@@ -31,21 +30,6 @@ class PlasmaGridBatch:
     values: dict[GridQuantity, jnp.ndarray]
 
 
-def build_psi_fn(
-    manager: NetworkManager,
-) -> Callable[[object, jnp.ndarray, jnp.ndarray, PlasmaConfig], jnp.ndarray]:
-    """Build a ``psi_fn`` closure matching the training-time normalization/signature."""
-    apply_fn = manager.model.apply
-
-    def psi_fn(params: object, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
-        inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
-        p_n, r_n, z_n = inp.normalize()
-        psi_n = apply_fn(params, r=r_n, z=z_n, **p_n)
-        return denormalize_psi(psi_n, R, Z, cfg)
-
-    return psi_fn
-
-
 def compute_gs_residual_on_points(
     manager: NetworkManager,
     config: PlasmaConfig,
@@ -53,7 +37,7 @@ def compute_gs_residual_on_points(
     Z_pts: jnp.ndarray,
 ) -> jnp.ndarray:
     """Evaluate normalised Grad-Shafranov residual at supplied ``(R, Z)`` points."""
-    psi_fn = build_psi_fn(manager)
+    psi_fn = manager.make_psi_fn()
     params = manager.state.params
 
     psi_vals = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R_pts, Z_pts)
@@ -93,7 +77,7 @@ def evaluate_plasma_kpis(
     if not core.any() or core.all():
         raise ValueError("KPI sample does not cover both core and edge regions")
 
-    psi_fn = build_psi_fn(manager)
+    psi_fn = manager.make_psi_fn()
     params = manager.state.params
     boundary_theta = jnp.linspace(0.0, 2.0 * jnp.pi, 257)[:-1]
     losses = []
@@ -176,7 +160,7 @@ def evaluate_plasma_grids(
         return jax.vmap(lambda t, r: get_poloidal_points(t, cfg.Geometry, r))(theta_flat, rho_flat)
 
     R_flat, Z_flat = jax.vmap(coordinates)(batched_config)
-    psi_fn = build_psi_fn(manager)
+    psi_fn = manager.make_psi_fn()
     params = manager.state.params
 
     def fields(R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> tuple[jnp.ndarray, ...]:
@@ -298,21 +282,24 @@ def plot_plasma_grid_montage(
 if __name__ == "__main__":
     # Region-split |GS residual| report: selection metric is the plasma core
     # (rho < --core-rho); the edge shell is reported but tolerated by design.
-    # Appends KPI rows to <outdir>/kpis.csv and saves one residual-heatmap
-    # montage PNG per checkpoint (fixed log color scale for comparability).
+    # Outputs are grouped per commit: <outdir>/<commit>/kpis.csv (appended) plus
+    # one <outdir>/<commit>/<run>/ dir per checkpoint holding config.json,
+    # training.csv and the montage PNG (fixed log color scale for comparability).
     import argparse
     import csv
     from datetime import datetime
+    import shutil
 
     from src.lib.config import Filepaths
     from src.lib.network_config import DomainBounds, HyperParams
+    from src.streamlit.network_utils import extract_commit
 
     parser = argparse.ArgumentParser(description="Region-split |GS residual| KPIs per checkpoint")
     parser.add_argument("networks", nargs="*", help="Checkpoint names (default: all *.flax)")
     parser.add_argument("--n-configs", type=int, default=8)
     parser.add_argument("--n-points", type=int, default=DEFAULT_KPI_SAMPLE_SIZE)
     parser.add_argument("--core-rho", type=float, default=0.85)
-    parser.add_argument("--outdir", type=str, default="logs/experiments")
+    parser.add_argument("--outdir", type=str, default=str(Filepaths.BENCHMARKS))
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--plot-resolution", type=int, default=96)
     parser.add_argument("--plot-title")
@@ -341,10 +328,14 @@ if __name__ == "__main__":
         f"{'core_med':>9} {'core_avg':>9} {'core_p95':>9} {'core_p05':>9} "
         f"{'edge_p95':>9} {'bnd_leak':>9}"
     )
-    csv_path = outdir / "kpis.csv"
-    write_header = not csv_path.exists()
     for name in names:
+        run_dir = outdir / (extract_commit(name) or "no_git") / Path(name).stem
+        run_dir.mkdir(parents=True, exist_ok=True)
         hp = HyperParams.from_json(str((Filepaths.NETWORKS / name).with_suffix(".json")))
+        shutil.copyfile((Filepaths.NETWORKS / name).with_suffix(".json"), run_dir / "config.json")
+        training_csv = (Filepaths.NETWORKS / name).with_suffix(".csv")
+        if training_csv.exists():
+            shutil.copyfile(training_csv, run_dir / "training.csv")
         manager = NetworkManager(hp)
         loaded = manager.from_disk(pinn_path=Filepaths.NETWORKS / name)
         manager.state = manager.state.replace(params=loaded)
@@ -360,6 +351,8 @@ if __name__ == "__main__":
             + " ".join(f"{value:>9.4f}" for value in kpis.values())
         )
 
+        csv_path = run_dir.parent / "kpis.csv"
+        write_header = not csv_path.exists()
         with open(csv_path, "a", newline="") as f:
             writer = csv.writer(f)
             if write_header:
@@ -377,7 +370,6 @@ if __name__ == "__main__":
                         *kpis.keys(),
                     ]
                 )
-                write_header = False
             writer.writerow(
                 [
                     datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -406,7 +398,7 @@ if __name__ == "__main__":
             title = f"{args.plot_title}: {title}"
         plot_plasma_grid_montage(
             grids,
-            outdir / f"{args.plot_quantity}_{Path(name).stem}.png",
+            run_dir / f"{args.plot_quantity}.png",
             quantity=args.plot_quantity,
             title=title,
             metadata=hp.to_dict(),
