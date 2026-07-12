@@ -32,22 +32,22 @@ from textual.widgets import Footer, RichLog, Static
 
 from src.engine.network import NetworkManager
 from src.engine.network import logger as network_logger
-from src.lib.config import current_commit
+from src.lib.config import Filepaths, current_commit
 from src.lib.logger import get_logger
 from src.lib.network_config import HyperParams
 
 logger = get_logger(name="OptunaHPO")
 console = Console(width=160)
 
-HPO_ROOT = Path("logs/hpo")
+HPO_ROOT = Filepaths.DATA / "hpo"
 
 
 def study_dir(study_name: str, commit: str | None = None) -> Path:
     """Per-study bundle under the running commit:
 
-    ``logs/hpo/<commit>/<study>/{study.db, optuna.log, top_trials.json, trials.json}``.
+    ``data/hpo/<commit>/<study>/{study.db, optuna.log, top_trials.json, trials.json}``.
 
-    Mirrors the per-commit benchmark tree (``logs/benchmarks/<commit>/<run>/``):
+    Mirrors the per-commit benchmark tree (``data/benchmarks/<commit>/<run>/``):
     a commit is one code revision, and all HPO studies run against that revision
     land together. ``commit`` defaults to HEAD so callers don't have to thread it.
     """

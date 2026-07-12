@@ -1,4 +1,3 @@
-from datetime import datetime
 import json
 
 from src.engine.network import NetworkManager
@@ -25,8 +24,8 @@ PLOT_GRID_RESOLUTION = 80
 
 
 def render_benchmark_row(network_name: str, configs: list[PlasmaConfig], mode: str) -> None:
-    pinn_path = Filepaths.NETWORKS / network_name
-    config_path = pinn_path.with_suffix(".json")
+    run_dir = Filepaths.BENCHMARKS / network_name
+    config_path = run_dir / "config.json"
 
     if not config_path.exists():
         st.error(f"Missing config for {network_name}")
@@ -36,7 +35,7 @@ def render_benchmark_row(network_name: str, configs: list[PlasmaConfig], mode: s
     with open(config_path) as f:
         config_dict = json.load(f)
 
-    display_name = network_name.replace(".flax", "")
+    display_name = network_name
 
     with st.expander(display_name, expanded=True):
         col_meta, col_plots = st.columns([1, 4])
@@ -46,7 +45,7 @@ def render_benchmark_row(network_name: str, configs: list[PlasmaConfig], mode: s
 
         with col_plots:
             manager = NetworkManager(network_config)
-            params = manager.from_disk(pinn_path=pinn_path)
+            params = manager.from_disk(pinn_path=run_dir / "network.flax")
             manager.state = manager.state.replace(params=params)
 
             if mode in ["Flux Prediction", "Both"]:
@@ -68,7 +67,7 @@ def init_session_state(networks: list[str]) -> None:
     if "manager" not in st.session_state:
         config = HyperParams()
         if networks:
-            config_path = (Filepaths.NETWORKS / networks[0]).with_suffix(".json")
+            config_path = Filepaths.BENCHMARKS / networks[0] / "config.json"
             if config_path.exists():
                 config = HyperParams.from_json(config_path)
         st.session_state.manager = NetworkManager(config)

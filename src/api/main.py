@@ -1,6 +1,8 @@
 """FastAPI layer wrapping the existing src/ physics + network code for the React frontend."""
 
+import contextlib
 import json
+import shutil
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,9 +18,10 @@ from src.api.schemas import (
     RenameRequest,
     SampleRequest,
 )
+from src.api.state import resolve_run_directory
 from src.lib.config import Filepaths
 from src.lib.geometry_config import ToroidalCoilConfig
-from src.streamlit.network_utils import get_available_networks, move_network_files
+from src.streamlit.network_utils import get_available_networks
 
 app = FastAPI(title="fusion-simulation API")
 
@@ -41,22 +44,21 @@ def list_networks(view_mode: str = "New Benchmarks") -> list[str]:
 
 @app.get("/api/benchmarks")
 def list_benchmarks() -> dict[str, dict[str, list[str]]]:
-    """logs/benchmarks tree: {commit: {run: [file, ...]}}; kpis.csv listed under '.'."""
+    """data/benchmarks tree: {commit: {run: [file, ...]}}."""
     tree: dict[str, dict[str, list[str]]] = {}
     for commit_dir in sorted(p for p in Filepaths.BENCHMARKS.iterdir() if p.is_dir()):
         runs: dict[str, list[str]] = {}
-        commit_files = sorted(f.name for f in commit_dir.iterdir() if f.is_file())
-        if commit_files:
-            runs["."] = commit_files
         for run in sorted(p for p in commit_dir.iterdir() if p.is_dir()):
             runs[run.name] = sorted(f.name for f in run.iterdir() if f.is_file())
-        tree[commit_dir.name] = runs
+        if runs:
+            tree[commit_dir.name] = runs
     return tree
 
 
 @app.get("/api/network/{name:path}/config")
 def network_config(name: str) -> dict:
-    config_path = (Filepaths.NETWORKS / name).with_suffix(".json")
+    run_dir = resolve_run_directory(name)
+    config_path = run_dir / "config.json"
     if not config_path.exists():
         raise HTTPException(404, f"No config found for {name}")
     return json.loads(config_path.read_text())
@@ -64,27 +66,32 @@ def network_config(name: str) -> dict:
 
 @app.post("/api/network/{name:path}/archive")
 def archive_network(name: str) -> dict:
-    Filepaths.NETWORK_ARCHIVE.mkdir(parents=True, exist_ok=True)
-    new_path_stem = Filepaths.NETWORK_ARCHIVE / (Filepaths.NETWORKS / name).stem
-    move_network_files(name, new_path_stem)
+    run_dir = resolve_run_directory(name)
+    commit = run_dir.parent.name
+    target = Filepaths.BENCHMARK_ARCHIVE / commit / run_dir.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(run_dir), str(target))
+    with contextlib.suppress(OSError):
+        run_dir.parent.rmdir()
     state.invalidate(name)
     return {"ok": True}
 
 
 @app.post("/api/network/{name:path}/rename")
 def rename_network(name: str, body: RenameRequest) -> dict:
-    old_path = Filepaths.NETWORKS / name
-    new_path_stem = old_path.parent / body.new_name
-    move_network_files(name, new_path_stem)
+    run_dir = resolve_run_directory(name)
+    new_path = run_dir.parent / body.new_name
+    shutil.move(str(run_dir), str(new_path))
     state.invalidate(name)
-    return {"name": str(new_path_stem.with_suffix(".flax").relative_to(Filepaths.NETWORKS))}
+    return {"name": f"{new_path.parent.name}/{new_path.name}"}
 
 
 @app.delete("/api/network/{name:path}")
 def delete_network(name: str) -> dict:
-    target_path = Filepaths.NETWORKS / name
-    target_path.unlink(missing_ok=True)
-    target_path.with_suffix(".json").unlink(missing_ok=True)
+    run_dir = resolve_run_directory(name)
+    shutil.rmtree(run_dir, ignore_errors=True)
+    with contextlib.suppress(OSError):
+        run_dir.parent.rmdir()
     state.invalidate(name)
     return {"ok": True}
 

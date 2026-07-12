@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import shutil
 
 import jax.numpy as jnp
 from stpyvista import stpyvista
@@ -39,8 +40,9 @@ def _get_networks() -> list[str]:
 
 def sync_selected_network() -> None:
     """Load selected checkpoint once and reseed shared samples."""
-    pinn_path = Filepaths.NETWORKS / st.session_state.selected_pinn
-    new_config = HyperParams.from_json(pinn_path.with_suffix(".json"))
+    run_dir = Filepaths.BENCHMARKS / st.session_state.selected_pinn
+    config_path = run_dir / "config.json"
+    new_config = HyperParams.from_json(config_path)
 
     # Re-instantiate only if the JIT-sensitive architecture changes
     if (
@@ -53,7 +55,7 @@ def sync_selected_network() -> None:
         st.session_state.manager.config = new_config
         st.session_state.manager.sampler.config = new_config
 
-    params = st.session_state.manager.from_disk(pinn_path=pinn_path)
+    params = st.session_state.manager.from_disk(pinn_path=run_dir / "network.flax")
     st.session_state.manager.state = st.session_state.manager.state.replace(params=params)
     reseed_network_visualisation()
 
@@ -156,8 +158,10 @@ def render_3d_topology_tab():  # noqa
 
 
 def handle_archive() -> None:
-    Filepaths.NETWORK_ARCHIVE.mkdir(parents=True, exist_ok=True)
-    new_path_stem = Filepaths.NETWORK_ARCHIVE / Path(st.session_state.selected_pinn).stem
+    Filepaths.BENCHMARK_ARCHIVE.mkdir(parents=True, exist_ok=True)
+    old_run_dir = Filepaths.BENCHMARKS / st.session_state.selected_pinn
+    commit = old_run_dir.parent.name
+    new_path_stem = Filepaths.BENCHMARK_ARCHIVE / commit / old_run_dir.name
     move_network_files(st.session_state.selected_pinn, new_path_stem)
     _update_networks_after_action()
 
@@ -166,25 +170,21 @@ def handle_rename(new_name: str) -> None:
     if not new_name:
         return
 
-    old_path = Filepaths.NETWORKS / st.session_state.selected_pinn
+    old_path = Filepaths.BENCHMARKS / st.session_state.selected_pinn
     new_path_stem = old_path.parent / new_name
 
     move_network_files(st.session_state.selected_pinn, new_path_stem)
 
     st.session_state.available_networks = _get_networks()
-    st.session_state._next_pinn = str(
-        new_path_stem.with_suffix(".flax").relative_to(Filepaths.NETWORKS)
-    )
+    st.session_state._next_pinn = f"{new_path_stem.parent.name}/{new_path_stem.name}"
     st.session_state.rename_mode = False
     st.rerun()
 
 
 def handle_delete() -> None:
-    target_path = Filepaths.NETWORKS / st.session_state.selected_pinn
-    if target_path.exists():
-        target_path.unlink()
-    if target_path.with_suffix(".json").exists():
-        target_path.with_suffix(".json").unlink()
+    target_path = Filepaths.BENCHMARKS / st.session_state.selected_pinn
+    if target_path.is_dir():
+        shutil.rmtree(target_path, ignore_errors=True)
 
     st.session_state.rename_mode = False
     _update_networks_after_action()
@@ -278,9 +278,10 @@ def render_sidebar() -> None:
 
         st.divider()
 
-        pinn_path = Filepaths.NETWORKS / st.session_state.selected_pinn
-        if pinn_path.with_suffix(".json").exists():
-            with open(pinn_path.with_suffix(".json")) as f:
+        pinn_path = Filepaths.BENCHMARKS / st.session_state.selected_pinn
+        config_path = pinn_path / "config.json"
+        if config_path.exists():
+            with open(config_path) as f:
                 st.json(json.load(f))
 
 

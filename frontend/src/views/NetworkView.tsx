@@ -28,7 +28,7 @@ const TAB_LABELS: Record<Tab, string> = {
 }
 
 const fmtExp = (v: number) => v.toExponential(2)
-const short = (name: string) => name.replace(/\.flax$/, '')
+const short = (name: string) => name.split('/')[1] ?? name
 
 export function NetworkView() {
   const [viewMode, setViewMode] = useState<(typeof VIEW_MODES)[number]>('New Benchmarks')

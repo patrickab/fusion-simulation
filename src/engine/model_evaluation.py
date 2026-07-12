@@ -1,5 +1,6 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+import json
 from pathlib import Path
 from typing import Literal
 
@@ -282,24 +283,25 @@ def plot_plasma_grid_montage(
 if __name__ == "__main__":
     # Region-split |GS residual| report: selection metric is the plasma core
     # (rho < --core-rho); the edge shell is reported but tolerated by design.
-    # Outputs are grouped per commit: <outdir>/<commit>/kpis.csv (appended) plus
-    # one <outdir>/<commit>/<run>/ dir per checkpoint holding config.json,
-    # training.csv and the montage PNG (fixed log color scale for comparability).
+    # Each run dir (data/benchmarks/<commit>/<run>/) already holds network.flax,
+    # config.json and training.csv from training; this CLI adds kpis.json and the
+    # montage PNG (fixed log color scale for comparability) into the same dir.
     import argparse
-    import csv
     from datetime import datetime
-    import shutil
 
     from src.lib.config import Filepaths
     from src.lib.network_config import DomainBounds, HyperParams
-    from src.streamlit.network_utils import extract_commit
+    from src.streamlit.network_utils import get_available_networks
 
     parser = argparse.ArgumentParser(description="Region-split |GS residual| KPIs per checkpoint")
-    parser.add_argument("networks", nargs="*", help="Checkpoint names (default: all *.flax)")
+    parser.add_argument(
+        "networks",
+        nargs="*",
+        help="Network names as commit/run (default: all in data/benchmarks/)",
+    )
     parser.add_argument("--n-configs", type=int, default=8)
     parser.add_argument("--n-points", type=int, default=DEFAULT_KPI_SAMPLE_SIZE)
     parser.add_argument("--core-rho", type=float, default=0.85)
-    parser.add_argument("--outdir", type=str, default=str(Filepaths.BENCHMARKS))
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--plot-resolution", type=int, default=96)
     parser.add_argument("--plot-title")
@@ -312,9 +314,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    outdir = Path(args.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    names = args.networks or sorted(p.name for p in Filepaths.NETWORKS.glob("*.flax"))
+    names = args.networks or get_available_networks(view_mode="All")
 
     lower, upper = DomainBounds.get_bounds()
     sobol = qmc.Sobol(d=len(lower), scramble=True, seed=BASE_SEED + 123)
@@ -323,21 +323,26 @@ if __name__ == "__main__":
         dtype=jnp.float32,
     )
     print(
-        f"{'network':<42} {'loss':>10} {'lr_max':>8} {'nff':>4} "
+        f"{'network':<50} {'loss':>10} {'lr_max':>8} {'nff':>4} "
         f"{'lbfgs':>6} {'median':>9} {'mean':>9} {'p95':>9} {'p05':>9} "
         f"{'core_med':>9} {'core_avg':>9} {'core_p95':>9} {'core_p05':>9} "
         f"{'edge_p95':>9} {'bnd_leak':>9}"
     )
     for name in names:
-        run_dir = outdir / (extract_commit(name) or "no_git") / Path(name).stem
-        run_dir.mkdir(parents=True, exist_ok=True)
-        hp = HyperParams.from_json(str((Filepaths.NETWORKS / name).with_suffix(".json")))
-        shutil.copyfile((Filepaths.NETWORKS / name).with_suffix(".json"), run_dir / "config.json")
-        training_csv = (Filepaths.NETWORKS / name).with_suffix(".csv")
-        if training_csv.exists():
-            shutil.copyfile(training_csv, run_dir / "training.csv")
+        run_dir = Filepaths.BENCHMARKS / name
+        if not run_dir.is_dir():
+            run_dir = Filepaths.BENCHMARK_ARCHIVE / name
+        if not run_dir.is_dir():
+            print(f"  skip {name}: run dir not found")
+            continue
+        config_path = run_dir / "config.json"
+        flax_path = run_dir / "network.flax"
+        if not config_path.exists() or not flax_path.exists():
+            print(f"  skip {name}: missing config or network.flax")
+            continue
+        hp = HyperParams.from_json(str(config_path))
         manager = NetworkManager(hp)
-        loaded = manager.from_disk(pinn_path=Filepaths.NETWORKS / name)
+        loaded = manager.from_disk(pinn_path=flax_path)
         manager.state = manager.state.replace(params=loaded)
         inputs = manager.sampler.sample_flux_input(plasma_configs=val_configs)
         configs = [inputs.config[i] for i in range(args.n_configs)]
@@ -346,44 +351,29 @@ if __name__ == "__main__":
         )
         loss_label = f"huber={hp.huber_delta:g}" if hp.huber_delta > 0 else "mse"
         print(
-            f"{name:<42} {loss_label:>10} {hp.learning_rate_max:>8.1e} "
+            f"{name:<50} {loss_label:>10} {hp.learning_rate_max:>8.1e} "
             f"{hp.n_fourier_features:>4d} {hp.lbfgs_steps:>6d} "
             + " ".join(f"{value:>9.4f}" for value in kpis.values())
         )
 
-        csv_path = run_dir.parent / "kpis.csv"
-        write_header = not csv_path.exists()
-        with open(csv_path, "a", newline="") as f:
-            writer = csv.writer(f)
-            if write_header:
-                writer.writerow(
-                    [
-                        "date",
-                        "network",
-                        "loss",
-                        "lr_max",
-                        "n_fourier_features",
-                        "lbfgs_steps",
-                        "n_configs",
-                        "n_points",
-                        "core_rho",
-                        *kpis.keys(),
-                    ]
-                )
-            writer.writerow(
-                [
-                    datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    name,
-                    loss_label,
-                    hp.learning_rate_max,
-                    hp.n_fourier_features,
-                    hp.lbfgs_steps,
-                    args.n_configs,
-                    args.n_points,
-                    args.core_rho,
-                    *(f"{v:.5f}" for v in kpis.values()),
-                ]
-            )
+        # kpis.json: one key per line, readable from the terminal at a glance.
+        # Overwritten each run (latest eval wins); the eval params are included
+        # so the file is self-describing without needing config.json alongside.
+        record = {
+            "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "network": name,
+            "loss": loss_label,
+            "lr_max": hp.learning_rate_max,
+            "n_fourier_features": hp.n_fourier_features,
+            "lbfgs_steps": hp.lbfgs_steps,
+            "n_configs": args.n_configs,
+            "n_points": args.n_points,
+            "core_rho": args.core_rho,
+            **kpis,
+        }
+        (run_dir / "kpis.json").write_text(
+            "\n".join(f'"{k}": {json.dumps(v)},' for k, v in record.items()) + "\n"
+        )
 
         if args.no_plots:
             continue
@@ -393,7 +383,7 @@ if __name__ == "__main__":
             resolution=args.plot_resolution,
             quantities=(args.plot_quantity,),
         )
-        title = Path(name).stem
+        title = name
         if args.plot_title:
             title = f"{args.plot_title}: {title}"
         plot_plasma_grid_montage(

@@ -9,8 +9,8 @@ const MODE_LABELS = { 'Flux Prediction': 'Flux', 'GS Residual': 'Residual', Both
 
 type Row = Extract<BenchmarkEvent, { type: 'row' | 'row_error' }>
 
-const short = (name: string) => name.replace(/\.flax$/, '')
-const commitOf = (name: string) => /_([0-9a-f]{6,})\.flax$/.exec(name)?.[1]
+const short = (name: string) => name.split('/')[1] ?? name
+const commitOf = (name: string) => name.split('/')[0]
 
 export function BenchmarkView() {
   const networks = useApi<string[]>('networks:All', () => api.networks('All'))
@@ -160,41 +160,32 @@ function SavedBenchmarks() {
       <summary>Saved benchmarks ({commits.length} commits)</summary>
       {commits.map(([commit, runs]) => (
         <details className="bench-saved" key={commit}>
-          <summary>
-            {commit}
-            {runs['.']?.map((f) => (
-              <a className="chip" key={f} href={benchmarkFileUrl(commit, '.', f)} target="_blank" rel="noreferrer">
-                {f}
-              </a>
-            ))}
-          </summary>
-          {Object.entries(runs)
-            .filter(([run]) => run !== '.')
-            .map(([run, files]) => (
-              <div className="bench-row" key={run}>
-                <div className="bench-head">
-                  <span className="name">{run}</span>
-                  {files
-                    .filter((f) => !f.endsWith('.png'))
-                    .map((f) => (
-                      <a className="chip" key={f} href={benchmarkFileUrl(commit, run, f)} target="_blank" rel="noreferrer">
-                        {f}
-                      </a>
-                    ))}
-                </div>
+          <summary>{commit}</summary>
+          {Object.entries(runs).map(([run, files]) => (
+            <div className="bench-row" key={run}>
+              <div className="bench-head">
+                <span className="name">{run}</span>
                 {files
-                  .filter((f) => f.endsWith('.png'))
+                  .filter((f) => !f.endsWith('.png'))
                   .map((f) => (
-                    <img
-                      key={f}
-                      src={benchmarkFileUrl(commit, run, f)}
-                      alt={`${run} ${f}`}
-                      loading="lazy"
-                      style={{ maxWidth: '100%' }}
-                    />
+                    <a className="chip" key={f} href={benchmarkFileUrl(commit, run, f)} target="_blank" rel="noreferrer">
+                      {f}
+                    </a>
                   ))}
               </div>
-            ))}
+              {files
+                .filter((f) => f.endsWith('.png'))
+                .map((f) => (
+                  <img
+                    key={f}
+                    src={benchmarkFileUrl(commit, run, f)}
+                    alt={`${run} ${f}`}
+                    loading="lazy"
+                    style={{ maxWidth: '100%' }}
+                  />
+                ))}
+            </div>
+          ))}
         </details>
       ))}
     </details>

@@ -23,15 +23,14 @@ class Filepaths:
 
     ROOT = Path.cwd()
     DATA = Path(ROOT) / "data"
-    NETWORKS = DATA / "networks"
-    NETWORK_ARCHIVE = NETWORKS / "archive"
 
-    if not NETWORKS.exists():
-        print(f"Creating output directory at {NETWORKS}")
-        pathlib.Path.mkdir(DATA / "networks", parents=True)
+    if not DATA.exists():
+        print(f"Creating output directory at {DATA}")
+        pathlib.Path.mkdir(DATA, parents=True)
 
-    # Per-commit benchmark tree: <commit>/<run>/{config.json,training.csv,train.log,*.png}
-    BENCHMARKS = ROOT / "logs" / "benchmarks"
+    # Per-commit benchmark tree: <commit>/<run>/{network.flax,config.json,...}
+    BENCHMARKS = DATA / "benchmarks"
+    BENCHMARK_ARCHIVE = BENCHMARKS / "_archive"
 
     PLASMA_SURFACE = DATA / "plasma_surface.ply"
     TOROIDAL_COILS = DATA / "toroidal_field_coils.ply"
