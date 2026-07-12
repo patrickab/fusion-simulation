@@ -1,4 +1,4 @@
-import type { ReactNode } from 'react'
+import { memo, type ReactNode } from 'react'
 import type { Data, Layout } from 'plotly.js'
 import { Plot, baseConfig, baseLayout } from './plotly'
 import type { GeometryResponse, Grid2D, GridQuantity, Sample } from './api'
@@ -11,14 +11,27 @@ export type Range2 = [number, number]
 function orderBoundary(R: number[], Z: number[]): { x: number[]; y: number[] } {
   const cR = R.reduce((s, v) => s + v, 0) / R.length
   const cZ = Z.reduce((s, v) => s + v, 0) / Z.length
-  const idx = R.map((_, i) => i).sort(
-    (a, b) => Math.atan2(Z[a] - cZ, R[a] - cR) - Math.atan2(Z[b] - cZ, R[b] - cR),
-  )
+  // angles precomputed once — atan2 inside the comparator would run O(n log n) times
+  const angle = R.map((r, i) => Math.atan2(Z[i] - cZ, r - cR))
+  const idx = R.map((_, i) => i).sort((a, b) => angle[a] - angle[b])
   const x = idx.map((i) => R[i])
   const y = idx.map((i) => Z[i])
   x.push(x[0])
   y.push(y[0])
   return { x, y }
+}
+
+/** Min/max over a 2D grid in one pass — spreading 45k values into Math.min
+ *  allocates the whole argument list and overflows the call stack at high res. */
+function minMax2d(rows: number[][]): Range2 {
+  let lo = Infinity
+  let hi = -Infinity
+  for (const row of rows)
+    for (const v of row) {
+      if (v < lo) lo = v
+      if (v > hi) hi = v
+    }
+  return [lo, hi]
 }
 
 function layoutWith(xr?: Range2, yr?: Range2): Partial<Layout> {
@@ -34,7 +47,7 @@ function PlotSquare({ children, aspect = 1 }: { children: ReactNode; aspect?: nu
   return <div className="plot-square" style={{ aspectRatio: aspect }}>{children}</div>
 }
 
-export function GridHeatmap({
+export const GridHeatmap = memo(function GridHeatmap({
   grid,
   quantity,
 }: {
@@ -45,15 +58,12 @@ export function GridHeatmap({
   // grid.R/Z are 2D — one physical (R, Z) point per (theta, rho) sample, all of
   // them inside this config's own boundary by construction (src/api/network.py).
   // Bounds/aspect come from that true footprint, not a shared box across samples.
-  const flatR = grid.R.flat()
-  const flatZ = grid.Z.flat()
-  const xr: Range2 = [Math.min(...flatR), Math.max(...flatR)]
-  const yr: Range2 = [Math.min(...flatZ), Math.max(...flatZ)]
+  const xr = minMax2d(grid.R)
+  const yr = minMax2d(grid.Z)
   const aspect = (xr[1] - xr[0]) / (yr[1] - yr[0])
   // carpet-axis showticklabels is an enum ('none'), not a boolean — false gets
   // coerced back to the default 'start' and litters the plot with labels
   const noAxisLines = { showgrid: false, showline: false, showticklabels: 'none', startline: false, endline: false }
-  const flatV = grid.values.flat()
   const { colorscale, lo, hi } = quantity === 'residual'
     ? { colorscale: plasmaPlotlyScale, lo: -2, hi: 1 }
     : { colorscale: 'Viridis', lo: 0, hi: 90 }
@@ -95,15 +105,17 @@ export function GridHeatmap({
   ]
   // ponytail: carpet traces don't reliably update through Plotly.react — key on a
   // data signature so new data remounts the component (fresh newPlot instead of diff)
-  const sig = `${flatV.length}:${flatV[0]}:${flatV[flatV.length >> 1]}:${xr}:${yr}:${lo}:${hi}`
+  const vs = grid.values
+  const mid = vs[vs.length >> 1]
+  const sig = `${vs.length}x${vs[0].length}:${vs[0][0]}:${mid[mid.length >> 1]}:${xr}:${yr}:${lo}:${hi}`
   return (
     <PlotSquare aspect={aspect}>
       <Plot key={sig} data={data} layout={layoutWith(xr, yr)} config={baseConfig} style={{ width: '100%', height: '100%' }} useResizeHandler />
     </PlotSquare>
   )
-}
+})
 
-export function SampleScatter({ sample, xr, yr }: { sample: Sample; xr?: Range2; yr?: Range2 }) {
+export const SampleScatter = memo(function SampleScatter({ sample, xr, yr }: { sample: Sample; xr?: Range2; yr?: Range2 }) {
   const boundary = orderBoundary(sample.boundary_R, sample.boundary_Z)
   const data: Data[] = [
     {
@@ -128,9 +140,9 @@ export function SampleScatter({ sample, xr, yr }: { sample: Sample; xr?: Range2;
       <Plot data={data} layout={layoutWith(xr, yr)} config={baseConfig} style={{ width: '100%', height: '100%' }} useResizeHandler />
     </PlotSquare>
   )
-}
+})
 
-export function CrossSection({ geo, height = 280 }: { geo: GeometryResponse; height?: number }) {
+export const CrossSection = memo(function CrossSection({ geo, height = 280 }: { geo: GeometryResponse; height?: number }) {
   const data: Data[] = [
     {
       type: 'scatter',
@@ -144,4 +156,4 @@ export function CrossSection({ geo, height = 280 }: { geo: GeometryResponse; hei
   return (
     <Plot data={data} layout={baseLayout()} config={baseConfig} style={{ width: '100%', height }} useResizeHandler />
   )
-}
+})
