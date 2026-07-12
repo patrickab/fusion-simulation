@@ -1,5 +1,6 @@
 """Configuration module for this repository."""
 
+import os
 import pathlib
 from pathlib import Path
 import typing
@@ -8,6 +9,11 @@ from typing import Any, Iterator, Self
 import jax
 import jax.numpy as jnp
 import numpy as np
+
+
+def current_commit() -> str:
+    """Short git commit hash of HEAD, used to partition benchmark/HPO artifacts."""
+    return os.popen("git rev-parse --short HEAD").read().strip() or "no_git"
 
 
 class Filepaths:
@@ -23,6 +29,9 @@ class Filepaths:
     if not NETWORKS.exists():
         print(f"Creating output directory at {NETWORKS}")
         pathlib.Path.mkdir(DATA / "networks", parents=True)
+
+    # Per-commit benchmark tree: <commit>/<run>/{config.json,training.csv,train.log,*.png}
+    BENCHMARKS = ROOT / "logs" / "benchmarks"
 
     PLASMA_SURFACE = DATA / "plasma_surface.ply"
     TOROIDAL_COILS = DATA / "toroidal_field_coils.ply"

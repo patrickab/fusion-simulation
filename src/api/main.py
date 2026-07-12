@@ -5,6 +5,7 @@ import json
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from fastapi.staticfiles import StaticFiles
 
 from src.api import benchmark, geometry, network, state
 from src.api.schemas import (
@@ -29,9 +30,28 @@ app.add_middleware(
 )
 
 
+Filepaths.BENCHMARKS.mkdir(parents=True, exist_ok=True)
+app.mount("/api/benchmarks/files", StaticFiles(directory=Filepaths.BENCHMARKS), name="benchmarks")
+
+
 @app.get("/api/networks")
 def list_networks(view_mode: str = "New Benchmarks") -> list[str]:
     return get_available_networks(view_mode)
+
+
+@app.get("/api/benchmarks")
+def list_benchmarks() -> dict[str, dict[str, list[str]]]:
+    """logs/benchmarks tree: {commit: {run: [file, ...]}}; kpis.csv listed under '.'."""
+    tree: dict[str, dict[str, list[str]]] = {}
+    for commit_dir in sorted(p for p in Filepaths.BENCHMARKS.iterdir() if p.is_dir()):
+        runs: dict[str, list[str]] = {}
+        commit_files = sorted(f.name for f in commit_dir.iterdir() if f.is_file())
+        if commit_files:
+            runs["."] = commit_files
+        for run in sorted(p for p in commit_dir.iterdir() if p.is_dir()):
+            runs[run.name] = sorted(f.name for f in run.iterdir() if f.is_file())
+        tree[commit_dir.name] = runs
+    return tree
 
 
 @app.get("/api/network/{name:path}/config")

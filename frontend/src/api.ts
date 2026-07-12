@@ -109,7 +109,12 @@ export const api = {
   bfield: (name: string, seed: number, sampleSize: number, nLines: number) =>
     post<BFieldResponse>(`/api/network/${enc(name)}/bfield`, { seed, sample_size: sampleSize, n_lines: nLines }),
   geometry: (body: GeometryRequest) => post<GeometryResponse>('/api/geometry', body),
+  // logs/benchmarks tree: {commit: {run: [file, ...]}}; commit-level files under '.'
+  benchmarks: () => fetch('/api/benchmarks').then((r) => toJson<Record<string, Record<string, string[]>>>(r)),
 }
+
+export const benchmarkFileUrl = (commit: string, run: string, file: string) =>
+  run === '.' ? `/api/benchmarks/files/${commit}/${file}` : `/api/benchmarks/files/${commit}/${run}/${file}`
 
 export async function* benchmarkStream(
   body: {
