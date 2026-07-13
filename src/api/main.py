@@ -46,11 +46,16 @@ def list_networks(view_mode: str = "New Benchmarks") -> list[str]:
 @app.get("/api/config")
 def get_config() -> dict:
     """Frontend-facing constants so Python and TS share one source of truth."""
-    from src.engine.model_evaluation import EVAL_CONFIG_COUNT, EVAL_RESOLUTION
+    from src.engine.model_evaluation import (
+        EVAL_CONFIG_COUNT,
+        EVAL_RESOLUTION,
+        RESIDUAL_COLOR_RANGE,
+    )
 
     return {
         "eval_config_count": EVAL_CONFIG_COUNT,
         "eval_resolution": EVAL_RESOLUTION,
+        "residual_color_range": list(RESIDUAL_COLOR_RANGE),
     }
 
 

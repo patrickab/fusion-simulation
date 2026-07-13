@@ -675,9 +675,7 @@ class NetworkManager:
         table.add_column("Epoch", justify="right", style="cyan")
         table.add_column("LR", justify="right", style="yellow")
         table.add_column("||∇L||", justify="right", style="magenta")
-        table.add_column(
-            "Loss = Residual + w*Boundary", justify="right", style="magenta", no_wrap=True
-        )
+        table.add_column("Loss", justify="right", style="magenta")
         table.add_column("Val Loss", justify="right", style="green")
         table.add_column("Time/Ep", justify="right")
         return table
@@ -762,9 +760,6 @@ class NetworkManager:
                 lr=lr,
                 grad_norm=moving_avg_grad_norm,
                 loss=moving_avg_loss,
-                residual=moving_avg_residual,
-                boundary=moving_avg_boundary,
-                weight_bc=self.config.weight_boundary_condition,
                 val_loss=val_loss,
                 epoch_time=moving_avg_time,
             )
@@ -952,19 +947,20 @@ def _metrics_row(
     lr: float,
     grad_norm: float,
     loss: float,
-    residual: float,
-    boundary: float,
-    weight_bc: float,
     val_loss: float | None,
     epoch_time: float,
 ) -> tuple[str, ...]:
-    """One Training Metrics table row; shared by the live display and show_run replay."""
+    """One Training Metrics table row; shared by the live display and show_run replay.
+
+    Loss alone (no residual/boundary breakdown) — both stay in training.csv for
+    post-hoc analysis, this table is just the terminal-width-constrained live view.
+    """
     return (
         f"{epoch}/{total_epochs}",
         f"{lr:.2e}",
-        f"{grad_norm:.3f}",
-        f"{loss:>9.3f} = {residual:>6.3f} + {weight_bc:g}*{boundary:>8.3f}",
-        f"{val_loss:.3f}" if val_loss is not None else "-",
+        f"{grad_norm:.2e}",
+        f"{loss:.2e}",
+        f"{val_loss:.2e}" if val_loss is not None else "-",
         f"{epoch_time:.2f}s",
     )
 
@@ -981,7 +977,6 @@ def show_run(run: str) -> None:
     csv_path = run_dir / "training.csv"
     if not csv_path.exists():
         raise SystemExit(f"no training.csv found for run '{run}'")
-    weight_bc = json.loads((run_dir / "config.json").read_text())["weight_boundary_condition"]
 
     with open(csv_path) as f:
         rows = list(csv.DictReader(f))
@@ -1000,9 +995,6 @@ def show_run(run: str) -> None:
                 lr=float(r["lr"]),
                 grad_norm=float(r["grad_norm"]),
                 loss=float(r["moving_avg_loss"]),
-                residual=float(r["residual"]),
-                boundary=float(r["boundary"]),
-                weight_bc=weight_bc,
                 val_loss=float(r["val_loss"]) if r["val_loss"] else None,
                 epoch_time=float(r["epoch_time"]),
             )

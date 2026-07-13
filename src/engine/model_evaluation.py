@@ -21,6 +21,13 @@ GridQuantity = Literal["flux", "residual"]
 DEFAULT_KPI_SAMPLE_SIZE = 16_384
 EVAL_CONFIG_COUNT = 8
 EVAL_RESOLUTION = 200
+# Fixed residual colorbar range, shared by the montage plot and the frontend
+# (via /api/config) so both render on one comparable scale. [0, 1] was the
+# right span for soft-BC checkpoints; the hard-BC fix (commit 8a8b9a4) and its
+# corrected-physics collapse-guard pushed core residuals into the 1e-4-1e-2
+# band (N3 sweep run: core_loss_median 0.0025 vs bb503b0's soft-BC 0.087), so
+# [0, 1] now renders every current checkpoint as a flat black square.
+RESIDUAL_COLOR_RANGE: tuple[float, float] = (0.0, 0.01)
 
 
 def build_kpi_record(
@@ -311,9 +318,10 @@ def plot_plasma_grid_montage(
             vmax = vmin + 1e-6
         color = {"cmap": "viridis", "vmin": vmin, "vmax": vmax, "label": r"$\psi$"}
     else:
-        # Fixed linear scale: residual montages from different checkpoints must
-        # be directly comparable by eye for model selection; ≥1 saturates.
-        color = {"cmap": "magma", "vmin": 0.0, "vmax": 1.0, "label": r"$|R_{GS}|$"}
+        # Fixed linear scale (RESIDUAL_COLOR_RANGE): residual montages from
+        # different checkpoints must be directly comparable by eye.
+        vmin, vmax = RESIDUAL_COLOR_RANGE
+        color = {"cmap": "magma", "vmin": vmin, "vmax": vmax, "label": r"$|R_{GS}|$"}
     image = None
     for i, ax in enumerate(axes.ravel()):
         if i >= n_configs:

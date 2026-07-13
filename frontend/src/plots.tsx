@@ -6,6 +6,15 @@ import { plasmaPlotlyScale } from './three/colormap'
 
 export type Range2 = [number, number]
 
+/** Matches the backend default (src/engine/model_evaluation.py RESIDUAL_COLOR_RANGE) —
+ *  used only until /api/config has loaded. */
+export const DEFAULT_RESIDUAL_RANGE: Range2 = [0, 0.01]
+
+/** Viridis, matching GridHeatmap's flux 'Viridis' Plotly colorscale — shared so the
+ *  carpet plot and its Colorbar legend never drift apart. */
+export const FLUX_COLORBAR =
+  'linear-gradient(to right, #440154, #482878, #31688e, #26828e, #35b779, #6cce5a, #fde725)'
+
 /** Backend boundary points are unordered — sort by poloidal angle around the
  *  centroid and close the loop so line traces form a clean closed curve. */
 function orderBoundary(R: number[], Z: number[]): { x: number[]; y: number[] } {
@@ -47,12 +56,33 @@ function PlotSquare({ children, aspect = 1 }: { children: ReactNode; aspect?: nu
   return <div className="plot-square" style={{ aspectRatio: aspect }}>{children}</div>
 }
 
+/** Min/max of one field over many grids — shared benchmark color scale. */
+export function minMaxGridValues(grids: Grid2D[]): Range2 {
+  let lo = Infinity
+  let hi = -Infinity
+  for (const grid of grids) {
+    const [a, b] = minMax2d(grid.values)
+    if (a < lo) lo = a
+    if (b > hi) hi = b
+  }
+  if (!Number.isFinite(lo)) return [0, 1]
+  if (hi - lo < 1e-12) return [lo, lo + 1e-6]
+  return [lo, hi]
+}
+
 export const GridHeatmap = memo(function GridHeatmap({
   grid,
   quantity,
+  zRange,
+  residualRange = DEFAULT_RESIDUAL_RANGE,
 }: {
   grid: Grid2D
   quantity: GridQuantity
+  /** Flux only: shared scale across a montage; defaults to this grid's min/max. */
+  zRange?: Range2
+  /** Residual only: fixed linear scale for comparability — pass /api/config's
+   *  residual_color_range so plot and colorbar agree. */
+  residualRange?: Range2
 }) {
   const boundary = orderBoundary(grid.boundary_R, grid.boundary_Z)
   // grid.R/Z are 2D — one physical (R, Z) point per (theta, rho) sample, all of
@@ -64,9 +94,14 @@ export const GridHeatmap = memo(function GridHeatmap({
   // carpet-axis showticklabels is an enum ('none'), not a boolean — false gets
   // coerced back to the default 'start' and litters the plot with labels
   const noAxisLines = { showgrid: false, showline: false, showticklabels: 'none', startline: false, endline: false }
-  const { colorscale, lo, hi } = quantity === 'residual'
-    ? { colorscale: plasmaPlotlyScale, lo: -2, hi: 1 }
-    : { colorscale: 'Viridis', lo: 0, hi: 90 }
+  const { colorscale, lo, hi } =
+    quantity === 'residual'
+      ? { colorscale: plasmaPlotlyScale, lo: residualRange[0], hi: residualRange[1] }
+      : {
+          colorscale: 'Viridis',
+          lo: zRange?.[0] ?? minMax2d(grid.values)[0],
+          hi: zRange?.[1] ?? minMax2d(grid.values)[1],
+        }
   const data: Data[] = [
     {
       type: 'carpet',
