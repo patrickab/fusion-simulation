@@ -162,8 +162,10 @@ technique going forward. Round 3 targets the remaining core-residual pattern dir
 ## Round 3
 
 N8 (Residual-Based Attention, Anagnostopoulos et al. 2024), N9 (multi-scale random
-Fourier features, Wang et al. 2021), N10 (both combined) — all on top of N6's
-hard-BC + bb503b0 schedule + 5×200 base.
+Fourier features, Wang et al. 2021), N10 (both combined) — all on top of N3's base
+(hard-BC + bb503b0 schedule, 4×128 — `run_sweep.py`'s `BB503B0` dict, the same
+architecture size as N3; N6's 5×200 is a separate, independent lever tested in round 2
+and not combined with these).
 
 **Methodology correction mid-round:** the first comparison pass used the default
 `EVAL_RESOLUTION=200` polar-mesh grid. At that resolution N8/N9 *looked* clearly worse
@@ -178,9 +180,9 @@ drawing any conclusion — this is the run of the "judge by plots" rule doing it
 
 | Run | Config | core_med | Verdict |
 |-----|--------|----------|---------|
-| N8  | N6 + RBA (`rba_eta=0.01, rba_decay=0.999`) | 0.0029 | Worse than N6 (0.0029 vs 0.0021) at the corrected resolution — not just a low-res artifact. Training fully converged (LR at floor, loss flat). Up-weighting persistently-high-residual points didn't fix the core pattern; if anything it looks marginally broader than N6's tight streaks. |
-| N9  | N6 + multi-scale Fourier features (`n_fourier_features=64`, σ∈{0.5,2.0,8.0}) | 0.0031 | Worse than N6, and the corrected-resolution plot reveals why: a fine speckle/moiré **ringing artifact** across nearly the entire domain — a known pathology of sinusoidal positional encodings on a bounded, non-periodic domain. Completely masked at `resolution=200` (grid averaging hid it); only visible once resolution was fixed. Genuine regression, not a rendering artifact. |
-| N10 | N6 + RBA + multi-scale Fourier (both combined) | 0.0031 (core_med) | **Inherits N9's ringing artifact essentially unchanged** — the residual montage shows the same domain-spanning fine radial-line/speckle pattern as N9 alone, undiminished by RBA. KPI sits between N8 and N9 individually (0.0031 vs N8's 0.0029, N9's 0.0031) — combining the two techniques does not compound any benefit, it just inherits Fourier's defect. Training fully converged (LR annealed to floor by epoch ~2400, both train/val loss flat). |
+| N8  | N3 + RBA (`rba_eta=0.01, rba_decay=0.999`) | 0.0029 | Worse than N6 (0.0029 vs 0.0021), and no better than N3 (0.0025) at matched architecture — not just a low-res artifact. Training fully converged (LR at floor, loss flat). Up-weighting persistently-high-residual points didn't fix the core pattern; if anything it looks marginally broader than N6's tight streaks. |
+| N9  | N3 + multi-scale Fourier features (`n_fourier_features=64`, σ∈{0.5,2.0,8.0}) | 0.0031 | Worse than both N3 and N6, and the corrected-resolution plot reveals why: a fine speckle/moiré **ringing artifact** across nearly the entire domain — a known pathology of sinusoidal positional encodings on a bounded, non-periodic domain. Completely masked at `resolution=200` (grid averaging hid it); only visible once resolution was fixed. Genuine regression, not a rendering artifact. |
+| N10 | N3 + RBA + multi-scale Fourier (both combined) | 0.0031 (core_med) | **Inherits N9's ringing artifact essentially unchanged** — the residual montage shows the same domain-spanning fine radial-line/speckle pattern as N9 alone, undiminished by RBA. KPI sits between N8 and N9 individually (0.0031 vs N8's 0.0029, N9's 0.0031) — combining the two techniques does not compound any benefit, it just inherits Fourier's defect. Training fully converged (LR annealed to floor by epoch ~2400, both train/val loss flat). |
 
 **Visual confirmation (not just KPIs):** at matched `resolution=600`, N6 remains the
 tightest, most core-localized residual pattern of the four. N3 is visibly broader than
