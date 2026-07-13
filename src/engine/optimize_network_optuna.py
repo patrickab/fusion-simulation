@@ -69,6 +69,8 @@ class SearchSpaceConfig:
     sigma_residual_range: tuple[float, float] = (0.01, 0.05)
 
     weight_boundary_condition: float = 10.0
+    weight_flux_scale: float = 10.0
+    soft_bc: bool = True
     n_rz_inner: int = 512
     n_rz_boundary: int = 128
     batch_size: int = 64
@@ -367,6 +369,8 @@ def build_hyperparams(trial: optuna.Trial, config: SearchSpaceConfig) -> HyperPa
         learning_rate_min=lr_max * lr_min_ratio,
         weight_decay=trial.suggest_float("weight_decay", *config.weight_decay_range, log=True),
         weight_boundary_condition=config.weight_boundary_condition,
+        weight_flux_scale=config.weight_flux_scale,
+        soft_bc=config.soft_bc,
         sigma_residual_adaptive_sampling=trial.suggest_float(
             "sigma_residual", *config.sigma_residual_range
         ),
