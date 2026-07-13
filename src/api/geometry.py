@@ -12,9 +12,8 @@ def _stride2d(arr: np.ndarray, stride: int) -> np.ndarray:
     return np.asarray(arr)[::stride, ::stride]
 
 
-def _round(arr: object, decimals: int = 2) -> list:
-    """Truncate float precision for JSON transport — full float64 repr ~3x the payload size."""
-    return np.round(np.asarray(arr, dtype=np.float64), decimals).tolist()
+def _to_list(arr: object) -> list:
+    return np.asarray(arr, dtype=np.float64).tolist()
 
 
 def build_geometry_response(
@@ -34,8 +33,8 @@ def build_geometry_response(
 
     response: dict = {
         "boundary2d": {
-            "R": _round(plasma_boundary.R),
-            "Z": _round(plasma_boundary.Z),
+            "R": _to_list(plasma_boundary.R),
+            "Z": _to_list(plasma_boundary.Z),
         },
         "coil2d": None,
         "plasma3d": None,
@@ -44,12 +43,12 @@ def build_geometry_response(
 
     if show_coils:
         response["coil2d"] = {
-            "R_inner": _round(toroidal_coil_2d.R_inner),
-            "Z_inner": _round(toroidal_coil_2d.Z_inner),
-            "R_outer": _round(toroidal_coil_2d.R_outer),
-            "Z_outer": _round(toroidal_coil_2d.Z_outer),
-            "R_center": _round(toroidal_coil_2d.R_center),
-            "Z_center": _round(toroidal_coil_2d.Z_center),
+            "R_inner": _to_list(toroidal_coil_2d.R_inner),
+            "Z_inner": _to_list(toroidal_coil_2d.Z_inner),
+            "R_outer": _to_list(toroidal_coil_2d.R_outer),
+            "Z_outer": _to_list(toroidal_coil_2d.Z_outer),
+            "R_center": _to_list(toroidal_coil_2d.R_center),
+            "Z_center": _to_list(toroidal_coil_2d.Z_center),
         }
 
     fusion_plasma = calculate_fusion_plasma(plasma_boundary=plasma_boundary)
@@ -59,9 +58,9 @@ def build_geometry_response(
     response["plasma3d"] = {
         "n_phi": X.shape[0],
         "n_theta": X.shape[1],
-        "X": _round(X.flatten()),
-        "Y": _round(Y.flatten()),
-        "Z": _round(Z.flatten()),
+        "X": _to_list(X.flatten()),
+        "Y": _to_list(Y.flatten()),
+        "Z": _to_list(Z.flatten()),
     }
 
     if show_coils:
@@ -82,12 +81,12 @@ def build_geometry_response(
                 {
                     "n_phi": X_in.shape[0],
                     "n_theta": X_in.shape[1],
-                    "X_inner": _round(X_in.flatten()),
-                    "Y_inner": _round(Y_in.flatten()),
-                    "Z_inner": _round(Z_in.flatten()),
-                    "X_outer": _round(X_out.flatten()),
-                    "Y_outer": _round(Y_out.flatten()),
-                    "Z_outer": _round(Z_out.flatten()),
+                    "X_inner": _to_list(X_in.flatten()),
+                    "Y_inner": _to_list(Y_in.flatten()),
+                    "Z_inner": _to_list(Z_in.flatten()),
+                    "X_outer": _to_list(X_out.flatten()),
+                    "Y_outer": _to_list(Y_out.flatten()),
+                    "Z_outer": _to_list(Z_out.flatten()),
                 }
             )
         response["coils3d"] = coils_out

@@ -88,9 +88,8 @@ def _seeded_samples(
     return data, geom_3d, state_3d
 
 
-def _round(arr: object, decimals: int = 2) -> list:
-    """Truncate float precision for JSON transport — full float64 repr ~3x the payload size."""
-    return np.round(np.asarray(arr, dtype=np.float64), decimals).tolist()
+def _to_list(arr: object) -> list:
+    return np.asarray(arr, dtype=np.float64).tolist()
 
 
 def build_sample_response(manager: NetworkManager, seed: int, sample_size: int) -> dict:
@@ -106,10 +105,10 @@ def build_sample_response(manager: NetworkManager, seed: int, sample_size: int) 
             "F_axis": float(d["state"].F_axis),
             "pressure_alpha": float(d["state"].pressure_alpha),
             "field_exponent": float(d["state"].field_exponent),
-            "boundary_R": _round(d["bR"]),
-            "boundary_Z": _round(d["bZ"]),
-            "interior_R": _round(d["iR"]),
-            "interior_Z": _round(d["iZ"]),
+            "boundary_R": _to_list(d["bR"]),
+            "boundary_Z": _to_list(d["bZ"]),
+            "interior_R": _to_list(d["iR"]),
+            "interior_Z": _to_list(d["iZ"]),
         }
         for d in data
     ]
@@ -135,15 +134,13 @@ def _serialize_grid_batch(grids: PlasmaGridBatch, quantity: GridQuantity) -> lis
     """Convert shared JAX grid data into the frontend's JSON contract."""
     return [
         {
-            # theta/rho are carpet-trace coordinates — 2dp would collapse adjacent
-            # rho steps (spacing ~1/200) into duplicates, so they keep 4dp
-            "theta": _round(grids.theta, 4),
-            "rho": _round(grids.rho, 4),
-            "R": _round(grids.R[i]),
-            "Z": _round(grids.Z[i]),
-            "values": _round(grids.values[quantity][i]),
-            "boundary_R": _round(grids.boundary_R[i]),
-            "boundary_Z": _round(grids.boundary_Z[i]),
+            "theta": _to_list(grids.theta),
+            "rho": _to_list(grids.rho),
+            "R": _to_list(grids.R[i]),
+            "Z": _to_list(grids.Z[i]),
+            "values": _to_list(grids.values[quantity][i]),
+            "boundary_R": _to_list(grids.boundary_R[i]),
+            "boundary_Z": _to_list(grids.boundary_Z[i]),
         }
         for i in range(grids.R.shape[0])
     ]
@@ -273,8 +270,8 @@ def build_field_lines(
         b_range = [0.0, 1.0]
 
     return {
-        "points": _round(points.flatten(), 3),
-        "speeds": _round(speeds, 3),
+        "points": _to_list(points.flatten()),
+        "speeds": _to_list(speeds),
         "line_lengths": lengths,
         "b_range": b_range,
     }

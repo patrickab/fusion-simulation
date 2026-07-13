@@ -20,7 +20,18 @@ from src.lib.network_config import HyperParams
 GridQuantity = Literal["flux", "residual"]
 DEFAULT_KPI_SAMPLE_SIZE = 16_384
 EVAL_CONFIG_COUNT = 8
-EVAL_RESOLUTION = 200
+# Polar-mesh residual montages paint each (theta, rho) cell as one flat/gouraud
+# patch; cell arc-length grows with rho, so at low theta resolution a single
+# narrow high-residual filament near the O-point gets flat-filled across a
+# whole wedge, badly overstating its true extent. 600 was verified (visually,
+# against the frontend's contourcarpet renderer at its own max resolution of
+# 300) to collapse those wedges back down to the filaments' real footprint.
+EVAL_RESOLUTION = 600
+# Per-config point-eval batch size for grid evaluation (see `fields` in
+# evaluate_plasma_grids) — bounds peak memory independent of EVAL_RESOLUTION.
+# 20_000 matches the old resolution=200 grid (n_theta*n_rho), a size already
+# proven safe mid-training on a 12GB GPU.
+GRID_EVAL_CHUNK = 20_000
 # Fixed residual colorbar range, shared by the montage plot and the frontend
 # (via /api/config) so both render on one comparable scale. [0, 1] was the
 # right span for soft-BC checkpoints; the hard-BC fix (commit 8a8b9a4) and its
@@ -238,14 +249,23 @@ def evaluate_plasma_grids(
     def fields(
         R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig, psi_axis: jnp.ndarray
     ) -> tuple[jnp.ndarray, ...]:
-        psi = jax.vmap(lambda r, z: psi_fn(params, r, z, cfg))(R, Z)
+        # Chunked rather than a flat vmap over all n_theta*n_rho points: this is
+        # already vmapped over n_configs outside, so an unchunked inner vmap
+        # scales peak memory with resolution^2 * n_configs at once — that's what
+        # OOM'd a GPU mid-run when EVAL_RESOLUTION went up (2026-07-13). Capping
+        # the inner batch keeps peak memory flat regardless of resolution.
+        psi = jax.lax.map(
+            lambda rz: psi_fn(params, rz[0], rz[1], cfg), (R, Z), batch_size=GRID_EVAL_CHUNK
+        )
         output = []
         if "flux" in requested:
             output.append(psi)
         if "residual" in requested:
-            residual = jax.vmap(
-                lambda r, z: grad_shafranov_residual(psi_fn, params, r, z, psi_axis, cfg)
-            )(R, Z)
+            residual = jax.lax.map(
+                lambda rz: grad_shafranov_residual(psi_fn, params, rz[0], rz[1], psi_axis, cfg),
+                (R, Z),
+                batch_size=GRID_EVAL_CHUNK,
+            )
             # Linear |R_GS|: post-fix residuals are O(0.1-1), where a log scale
             # only spreads the noise floor; display range is fixed [0, 1].
             output.append(jnp.abs(residual))
