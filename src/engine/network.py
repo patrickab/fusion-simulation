@@ -419,6 +419,7 @@ class NetworkManager:
                     )
 
         self._save_residual_plot()
+        self._save_training_curves_plot()
         return self.artifact_stem
 
     def from_disk(self, pinn_path) -> any:  # noqa
@@ -482,6 +483,17 @@ class NetworkManager:
         (run_dir / "kpis.json").write_text(json.dumps(record, indent=2) + "\n")
 
         logger.info(f"residual plot saved to {run_dir}")
+
+    def _save_training_curves_plot(self) -> None:
+        """Loss/val-loss + LR/grad-norm overview, straight from training.csv."""
+        if self.test_mode or not self.training_log:
+            return
+        from src.engine.model_evaluation import plot_training_curves
+
+        run_dir = self.run_dir()
+        plot_training_curves(
+            run_dir / "training.csv", run_dir / "training_curves.png", title=self.artifact_stem
+        )
 
     def _init_state(self) -> train_state.TrainState:
         """Initialize the training state with dummy data."""
