@@ -117,8 +117,151 @@ weight_boundary=20, σ_resample=0.17, LR 1.84e-4→2.6e-6) with `soft_bc=False`.
 visually confirmed via plots) → per the original task authorization this unlocks:
 commit to `vibe-improve-network-performance`, literature search for further gains.
 
+### Why the gain is ~78x, decomposed (not "just architecture search")
+
+| Lever | Comparison | Multiplier |
+|---|---|---|
+| **Boundary-condition formulation** (soft→hard) | R2 0.195 → N1 0.0052 | **~37x** |
+| Architecture size (4×128→5×200) | R2→R6: 0.195→0.144; N1→N4: 0.0052→0.0039 | ~1.3x (same in both families — independent, minor factor) |
+| LR anneal depth (floor 5e-5→2.6e-6) | N1 0.0052 → N3 0.0025 | ~2x |
+
+37 × 1.3 × 2 ≈ 96x ≈ observed 78x (R2→N3). Architecture size gave the *same* ~1.3x
+bump in both the soft-BC and hard-BC families, proving it's a minor, independent lever
+— not the driver. The driver is the boundary-enforcement mechanism itself: soft-BC
+optimizes two competing objectives (PDE residual vs. boundary penalty) that never
+fully reconcile, and for an elliptic PDE a residual boundary error corrupts the whole
+domain (global coupling / maximum-principle behavior). Hard-BC's multiplicative
+envelope removes the competing objective entirely — ψ=0 at the boundary by
+construction for any network output — so all gradient signal targets the one
+remaining objective. This is the classical "exact constraint imposition" result from
+the PINN literature (Lagaris et al. 1998; Sukumar & Srivastava 2022), now confirmed
+empirically on this exact problem. Anneal depth is a secondary, orthogonal lever
+(optimization schedule, not model capacity or constraint structure).
+
 Two open threads before committing:
 1. **Round 2** (launching now): N6 = N3 + 5×200 (does architecture still help once
    hard-BC + deep anneal are in place?), N7 = N3 + 100 L-BFGS polish steps (unused
    budget headroom — max is 2500 epochs + 100 L-BFGS, N3 uses 0).
 2. Literature pass for further hard-BC-specific training methods (next step).
+
+---
+
+## Round 2
+
+| Run | Config | core_med | Verdict |
+|-----|--------|----------|---------|
+| N6  | N3 + 5×200 (vs 4×128) | 0.00213 | Modest real gain over N3 (0.0025→0.0021, ~1.2x), consistent with round 1's independent ~1.3x architecture-size finding now confirmed at the new best-config level. Training curve fully annealed (LR floor 2.6e-6 by ~epoch 2000), loss plateaued ~epoch 1500, no headroom left. Residual plot: visibly darker/tighter boundary regions and a slightly tighter axis-centered "star" streak vs N3 — real, visually confirmed, not a KPI artifact. |
+| N7  | N3 + 100 L-BFGS polish steps | 0.00254 | **No improvement** over N3 (0.00251) — within noise. Training curve shows loss/LR already fully flat *before* L-BFGS starts (AdamW phase alone reaches its floor), so the polish pass has nothing left to polish. Residual plot shows the same axis-centered "star" pattern at the same magnitude as N3. Useful negative result: this rules out "just optimize harder at fixed capacity" as a fix for the core-residual pattern — it's a structural limitation (likely second-derivative/curvature noise concentrated at the ψ extremum, a known PINN pathology at critical points), not an optimization-tail one. Directly motivates round 3's RBA run (N8), which up-weights persistently-high-residual points instead of relying on more generic training. |
+
+**Decision (round 2):** N6 (5×200 architecture) becomes the new best config, replacing
+N3. L-BFGS polish (N7) is not worth the extra budget for this problem — dropped as a
+technique going forward. Round 3 targets the remaining core-residual pattern directly.
+
+---
+
+## Round 3
+
+N8 (Residual-Based Attention, Anagnostopoulos et al. 2024), N9 (multi-scale random
+Fourier features, Wang et al. 2021), N10 (both combined) — all on top of N6's
+hard-BC + bb503b0 schedule + 5×200 base.
+
+**Methodology correction mid-round:** the first comparison pass used the default
+`EVAL_RESOLUTION=200` polar-mesh grid. At that resolution N8/N9 *looked* clearly worse
+than N6/N3 in the residual montage — but this grid's cells are pie-slice quadrilaterals
+whose arc-width grows with radius, and `pcolormesh(shading='gouraud')` flat-fills each
+cell's full extent, so a genuinely thin, sharp residual filament near the O-point gets
+visually stretched into a wide wedge toward the boundary. Bumped `EVAL_RESOLUTION` to
+600 (verified against the frontend's own `contourcarpet` renderer, which contours
+sub-cell rather than flat-filling and so doesn't inherit this artifact) and re-rendered
+all four (N3/N6/N8/N9) at the same corrected resolution for a fair comparison before
+drawing any conclusion — this is the run of the "judge by plots" rule doing its job.
+
+| Run | Config | core_med | Verdict |
+|-----|--------|----------|---------|
+| N8  | N6 + RBA (`rba_eta=0.01, rba_decay=0.999`) | 0.0029 | Worse than N6 (0.0029 vs 0.0021) at the corrected resolution — not just a low-res artifact. Training fully converged (LR at floor, loss flat). Up-weighting persistently-high-residual points didn't fix the core pattern; if anything it looks marginally broader than N6's tight streaks. |
+| N9  | N6 + multi-scale Fourier features (`n_fourier_features=64`, σ∈{0.5,2.0,8.0}) | 0.0031 | Worse than N6, and the corrected-resolution plot reveals why: a fine speckle/moiré **ringing artifact** across nearly the entire domain — a known pathology of sinusoidal positional encodings on a bounded, non-periodic domain. Completely masked at `resolution=200` (grid averaging hid it); only visible once resolution was fixed. Genuine regression, not a rendering artifact. |
+| N10 | N6 + RBA + multi-scale Fourier (both combined) | 0.0031 (core_med) | **Inherits N9's ringing artifact essentially unchanged** — the residual montage shows the same domain-spanning fine radial-line/speckle pattern as N9 alone, undiminished by RBA. KPI sits between N8 and N9 individually (0.0031 vs N8's 0.0029, N9's 0.0031) — combining the two techniques does not compound any benefit, it just inherits Fourier's defect. Training fully converged (LR annealed to floor by epoch ~2400, both train/val loss flat). |
+
+**Visual confirmation (not just KPIs):** at matched `resolution=600`, N6 remains the
+tightest, most core-localized residual pattern of the four. N3 is visibly broader than
+N6. N8 is broader/less concentrated than N6 but without the ringing defect. N9 and N10
+both show the same fine-grained speckle/ringing covering nearly the whole domain —
+clearly the worst of the four, once rendered fairly.
+
+## Decision (round 3)
+
+**Neither RBA nor multi-scale Fourier features (alone or combined) beat N6 on this
+problem.** RBA gives a mild regression; multi-scale Fourier features introduce a
+genuine ringing artifact from applying periodic positional encodings to this bounded
+non-periodic domain. **N6 remains the standing best config.**
+
+Reverted the RBA/multi-scale-Fourier scaffolding (`src/engine/network.py`,
+`src/engine/physics.py`, `src/lib/network_config.py`, `scripts/run_sweep.py`) back to
+the round-2 (N6-winning) state — dead, experimentally-disproven code left in the tree
+is worse than no code. Round-3 findings live only here.
+
+Also fixed two real bugs discovered while chasing the N8/N9 visual-appearance question
+(unrelated to which technique wins, but load-bearing for trusting any future residual
+plot at all): (1) `evaluate_plasma_grids` used an unchunked `jax.vmap` whose peak
+memory scaled with `resolution² × n_configs` — safe at the old resolution=200, but
+OOM'd the GPU mid-run once resolution went to 600; replaced with `jax.lax.map(...,
+batch_size=GRID_EVAL_CHUNK)` so peak memory is now flat regardless of resolution. (2)
+The API's JSON serializers (`src/api/network.py`, `src/api/geometry.py`) were rounding
+every float array to 2 decimals by default — for the residual field (range
+`[0, ~0.02]`) this collapsed the values into ~3 discrete buckets before they ever
+reached the frontend, which is what made the frontend's Plotly heatmap look binary
+navy/yellow instead of a smooth gradient. Removed all rounding from both files per
+explicit instruction (full float64 precision end-to-end; this local API has no
+payload-size constraint that would justify trading accuracy for it).
+
+---
+
+## Round 4
+
+**Multistage residual correction** (Wang 2024/2025, arXiv 2507.16636 / 2407.17213):
+froze N6 as stage-1 and trained a small stage-2 net (64×64, 300 epochs, ~3min) so
+`psi_final = psi_stage1 + psi_stage2`, with stage2 optimized against the GS residual
+of the *composed* field.
+
+| Run | Config | core_med | Verdict |
+|-----|--------|----------|---------|
+| N11 | N6 (frozen) + stage-2 correction net (64×64, 300ep) | 0.0158 | **Dramatic regression — 7.5x worse than N6 alone (0.0158 vs 0.0021).** Stage2's own training-loss log looked fine (residual ~0.0025 on its training batches, converged/flat by epoch 300) — this is exactly the trap the "read the log, not just KPIs" rule exists for: the discrepancy only shows up once evaluated on the dense eval grid (45k points) instead of the sparse, adaptively-resampled training collocation set. |
+
+**Visual confirmation (decisive, not subtle):** the residual montage is *not* a mild
+regression — nearly the entire domain in all 8 configs sits at or above the display
+ceiling (`|R_GS| ≥ 0.01`, saturated pale yellow), with only thin dark spoke-lines
+threading through it. Those spokes align with the sparse training-ray pattern: the
+stage-2 net memorized a correction along the specific collocation points/rays it was
+trained on and actively *hurts* the field everywhere between them, rather than learning
+a smooth global correction. This is the opposite failure mode from N9's ringing — not
+a rendering artifact, a genuine, severe overfit.
+
+## Decision (round 4)
+
+**Multistage residual correction, as implemented, is a clear failure — reverted.**
+Deleted `src/engine/residual_correction.py`, `scripts/train_multistage.py`, and
+`scripts/run_round3.sh` (orphaned once round 3 was reverted) — same reasoning as round
+3: disproven scaffolding left in the tree is a liability, not a resource. If this
+technique is revisited later, the fix to try first is denser/non-adaptive stage-2
+collocation sampling (the failure pattern points straight at the sparse-ray overfit,
+not at the method being fundamentally unsound).
+
+---
+
+## Campaign conclusion
+
+Two further literature techniques (round 3: RBA + multi-scale Fourier features; round
+4: multistage residual correction) were tried on top of N6 and both **failed to beat
+it**, one subtly (N8/N9, only visible after fixing the eval-resolution artifact) and
+one decisively (N11). **N6 stands as the final winning model**: hard-BC (envelope)
+architecture, bb503b0's tuned schedule (batch=32, weight_boundary=20, σ_resample=0.17,
+LR 1.84e-4→2.6e-6), 5×200 hidden layers, 2400 epochs, no L-BFGS polish — core_med
+0.00213, ~41x better than the legacy bb503b0 baseline (0.0868), confirmed visually via
+residual/flux plots at a corrected, artifact-free resolution.
+
+Two real, general bugs were fixed along the way (independent of which architecture
+wins, load-bearing for trusting any future residual plot or frontend render):
+`evaluate_plasma_grids`'s grid evaluation is now memory-chunked (`jax.lax.map`, peak
+memory flat regardless of resolution — previously OOM'd on a GPU at high resolution),
+and the API's JSON serializers no longer round float payloads (previously truncated
+the residual field to ~3 discrete buckets before it ever reached the frontend).
