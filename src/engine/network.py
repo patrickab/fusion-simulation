@@ -4,6 +4,7 @@ from contextlib import nullcontext, suppress
 import csv
 from datetime import datetime
 import functools
+from functools import partial
 import json
 import logging
 from pathlib import Path
@@ -47,7 +48,12 @@ logger = get_logger(
 
 
 def denormalize_psi(
-    psi_n: jnp.ndarray, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig
+    psi_n: jnp.ndarray,
+    R: jnp.ndarray,
+    Z: jnp.ndarray,
+    cfg: PlasmaConfig,
+    *,
+    soft_bc: bool = False,
 ) -> jnp.ndarray:
     """Map raw network output to physical psi.
 
@@ -55,23 +61,37 @@ def denormalize_psi(
     the boundary, dpsi/dtheta=0) at the plasma edge via a multiplicative
     envelope, so boundary conditions hold by construction instead of via a
     soft loss penalty.
+
+    ``soft_bc=True`` skips the envelope multiply: soft-BC checkpoints train
+    and evaluate on the raw physical flux, with boundary conditions enforced
+    by Dirichlet/Neumann penalties instead.
     """
+    scaled = psi_n.squeeze() * cfg.State.F_axis * cfg.Geometry.a
+    if soft_bc:
+        return scaled
     envelope = 1.0 - boundary_normalized_radius(R, Z, cfg.Boundary) ** 2
-    return envelope * psi_n.squeeze() * cfg.State.F_axis * cfg.Geometry.a
+    return envelope * scaled
 
 
 def apply_psi_fn(
-    apply_fn: Callable, params: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig
+    apply_fn: Callable,
+    params: any,
+    R: jnp.ndarray,
+    Z: jnp.ndarray,
+    cfg: PlasmaConfig,
+    *,
+    soft_bc: bool = False,
 ) -> jnp.ndarray:
     """Adapter converting neural network output to physical psi flux.
 
     Shared by training, inference, and evaluation call sites; bind ``apply_fn``
     with ``functools.partial`` to get a ``(params, R, Z, cfg) -> psi`` callable.
+    ``soft_bc`` is forwarded to :func:`denormalize_psi`.
     """
     inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
     p_n, r_n, z_n = inp.normalize()
     psi_n = apply_fn(params, r=r_n, z=z_n, **p_n)
-    return denormalize_psi(psi_n, R, Z, cfg)
+    return denormalize_psi(psi_n, R, Z, cfg, soft_bc=soft_bc)
 
 
 # --- Network (simple MLP) ---
@@ -134,7 +154,9 @@ RESAMPLING_FREQUENCY = 10  # Resample training set every N epochs
 LOG_FREQUENCY = 10  # Log training metrics every N epochs
 N_VALIDATION_SIZE = 128  # Number of validation plasma configs
 VALIDATION_FREQUENCY = 5 * LOG_FREQUENCY  # Evaluate validation set every N epochs
-LIVE_TABLE_MAX_ROWS = 15  # cap rows shown in the live table; unbounded growth desyncs Rich's redraw once it overflows the terminal, corrupting scrollback
+# Cap rows shown in the live table; unbounded growth desyncs Rich's redraw
+# once it overflows the terminal, corrupting scrollback.
+LIVE_TABLE_MAX_ROWS = 15
 
 
 class Sampler:
@@ -502,9 +524,11 @@ class NetworkManager:
         inputs: FluxInput,
         weight_boundary_condition: float,
         huber_delta: float,
+        weight_flux_scale: float,
+        soft_bc: bool,
     ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
         """Pure function to compute physics loss. Reusable for both training and evaluation."""
-        psi_fn = functools.partial(apply_psi_fn, apply_fn)
+        psi_fn = functools.partial(apply_psi_fn, apply_fn, soft_bc=soft_bc)
 
         total, l_res, l_dir, l_per_cfg = pinn_loss_function(
             psi_fn,
@@ -514,20 +538,30 @@ class NetworkManager:
             inputs.config,
             weight_boundary_condition=weight_boundary_condition,
             huber_delta=huber_delta,
+            weight_flux_scale=weight_flux_scale,
+            soft_bc=soft_bc,
         )
         return total, (l_res, l_dir, l_per_cfg)
 
     @staticmethod
-    @jax.jit
+    @partial(jax.jit, static_argnames=("soft_bc",))
     def eval_step(
         state: train_state.TrainState,
         inputs: FluxInput,
         weight_boundary_condition: float,
         huber_delta: float,
+        weight_flux_scale: float,
+        soft_bc: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Fast, gradient-free evaluation step returning all loss components."""
         total, (l_res, l_dir, l_per_cfg) = NetworkManager.compute_loss(
-            state.params, state.apply_fn, inputs, weight_boundary_condition, huber_delta
+            state.params,
+            state.apply_fn,
+            inputs,
+            weight_boundary_condition,
+            huber_delta,
+            weight_flux_scale,
+            soft_bc,
         )
         return total, l_res, l_dir, l_per_cfg
 
@@ -543,7 +577,6 @@ class NetworkManager:
         chunk_size = 128
         total_loss = 0.0
         n_chunks = 0
-        weight_bc = self.config.weight_boundary_condition
         if self._validation_sampler is None:
             self._validation_sampler = Sampler(self.config, seed=self.seed + 1_000)
         sampler = self._validation_sampler
@@ -552,33 +585,45 @@ class NetworkManager:
             end = min(i + chunk_size, len(val_configs))
             batch = jnp.array(val_configs[i:end], dtype=jnp.float32)
             inputs = sampler.sample_flux_input(plasma_configs=batch)
-            loss, _, _, _ = self.eval_step(self.state, inputs, weight_bc, self.config.huber_delta)
+            loss, _, _, _ = self.eval_step(
+                self.state,
+                inputs,
+                self.config.weight_boundary_condition,
+                self.config.huber_delta,
+                self.config.weight_flux_scale,
+                self.config.soft_bc,
+            )
             total_loss += float(loss)
             n_chunks += 1
 
         return total_loss / n_chunks
 
     @staticmethod
-    @jax.jit
+    @partial(jax.jit, static_argnames=("soft_bc",))
     def train_step(
         state: train_state.TrainState,
         inputs: FluxInput,
         weight_boundary_condition: float,
         huber_delta: float,
+        weight_flux_scale: float,
+        soft_bc: bool,
     ) -> tuple[
         train_state.TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray
     ]:
         """Perform a single training step using physics-informed gradients."""
 
-        # Rematerializes activations during backprop. Trades compute for memory,
-        # enabling training of larger networks with limited GPU memory.
         @jax.checkpoint
         def loss_wrapper(
             params: any,
         ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-            """Wrap compute loss to enable gradient computation"""
             return NetworkManager.compute_loss(
-                params, state.apply_fn, inputs, weight_boundary_condition, huber_delta
+                params,
+                state.apply_fn,
+                inputs,
+                weight_boundary_condition,
+                huber_delta,
+                weight_flux_scale,
+                soft_bc,
             )
 
         (loss, (l_res, l_dir, l_per_cfg)), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(
@@ -607,6 +652,8 @@ class NetworkManager:
                 inputs=inputs,
                 weight_boundary_condition=self.config.weight_boundary_condition,
                 huber_delta=self.config.huber_delta,
+                weight_flux_scale=self.config.weight_flux_scale,
+                soft_bc=self.config.soft_bc,
             )
             all_losses.append(per_config_loss)
             grad_norms.append(b_grad_norm)
@@ -834,11 +881,16 @@ class NetworkManager:
         self.sampler.precompute_coordinate_samples()
         batch = self.train_set[: self.config.batch_size]
         inputs = self.sampler.sample_flux_input(plasma_configs=batch)
-        weight_bc, huber_delta = self.config.weight_boundary_condition, self.config.huber_delta
 
         def loss_fn(params: any) -> jnp.ndarray:
             total, _ = NetworkManager.compute_loss(
-                params, self.state.apply_fn, inputs, weight_bc, huber_delta
+                params,
+                self.state.apply_fn,
+                inputs,
+                self.config.weight_boundary_condition,
+                self.config.huber_delta,
+                self.config.weight_flux_scale,
+                self.config.soft_bc,
             )
             return total
 
@@ -887,7 +939,11 @@ class NetworkManager:
         Returns:
             Callable[(params, R, Z, config) -> psi] for physics calculations.
         """
-        return functools.partial(apply_psi_fn, self.model.apply)
+        return functools.partial(
+            apply_psi_fn,
+            self.model.apply,
+            soft_bc=self.config.soft_bc,
+        )
 
 
 def _metrics_row(
@@ -976,6 +1032,23 @@ if __name__ == "__main__":
         help="PDE loss: >0 = Huber with this delta (default 1.0), 0.0 = MSE",
     )
     parser.add_argument(
+        "--weight-flux-scale",
+        type=float,
+        default=None,
+        help="Weight of the interior-mean-ψ collapse-guard hinge (default 10)",
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Total epochs; split 1:5 warmup:decay (default: HyperParams 100+500)",
+    )
+    parser.add_argument(
+        "--soft-bc",
+        action="store_true",
+        help="Legacy soft-BC training: raw ψ + Dirichlet/Neumann penalties (no envelope)",
+    )
+    parser.add_argument(
         "--show",
         metavar="RUN",
         default=None,
@@ -995,9 +1068,17 @@ if __name__ == "__main__":
                 huber_delta=args.huber_delta,
                 n_fourier_features=args.fourier_features,
                 lbfgs_steps=args.lbfgs,
+                soft_bc=args.soft_bc,
             )
             if args.lr is not None:
                 config = config.replace(learning_rate_max=args.lr)
+            if args.weight_flux_scale is not None:
+                config = config.replace(weight_flux_scale=args.weight_flux_scale)
+            if args.epochs is not None:
+                config = config.replace(
+                    warmup_epochs=max(1, args.epochs // 6),
+                    decay_epochs=args.epochs - max(1, args.epochs // 6),
+                )
             manager = NetworkManager(config, test_mode=args.test)
             manager.train(save_to_disk=True)
         else:
@@ -1005,6 +1086,7 @@ if __name__ == "__main__":
             globals()["VALIDATION_FREQUENCY"] = 20
             config = HyperParams(
                 huber_delta=args.huber_delta,
+                soft_bc=args.soft_bc,
                 lbfgs_steps=64,
                 hidden_dims=(32, 32),
                 batch_size=8,

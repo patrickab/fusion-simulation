@@ -38,6 +38,11 @@ class HyperParams(BaseModel):
     learning_rate_min: float = 5e-5
     weight_decay: float = 1e-7
     weight_boundary_condition: float = 10.0
+    # Collapse-guard hinge: penalizes interior-mean ψ below 0.05·F_axis·a (also
+    # pins the ψ>0-at-axis sign convention); zero loss once above the floor.
+    weight_flux_scale: float = 10.0
+    # Train like legacy bb503b0: raw ψ output + Dirichlet/Neumann penalties (no envelope).
+    soft_bc: bool = False
     sigma_residual_adaptive_sampling: float = 0.05
     batch_size: int = 64
     n_rz_inner_samples: int = 512

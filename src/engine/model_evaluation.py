@@ -11,7 +11,7 @@ import numpy as np
 from scipy.stats import qmc
 
 from src.engine.network import BASE_SEED, NetworkManager
-from src.engine.physics import grad_shafranov_residual
+from src.engine.physics import estimate_psi_axis, grad_shafranov_residual
 from src.engine.plasma import get_poloidal_points
 from src.lib.config import current_commit
 from src.lib.geometry_config import PlasmaConfig
@@ -68,6 +68,30 @@ class PlasmaGridBatch:
     values: dict[GridQuantity, jnp.ndarray]
 
 
+def estimate_axis_for_config(
+    manager: NetworkManager,
+    config: PlasmaConfig,
+    sample_size: int = DEFAULT_KPI_SAMPLE_SIZE,
+    seed: int = BASE_SEED + 124,
+) -> jnp.ndarray:
+    """psi_axis on the fixed area-uniform Sobol sample used for KPI ranking.
+
+    Callers that evaluate on a different, smaller point set (a display grid,
+    an arbitrary scatter) must reuse this instead of refitting axis locally —
+    otherwise the same checkpoint normalizes its residual differently in the
+    KPI table vs. whatever it happens to be rendered against.
+    """
+    unit_points = qmc.Sobol(d=2, scramble=True, seed=seed).random_base2(
+        (sample_size - 1).bit_length()
+    )[:sample_size]
+    theta = jnp.asarray(2.0 * np.pi * unit_points[:, 0], dtype=jnp.float32)
+    rho = jnp.asarray(np.sqrt(unit_points[:, 1]), dtype=jnp.float32)
+    R, Z = jax.vmap(lambda t, r: get_poloidal_points(t, config.Geometry, r))(theta, rho)
+    psi_fn = manager.make_psi_fn()
+    psi = jax.vmap(lambda r, z: psi_fn(manager.state.params, r, z, config))(R, Z)
+    return estimate_psi_axis(psi)
+
+
 def compute_gs_residual_on_points(
     manager: NetworkManager,
     config: PlasmaConfig,
@@ -78,9 +102,7 @@ def compute_gs_residual_on_points(
     psi_fn = manager.make_psi_fn()
     params = manager.state.params
 
-    psi_vals = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R_pts, Z_pts)
-    n_axis = max(1, psi_vals.shape[0] // 20)
-    psi_axis = jax.lax.stop_gradient(jnp.mean(jnp.sort(psi_vals)[:n_axis]))
+    psi_axis = estimate_axis_for_config(manager, config)
 
     residual_fn = jax.vmap(
         lambda r, z: grad_shafranov_residual(psi_fn, params, r, z, psi_axis, config)
@@ -125,8 +147,7 @@ def evaluate_plasma_kpis(
             theta, rho
         )
         psi = jax.vmap(lambda r, z, cfg=config: psi_fn(params, r, z, cfg))(R, Z)
-        n_axis = max(1, sample_size // 20)
-        psi_axis = jax.lax.stop_gradient(jnp.mean(jnp.sort(psi)[:n_axis]))
+        psi_axis = estimate_axis_for_config(manager, config, sample_size, seed)
         residual = jax.vmap(
             lambda r, z, axis=psi_axis, cfg=config: grad_shafranov_residual(
                 psi_fn, params, r, z, axis, cfg
@@ -140,6 +161,7 @@ def evaluate_plasma_kpis(
         )
         # Use the strongest 5% by magnitude so leakage remains meaningful for
         # checkpoints that converged to either flux sign.
+        n_axis = max(1, sample_size // 20)
         flux_depth = jnp.mean(jnp.sort(jnp.abs(psi))[-n_axis:])
         boundary_leaks.append(float(jnp.max(jnp.abs(psi_boundary)) / (flux_depth + 1e-12)))
 
@@ -201,21 +223,28 @@ def evaluate_plasma_grids(
     psi_fn = manager.make_psi_fn()
     params = manager.state.params
 
-    def fields(R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> tuple[jnp.ndarray, ...]:
+    # Axis fixed per config on the same Sobol sample used for KPI ranking —
+    # not refit from this grid's own (much smaller, differently-shaped) points,
+    # so the rendered residual always matches the reported KPI's normalization.
+    axis_per_config = jnp.stack([estimate_axis_for_config(manager, cfg) for cfg in configs])
+
+    def fields(
+        R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig, psi_axis: jnp.ndarray
+    ) -> tuple[jnp.ndarray, ...]:
         psi = jax.vmap(lambda r, z: psi_fn(params, r, z, cfg))(R, Z)
         output = []
         if "flux" in requested:
             output.append(psi)
         if "residual" in requested:
-            n_axis = max(1, R.shape[0] // 20)
-            psi_axis = jax.lax.stop_gradient(jnp.mean(jnp.sort(psi)[:n_axis]))
             residual = jax.vmap(
                 lambda r, z: grad_shafranov_residual(psi_fn, params, r, z, psi_axis, cfg)
             )(R, Z)
-            output.append(jnp.log10(jnp.abs(residual) + 1e-6))
+            # Linear |R_GS|: post-fix residuals are O(0.1-1), where a log scale
+            # only spreads the noise floor; display range is fixed [0, 1].
+            output.append(jnp.abs(residual))
         return tuple(output)
 
-    evaluated = jax.vmap(fields)(R_flat, Z_flat, batched_config)
+    evaluated = jax.vmap(fields)(R_flat, Z_flat, batched_config, axis_per_config)
     values = {
         quantity: field.reshape(len(configs), n_rho, n_theta)
         for quantity, field in zip(requested, evaluated, strict=True)
@@ -274,15 +303,17 @@ def plot_plasma_grid_montage(
         layout="constrained",
     )
     values = np.asarray(grids.values[quantity])
-    color = {
-        "flux": {"cmap": "viridis", "vmin": 0.0, "vmax": 90.0, "label": r"$\psi$"},
-        "residual": {
-            "cmap": "magma",
-            "vmin": -2.0,
-            "vmax": 1.0,
-            "label": r"$\log_{10}|R_{GS}|$",
-        },
-    }[quantity]
+    if quantity == "flux":
+        # Data-driven: a fixed range hides sign-flipped or collapsed fields;
+        # the colorbar ticks expose a flat ψ≈0 run immediately.
+        vmin, vmax = float(values.min()), float(values.max())
+        if vmax - vmin < 1e-12:
+            vmax = vmin + 1e-6
+        color = {"cmap": "viridis", "vmin": vmin, "vmax": vmax, "label": r"$\psi$"}
+    else:
+        # Fixed linear scale: residual montages from different checkpoints must
+        # be directly comparable by eye for model selection; ≥1 saturates.
+        color = {"cmap": "magma", "vmin": 0.0, "vmax": 1.0, "label": r"$|R_{GS}|$"}
     image = None
     for i, ax in enumerate(axes.ravel()):
         if i >= n_configs:
@@ -358,7 +389,7 @@ if __name__ == "__main__":
     # (rho < --core-rho); the edge shell is reported but tolerated by design.
     # Each run dir (data/benchmarks/<commit>/<run>/) already holds network.flax,
     # config.json and training.csv from training; this CLI adds kpis.json and the
-    # montage PNG (fixed log color scale for comparability) into the same dir.
+    # montage PNG (fixed linear color scale for comparability) into the same dir.
     import argparse
     from datetime import datetime
 
