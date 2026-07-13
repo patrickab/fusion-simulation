@@ -11,7 +11,14 @@ import {
   type SampleResponse,
 } from '../api'
 import { useStore } from '../store'
-import { GridHeatmap, SampleScatter, type Range2 } from '../plots'
+import {
+  DEFAULT_RESIDUAL_RANGE,
+  FLUX_COLORBAR,
+  GridHeatmap,
+  SampleScatter,
+  minMaxGridValues,
+  type Range2,
+} from '../plots'
 import { Scene } from '../three/Scene'
 import { FieldLines, PlasmaWireframe } from '../three/Reactor3D'
 import { plasmaGradient } from '../three/colormap'
@@ -233,10 +240,15 @@ function GridTab({
   resolution: number
 }) {
   const dResolution = useDebounced(resolution, 400)
+  const cfg = useApi('config', api.config)
+  const residualRange = cfg.data?.residual_color_range ?? DEFAULT_RESIDUAL_RANGE
   const grids = useApi<Grid2D[]>(
     `${kind}:${network}:${seed}:${sampleSize}:${dResolution}`,
     () => api.grid(network, kind, seed, sampleSize, dResolution),
   )
+  const zRange: Range2 | undefined = grids.data?.length
+    ? minMaxGridValues(grids.data)
+    : undefined
 
   return (
     <div className="scroll" style={{ position: 'relative' }}>
@@ -258,12 +270,17 @@ function GridTab({
                 <GridHeatmap
                   grid={g}
                   quantity={kind}
+                  zRange={zRange}
+                  residualRange={residualRange}
                 />
               </div>
             ))}
       </div>
+      {kind === 'flux' && zRange && (
+        <Colorbar title="ψ" gradient={FLUX_COLORBAR} range={zRange} unit="Wb" />
+      )}
       {kind === 'residual' && (
-        <Colorbar title="log₁₀|R_GS|" gradient={plasmaGradient} range={[-2, 1]} />
+        <Colorbar title="|R_GS|" gradient={plasmaGradient} range={residualRange} />
       )}
     </div>
   )

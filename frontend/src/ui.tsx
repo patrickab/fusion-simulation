@@ -16,7 +16,10 @@ export function Colorbar({
 }) {
   const [lo, hi] = range
   const mid = (lo + hi) / 2
-  const fmt = (v: number) => `${v.toFixed(2)}${unit ? ` ${unit}` : ''}`
+  // narrow ranges (e.g. residual [0, 0.01]) need more than 2dp or lo/mid/hi
+  // collide on the same rounded label
+  const fmt = (v: number) =>
+    `${hi - lo < 1 ? v.toExponential(1) : v.toFixed(2)}${unit ? ` ${unit}` : ''}`
   return (
     <div className="colorbar">
       <div className="colorbar-title">{title}</div>

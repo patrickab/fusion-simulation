@@ -1,6 +1,12 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
 import { api, benchmarkFileUrl, benchmarkStream, kpiEntries, useApi, useDebounced, type BenchmarkEvent, type Grid2D } from '../api'
-import { GridHeatmap } from '../plots'
+import {
+  DEFAULT_RESIDUAL_RANGE,
+  FLUX_COLORBAR,
+  GridHeatmap,
+  minMaxGridValues,
+  type Range2,
+} from '../plots'
 import { plasmaGradient } from '../three/colormap'
 import { Colorbar, Panel, Section, Segmented, Slider, Spinner, Stat, Toggle } from '../ui'
 
@@ -16,6 +22,7 @@ export function BenchmarkView() {
   const networks = useApi<string[]>('networks:All', () => api.networks('All'))
   const cfg = useApi('config', api.config)
   const evalConfigCount = cfg.data?.eval_config_count ?? 8
+  const residualRange = cfg.data?.residual_color_range ?? DEFAULT_RESIDUAL_RANGE
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [commit, setCommit] = useState('All')
   const [mode, setMode] = useState<(typeof MODES)[number]>('Both')
@@ -130,7 +137,7 @@ export function BenchmarkView() {
                 </div>
               </div>
             ) : (
-              <BenchRow key={row.network} row={row} />
+              <BenchRow key={row.network} row={row} residualRange={residualRange} />
             ),
           )}
         </div>
@@ -176,6 +183,7 @@ function StoredRun({ commit, run, files }: { commit: string; run: string; files:
   const networkName = `${commit}/${run}`
   const cfg = useApi('config', api.config)
   const evalConfigCount = cfg.data?.eval_config_count ?? 8
+  const residualRange = cfg.data?.residual_color_range ?? DEFAULT_RESIDUAL_RANGE
   const [seed, setSeed] = useState(0)
   const [resolution, setResolution] = useState(50)
   const dSeed = useDebounced(seed, 400)
@@ -215,10 +223,10 @@ function StoredRun({ commit, run, files }: { commit: string; run: string; files:
         <>
           <div className="bench-grids">
             {grids.data.map((g, i) => (
-              <GridHeatmap key={i} grid={g} quantity="residual" />
+              <GridHeatmap key={i} grid={g} quantity="residual" residualRange={residualRange} />
             ))}
           </div>
-          <Colorbar title="log₁₀|R_GS|" gradient={plasmaGradient} range={[-2, 1]} />
+          <Colorbar title="|R_GS|" gradient={plasmaGradient} range={residualRange} />
         </>
       )}
     </div>
@@ -227,11 +235,18 @@ function StoredRun({ commit, run, files }: { commit: string; run: string; files:
 
 // memo: each streamed SSE row re-renders the list — without it, appending row N
 // re-diffs every already-rendered row's carpet heatmaps (row objects never mutate)
-const BenchRow = memo(function BenchRow({ row }: { row: Extract<Row, { type: 'row' }> }) {
+const BenchRow = memo(function BenchRow({
+  row,
+  residualRange,
+}: {
+  row: Extract<Row, { type: 'row' }>
+  residualRange: Range2
+}) {
   const cfg = row.config
   const chips = ['hidden_dims', 'learning_rate_max', 'n_train', 'n_epochs']
     .filter((k) => cfg[k] !== undefined)
     .map((k) => `${k}=${JSON.stringify(cfg[k])}`)
+  const fluxRange = row.flux_grids?.length ? minMaxGridValues(row.flux_grids) : undefined
   return (
     <div className="bench-row">
       <div className="bench-head">
@@ -254,9 +269,10 @@ const BenchRow = memo(function BenchRow({ row }: { row: Extract<Row, { type: 'ro
           </div>
           <div className="bench-grids">
             {row.flux_grids.map((g, i) => (
-              <GridHeatmap key={i} grid={g} quantity="flux" />
+              <GridHeatmap key={i} grid={g} quantity="flux" zRange={fluxRange} />
             ))}
           </div>
+          {fluxRange && <Colorbar title="ψ" gradient={FLUX_COLORBAR} range={fluxRange} unit="Wb" />}
         </>
       )}
       {row.residual_grids && row.residual_grids.length > 0 && (
@@ -266,10 +282,10 @@ const BenchRow = memo(function BenchRow({ row }: { row: Extract<Row, { type: 'ro
           </div>
           <div className="bench-grids">
             {row.residual_grids.map((g, i) => (
-              <GridHeatmap key={i} grid={g} quantity="residual" />
+              <GridHeatmap key={i} grid={g} quantity="residual" residualRange={residualRange} />
             ))}
           </div>
-          <Colorbar title="log₁₀|R_GS|" gradient={plasmaGradient} range={[-2, 1]} />
+          <Colorbar title="|R_GS|" gradient={plasmaGradient} range={residualRange} />
         </>
       )}
     </div>

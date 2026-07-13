@@ -94,7 +94,11 @@ const enc = (name: string) => encodeURIComponent(name).replaceAll('%2F', '/')
 export const api = {
   config: () =>
     fetch('/api/config').then((r) =>
-      toJson<{ eval_config_count: number; eval_resolution: number }>(r),
+      toJson<{
+        eval_config_count: number
+        eval_resolution: number
+        residual_color_range: [number, number]
+      }>(r),
     ),
   networks: (viewMode: string) =>
     fetch(`/api/networks?view_mode=${encodeURIComponent(viewMode)}`).then((r) => toJson<string[]>(r)),
