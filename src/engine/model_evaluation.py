@@ -360,6 +360,63 @@ def plot_plasma_grid_montage(
     plt.close(fig)
 
 
+def plot_training_curves(
+    csv_path: str | Path, output_path: str | Path, title: str | None = None
+) -> None:
+    """Two-panel training overview from training.csv: loss/val-loss on top,
+    LR + gradient norm (twinned y-axes) below — one glance to see whether a
+    run is still descending or has actually annealed to its LR floor."""
+    import csv
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    epochs: list[int] = []
+    lr: list[float] = []
+    loss: list[float] = []
+    grad_norm: list[float] = []
+    val_epochs: list[int] = []
+    val_loss: list[float] = []
+    with open(csv_path) as f:
+        for row in csv.DictReader(f):
+            epochs.append(int(row["epoch"]))
+            lr.append(float(row["lr"]))
+            loss.append(float(row["moving_avg_loss"]))
+            grad_norm.append(float(row["grad_norm"]))
+            if row["val_loss"]:
+                val_epochs.append(int(row["epoch"]))
+                val_loss.append(float(row["val_loss"]))
+
+    fig, (ax_loss, ax_lr) = plt.subplots(2, 1, figsize=(8, 7), sharex=True, layout="constrained")
+
+    ax_loss.plot(epochs, loss, color="#6cce5a", lw=1.2, label="train loss")
+    if val_loss:
+        ax_loss.plot(
+            val_epochs, val_loss, color="#fde725", marker="o", markersize=3, lw=0, label="val loss"
+        )
+    ax_loss.set_yscale("log")
+    ax_loss.set_ylabel("loss")
+    ax_loss.legend(loc="upper right", fontsize=8)
+    ax_loss.set_title(title or Path(csv_path).parent.name, fontsize=10)
+
+    ax_lr.plot(epochs, lr, color="#26828e", lw=1.2)
+    ax_lr.set_yscale("log")
+    ax_lr.set_ylabel("learning rate", color="#26828e")
+    ax_lr.tick_params(axis="y", labelcolor="#26828e")
+    ax_lr.set_xlabel("epoch")
+
+    ax_gn = ax_lr.twinx()
+    ax_gn.plot(epochs, grad_norm, color="#d4d4d8", lw=1.0, alpha=0.7)
+    ax_gn.set_yscale("log")
+    ax_gn.set_ylabel("||∇L||", color="#d4d4d8")
+    ax_gn.tick_params(axis="y", labelcolor="#d4d4d8")
+
+    fig.savefig(output_path, dpi=110)
+    plt.close(fig)
+
+
 def _add_kpi_table(fig: object, kpis: Mapping[str, float]) -> None:
     """Render KPIs as a 2-row (All/Core) x 4-col (mean/median/p95/p05) table."""
     stats = ["mean", "median", "p95", "p05"]
@@ -476,6 +533,9 @@ if __name__ == "__main__":
 
         if args.no_plots:
             continue
+        csv_path = run_dir / "training.csv"
+        if csv_path.exists():
+            plot_training_curves(csv_path, run_dir / "training_curves.png", title=name)
         grids = evaluate_plasma_grids(
             manager,
             configs,
