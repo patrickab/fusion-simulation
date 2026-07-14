@@ -475,6 +475,30 @@ def _save_top_configs(
     logger.info(f"Top configurations saved to {output_file}")
 
 
+def _generate_benchmark_report(study: optuna.Study, hpo_benchmark_dir: Path) -> None:
+    """Render the LaTeX benchmark PDF for all kept (non-pruned) configs.
+
+    A kept config = COMPLETE trial with a surviving run dir (network.flax on
+    disk). Pruned/failed trials never wrote one. Failures here never propagate --
+    a broken report must not fail a finished study.
+    """
+    run_dirs = [
+        hpo_benchmark_dir / t.user_attrs["run"]
+        for t in study.trials
+        if t.state == optuna.trial.TrialState.COMPLETE
+        and "checkpoint" in t.user_attrs
+        and (hpo_benchmark_dir / t.user_attrs.get("run", "") / "network.flax").exists()
+    ]
+    if not run_dirs:
+        return
+    try:
+        from src.engine.benchmark_report import generate_report
+
+        generate_report(run_dirs, output_path=hpo_benchmark_dir / "benchmark_report.pdf")
+    except Exception as e:
+        logger.warning(f"Benchmark report generation failed: {e}")
+
+
 def run_optimization(
     search_space: SearchSpaceConfig | None = None,
     study: StudyConfig | None = None,
@@ -573,6 +597,7 @@ def run_optimization(
             )
         _save_top_configs(results, optuna_study, hpo_benchmark_dir)
         _write_trials_json(optuna_study, hpo_benchmark_dir)
+        _generate_benchmark_report(optuna_study, hpo_benchmark_dir)
         return results
     finally:
         lock.unlink(missing_ok=True)
