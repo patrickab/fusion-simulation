@@ -336,11 +336,15 @@ class NetworkManager:
         seed: int = BASE_SEED,
         n_validation_size: int = N_VALIDATION_SIZE,
         test_mode: bool = False,
+        output_dir: Path | None = None,
     ) -> None:
         self.config = config
         self.seed = seed
         self.n_validation_size = n_validation_size
         self.test_mode = test_mode
+        # Where run dirs land. None -> the per-commit benchmark tree; HPO passes
+        # its bundle dir so trained nets live under data/hpo/<slug>/ instead.
+        self.output_dir = output_dir
         self.model = FluxPINN(
             hidden_dims=config.hidden_dims,
             n_fourier_features=config.n_fourier_features,
@@ -371,10 +375,12 @@ class NetworkManager:
         return f"pinn_{timestamp}"
 
     def run_dir(self) -> Path:
-        """Per-run benchmark dir: data/benchmarks/<commit>/<run>."""
+        """Per-run dir: data/benchmarks/<commit>/<run>, or <output_dir>/<run>
+        when an output_dir was given (e.g. an HPO study bundle)."""
         if self.artifact_stem is None:
             self.artifact_stem = self._new_artifact_stem()
-        return Filepaths.BENCHMARKS / current_commit() / self.artifact_stem
+        base = self.output_dir or Filepaths.BENCHMARKS / current_commit()
+        return base / self.artifact_stem
 
     def discard_unsaved_run(self) -> None:
         """Delete the benchmark run dir unless this run's checkpoint was saved.
@@ -979,7 +985,11 @@ def show_run(run: str) -> None:
     """
     run_dir = Path(run)
     if not run_dir.is_dir():
-        candidates = [Filepaths.BENCHMARKS / run, *Filepaths.BENCHMARKS.glob(f"*/{run}")]
+        candidates = [
+            Filepaths.BENCHMARKS / run,
+            *Filepaths.BENCHMARKS.glob(f"*/{run}"),
+            *(Filepaths.DATA / "hpo").glob(f"*/{run}"),
+        ]
         run_dir = next((p for p in candidates if p.is_dir()), run_dir)
     csv_path = run_dir / "training.csv"
     if not csv_path.exists():
