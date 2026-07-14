@@ -19,25 +19,23 @@ from src.lib.network_config import HyperParams
 
 GridQuantity = Literal["flux", "residual"]
 DEFAULT_KPI_SAMPLE_SIZE = 16_384
-EVAL_CONFIG_COUNT = 8
-# Polar-mesh residual montages paint each (theta, rho) cell as one flat/gouraud
-# patch; cell arc-length grows with rho, so at low theta resolution a single
-# narrow high-residual filament near the O-point gets flat-filled across a
-# whole wedge, badly overstating its true extent. 600 was verified (visually,
-# against the frontend's contourcarpet renderer at its own max resolution of
-# 300) to collapse those wedges back down to the filaments' real footprint.
+# Plot count - kept small to ensure plots do not become too large
+N_PLOTS = 8
+
+# Config count for KPI *statistics* (median/p95/etc).
+# Increasing this value increases stability of these estimators
+KPI_CONFIG_COUNT = 100
+
+# Grid resolution for montage plots -- collapses flat-filled wedge artifacts
+# near the O-point back down to their real footprint.
 EVAL_RESOLUTION = 600
-# Per-config point-eval batch size for grid evaluation (see `fields` in
-# evaluate_plasma_grids) — bounds peak memory independent of EVAL_RESOLUTION.
-# 20_000 matches the old resolution=200 grid (n_theta*n_rho), a size already
-# proven safe mid-training on a 12GB GPU.
+
+# Per-config point-eval batch size for grid evaluation -- bounds peak memory
+# independent of EVAL_RESOLUTION.
 GRID_EVAL_CHUNK = 20_000
-# Fixed residual colorbar range, shared by the montage plot and the frontend
-# (via /api/config) so both render on one comparable scale. [0, 1] was the
-# right span for soft-BC checkpoints; the hard-BC fix (commit 8a8b9a4) and its
-# corrected-physics collapse-guard pushed core residuals into the 1e-4-1e-2
-# band (N3 sweep run: core_loss_median 0.0025 vs bb503b0's soft-BC 0.087), so
-# [0, 1] now renders every current checkpoint as a flat black square.
+
+# Fixed residual colorbar range, shared with the frontend so both render on
+# one comparable scale.
 RESIDUAL_COLOR_RANGE: tuple[float, float] = (0.0, 0.01)
 
 
@@ -487,7 +485,13 @@ if __name__ == "__main__":
         nargs="*",
         help="Network names as commit/run (default: all in data/benchmarks/)",
     )
-    parser.add_argument("--n-configs", type=int, default=8)
+    parser.add_argument("--n-configs", type=int, default=KPI_CONFIG_COUNT)
+    parser.add_argument(
+        "--plot-n-configs",
+        type=int,
+        default=N_PLOTS,
+        help="Configs rendered in the montage (subset of --n-configs)",
+    )
     parser.add_argument("--n-points", type=int, default=DEFAULT_KPI_SAMPLE_SIZE)
     parser.add_argument("--core-rho", type=float, default=0.85)
     parser.add_argument("--no-plots", action="store_true")
@@ -558,7 +562,7 @@ if __name__ == "__main__":
             plot_training_curves(csv_path, run_dir / "training_curves.png", title=name)
         grids = evaluate_plasma_grids(
             manager,
-            configs,
+            configs[: args.plot_n_configs],
             resolution=args.plot_resolution,
             quantities=(args.plot_quantity,),
         )

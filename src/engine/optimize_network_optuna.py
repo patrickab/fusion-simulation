@@ -1,55 +1,166 @@
 """Optuna hyperparameter search using the standard network training path."""
 
 import argparse
-from collections import deque
 import json
 import logging
 import os
+import shutil
 import sys
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, Literal
 
 import jax
 import optuna
 from optuna.pruners import HyperbandPruner, NopPruner
 from optuna.samplers import TPESampler
-from rich import box
-from rich.console import Console, Group
-from rich.live import Live
-from rich.markup import escape
-from rich.panel import Panel
-from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
-from rich.table import Table
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.containers import VerticalScroll
-from textual.widgets import Footer, RichLog, Static
 
 from src.engine.network import NetworkManager
-from src.engine.network import logger as network_logger
 from src.lib.config import Filepaths, current_commit
-from src.lib.logger import get_logger
 from src.lib.network_config import HyperParams
-
-logger = get_logger(name="OptunaHPO")
-console = Console(width=160)
+from src.lib.optuna_tui import HpoApp, OptunaProgressDisplay, logger, resolve_reset_choice
 
 HPO_ROOT = Filepaths.DATA / "hpo"
 
+# Architectures (width * depth) to search over.
+_ARCHITECTURE_GRID = [
+    (200,) * 5,
+    (160,) * 5,
+    (128,) * 5,
+    (200,) * 4,
+    (160,) * 4,
+    (128,) * 4,
+]
+
+# Hand-curated list of previous experiments for warm-start of experiment database.
+WARMSTART_CONFIG_PATHS: list[Path] = [
+    Filepaths.BENCHMARKS
+    / "model_selection_benchmark"
+    / "pinn_2026_07_13_01_18_41_hard-bc-unoptimized"
+    / "config.json",
+    Filepaths.BENCHMARKS
+    / "model_selection_benchmark"
+    / "pinn_2026_07_13_06_59_27_hard-bc-tuned-schedule"
+    / "config.json",
+    Filepaths.BENCHMARKS
+    / "model_selection_benchmark"
+    / "pinn_2026_07_13_08_32_59_hard-bc-final"
+    / "config.json",
+]
+
+# Optuna storage URL for persistent experiment ledger, e.g.
+# "sqlite:///data/hpo/experiments.db". "" -> in-memory only (still works for a
+# single optuna_warmstart() call, just doesn't persist between processes).
+WARMSTART_EXPERIMENT_DATABASE: str | None = None
+
+
+@dataclass(frozen=True)
+class Range:
+    """Continuous, optionally log-scaled search axis."""
+
+    low: float
+    high: float
+    log: bool = False
+
+
+@dataclass
+class SearchSpaceConfig:
+    """
+    Search-space for HyperParams.
+
+    Dynamically & declaratively defines Optuna optimization run.
+        - Scalar = pinned
+        - list   = discrete choices,
+        - Range  = continuous.
+
+    To define a new searchable axis define a range or list of values.
+    Field names mirror HyperParams.
+    """
+
+    hidden_dims: tuple[int, ...] | list[tuple[int, ...]] = field(
+        default_factory=_ARCHITECTURE_GRID.copy
+    )
+    learning_rate_max: Range = Range(1e-3, 3e-3, log=True)
+    learning_rate_min: Range = Range(1e-6, 2.4e-4, log=True)
+    weight_decay: Range = Range(1e-8, 1e-4, log=True)
+    sigma_residual_adaptive_sampling: Range = Range(0.01, 0.05)
+    weight_boundary_condition: float = 10.0
+    weight_flux_scale: float = 10.0
+    soft_bc: bool = True
+    n_rz_inner_samples: int = 512
+    n_rz_boundary_samples: int = 128
+    batch_size: int = 64
+    n_train: int = 1024
+    warmup_epochs: int = 100
+    decay_epochs: int = 500
+    huber_delta: float = 1.0
+    n_fourier_features: int = 64
+    lbfgs_steps: int = 0
+
+    def get_static_params(self) -> dict[str, Any]:
+        """Fields pinned to a single value -- fed straight into HyperParams(**...)."""
+        return {
+            f.name: getattr(self, f.name)
+            for f in fields(self)
+            if not isinstance(getattr(self, f.name), list | Range)
+        }
+
+    def get_suggestable_params(self) -> dict[str, list | Range]:
+        """Fields Optuna searches: name -> its list of choices or its Range."""
+        return {
+            f.name: getattr(self, f.name)
+            for f in fields(self)
+            if isinstance(getattr(self, f.name), list | Range)
+        }
+
+    def is_valid_config(self, hparams: HyperParams) -> bool:
+        """Whether hp's values fall within every axis this search space searches."""
+        for name, spec in self.get_suggestable_params().items():
+            value = getattr(hparams, name)
+            if isinstance(spec, Range):
+                if not (spec.low <= value <= spec.high):
+                    return False
+            elif value not in spec:
+                return False
+        return True
+
+    def is_static_parameter_mismatch(self, hparams: HyperParams) -> dict[str, Any]:
+        """
+        Check if hyperparameters disagree with static parameters.
+
+        Used for warmstarting experiments to ensure fair comparison.
+        """
+        return {k: v for k, v in self.get_static_params().items() if getattr(hparams, k) != v}
+
+
+_DEFAULT_TOTAL_EPOCHS = SearchSpaceConfig.warmup_epochs + SearchSpaceConfig.decay_epochs
+
+
+@dataclass
+class StudyConfig:
+    """Orchestration knobs for the Optuna study itself -- never fed to HyperParams."""
+
+    study_name: str = "pinn_hpo"
+    n_trials: int = 5
+    top_k: int = 3
+    n_startup_trials: int = 10
+    n_validate: int = 20
+    min_epochs: int = _DEFAULT_TOTAL_EPOCHS // 2
+    total_epochs: int = _DEFAULT_TOTAL_EPOCHS
+    prune_trials: bool = True
+    # "none": no checkpoints/benchmark dirs (--test). "top_k": only trials that rank in
+    # the current top_k get saved (post-hoc). "all": every trial saves during training.
+    checkpoint_policy: Literal["none", "top_k", "all"] = "top_k"
+
 
 def study_dir(study_name: str, commit: str | None = None) -> Path:
-    """Per-study bundle under the running commit:
+    """
+    Defines storage location for optuna study artifacts:
 
-    ``data/hpo/<commit>/<study>/{study.db, optuna.log, top_trials.json, trials.json}``.
-
-    Mirrors the per-commit benchmark tree (``data/benchmarks/<commit>/<run>/``):
-    a commit is one code revision, and all HPO studies run against that revision
-    land together. ``commit`` defaults to HEAD so callers don't have to thread it.
+        data / hpo / <commit> / <study> / {study.db, optuna.log, top_trials.json, trials.json}.
     """
     commit = commit or current_commit()
     path = HPO_ROOT / commit / study_name
@@ -57,362 +168,136 @@ def study_dir(study_name: str, commit: str | None = None) -> Path:
     return path
 
 
-@dataclass
-class SearchSpaceConfig:
-    """Search bounds and fixed experiment settings."""
-
-    depth_range: tuple[int, int] = (4, 5)
-    width_choices: tuple[int, ...] = (128, 160, 200)
-    lr_max_range: tuple[float, float] = (1e-3, 3e-3)
-    lr_min_ratio_range: tuple[float, float] = (0.001, 0.08)
-    weight_decay_range: tuple[float, float] = (1e-8, 1e-4)
-    sigma_residual_range: tuple[float, float] = (0.01, 0.05)
-
-    weight_boundary_condition: float = 10.0
-    weight_flux_scale: float = 10.0
-    soft_bc: bool = True
-    n_rz_inner: int = 512
-    n_rz_boundary: int = 128
-    batch_size: int = 64
-    n_train: int = 1024
-    total_epochs: int = 600
-    warmup_ratio: float = 0.167
-    n_validate: int = 20
-
-    min_epochs: int = 50
-    n_trials: int = 5
-    top_k: int = 3
-    n_startup_trials: int = 10
-
-    huber_delta: float = 1.0
-    n_fourier_features: int = 64
-    lbfgs_steps: int = 0
-    study_name: str = "pinn_hpo"
-    prune_trials: bool = True
-    save_all: bool = False
-    save_checkpoints: bool = True  # False (--test): keep no checkpoints/benchmark dirs
+def load_configs(paths: list[Path] = WARMSTART_CONFIG_PATHS) -> list[tuple[Path, HyperParams]]:
+    return [(path, HyperParams.from_json(str(path))) for path in paths]
 
 
-class OptunaProgressDisplay:
-    """Rich live dashboard showing optimization progress and top configs."""
+def load_experiment_db(
+    search_space: SearchSpaceConfig, storage: str | None = WARMSTART_EXPERIMENT_DATABASE
+) -> optuna.Study | None:
 
-    def __init__(self, config: SearchSpaceConfig, prior_trials: int = 0, live: bool = True) -> None:
-        self.config = config
-        # Per-trial events (markup strings or Rich renderables) for the TUI detail view;
-        # drained by HpoApp on its UI timer. RichLog snapshots renderables at write time.
-        self.events: deque[Any] = deque(maxlen=2000)
-        self._trial_rows: list[tuple[str, ...]] = []
-        # Manager of the currently training trial; the TUI renders its metrics table live.
-        self.current_manager: NetworkManager | None = None
-        # Keep a rolling window: an ever-growing table eventually exceeds the terminal height
-        # and desynchronizes Rich's cursor-based redraw when the terminal scrolls.
-        self._trials_data: deque[dict[str, Any]] = deque(maxlen=15)
-        self._best_configs: list[tuple[dict[str, Any], float]] = []
-        self._best_loss, self._start_time = float("inf"), datetime.now()
-        self._counts = {"pruned": 0, "failed": 0, "done": 0}
-        self._trials_processed, self._prior_trials = 0, prior_trials
-        self._current_trial_info: dict[str, Any] = {}
+    if storage is None:
+        return None
 
-        self._progress = Progress(
-            TextColumn("[bold cyan]{task.description}"),
-            BarColumn(complete_style="cyan", finished_style="green"),
-            TextColumn("{task.completed}/{task.total}"),
-            TextColumn("({task.percentage:.0f}%)"),
-            TimeElapsedColumn(),
-            console=console,
-        )
-        self._task = self._progress.add_task("Progress:", total=self.config.n_trials)
-        self._epoch_task = self._progress.add_task(
-            "[magenta]Epochs:  ", total=self.config.total_epochs, visible=False
-        )
-        # live=False: HpoApp renders _build_layout() itself; no terminal-owning Live loop.
-        self._live = (
-            Live(
-                self._build_layout(),
-                refresh_per_second=4,
-                console=console,
-                vertical_overflow="visible",
-            )
-            if live
-            else None
-        )
-
-    def _sync(self) -> None:
-        if self._live is not None:
-            self._live.update(self._build_layout())
-
-    def _get_trials_table(self) -> Table:
-        table = Table(title="Previous Trials", show_header=True, header_style="bold cyan")
-        for column in [
-            "Trial",
-            "Depth",
-            "Width",
-            "Max LR",
-            "Min LR",
-            "Weight Decay",
-            "Sig Adapt Sampling",
-            "Val Loss",
-            "Status",
-        ]:
-            table.add_column(column, justify="left" if column == "Status" else "right")
-        for data in self._trials_data:
-            table.add_row(
-                *[
-                    str(data.get(key, "?"))
-                    for key in (
-                        "trial",
-                        "depth",
-                        "width",
-                        "lr_max",
-                        "lr_min",
-                        "wd",
-                        "sig",
-                        "loss",
-                        "status",
-                    )
-                ]
-            )
-        return table
-
-    def _get_best_table(self) -> Table:
-        table = Table(
-            title=f"Top {self.config.top_k} Configs",
-            show_header=True,
-            header_style="bold green",
-        )
-        for column in [
-            "Rank",
-            "Depth",
-            "Width",
-            "Max LR",
-            "Min LR",
-            "Weight Decay",
-            "Sig Adapt Sampling",
-            "Val Loss",
-        ]:
-            table.add_column(column, justify="right")
-        for rank, (params, loss) in enumerate(self._best_configs, 1):
-            table.add_row(
-                str(rank),
-                str(params.get("depth", "?")),
-                str(params.get("width", "?")),
-                f"{params.get('lr_max', 0):.2e}",
-                f"{params.get('lr_min', 0):.2e}",
-                f"{params.get('wd', 0):.2e}",
-                f"{params.get('sig', 0):.3f}",
-                f"{loss:.4f}",
-            )
-        return table
-
-    def _build_layout(self) -> Panel:
-        elapsed_str = str(datetime.now() - self._start_time).split(".")[0]
-        summary = (
-            f"[bold]Best Val Loss:[/] {self._best_loss:.4f}  |  "
-            f"[bold]Elapsed:[/] {elapsed_str}\n"
-            f"Session: {self._counts['done']} done  |  {self._counts['pruned']} pruned  |  "
-            f"{self._counts['failed']} failed"
-            + (f"  |  Prior: {self._prior_trials}" if self._prior_trials else "")
-        )
-
-        current_table = Table(show_header=False, box=box.SIMPLE)
-        if self._current_trial_info:
-            current = self._current_trial_info
-            params = current["params"]
-            val_loss = current.get("val_loss")
-            title = f"Current Trial: {current['trial']}"
-            rows = [
-                ("Architecture:", f"{params.get('depth')}x{params.get('width')}"),
-                ("Max LR:", f"{params.get('lr_max', 0):.2e}"),
-                ("Min LR:", f"{params.get('lr_min', 0):.2e}"),
-                ("Weight Decay:", f"{params.get('wd', 0):.2e}"),
-                ("Sigma Res:", f"{params.get('sig', 0):.3f}"),
-                (
-                    "Recent Val Loss:",
-                    f"[bold cyan]{val_loss:.4f}[/bold cyan]"
-                    if val_loss is not None
-                    else "[bold cyan]--[/bold cyan]",
-                ),
-            ]
-        else:
-            title = "Current Trial: ---"
-            rows = [
-                (key, "---" if "Loss" not in key else "[bold cyan]---[/bold cyan]")
-                for key in (
-                    "Architecture:",
-                    "Max LR:",
-                    "Min LR:",
-                    "Weight Decay:",
-                    "Sigma Res:",
-                    "Recent Val Loss:",
-                )
-            ]
-        current_table.title = title
-        for key, value in rows:
-            current_table.add_row(key, value)
-
-        return Panel(
-            Group(
-                self._progress,
-                summary,
-                self._get_best_table(),
-                Panel(current_table, border_style="magenta"),
-                self._get_trials_table(),
-            ),
-            title="[bold cyan]PINN HPO Optimization[/bold cyan]",
-            border_style="cyan",
-        )
-
-    def start_trial(self, trial_num: int, params: dict[str, Any], total_epochs: int) -> None:
-        self._current_trial_info = {
-            "trial": trial_num,
-            "params": params,
-            "epoch": 0,
-            "val_loss": None,
-        }
-        self._progress.remove_task(self._epoch_task)
-        self._epoch_task = self._progress.add_task(
-            "[magenta]Epochs:  ", total=total_epochs, visible=True
-        )
-        if trial_num > 1:
-            self.events.append("")
-            self.events.append("")
-        self.events.append(f"[bold cyan]── trial {trial_num} ──[/]")
-        self._sync()
-
-    def update_epoch(self, epoch: int, val_loss: float | None = None) -> None:
-        if not self._current_trial_info:
-            return
-        self._current_trial_info["epoch"] = epoch
-        if val_loss is not None:
-            self._current_trial_info["val_loss"] = val_loss
-        self._progress.update(self._epoch_task, completed=epoch)
-        self._sync()
-
-    def add_metrics_row(self, row: tuple[str, ...]) -> None:
-        """Collect finalized training-table rows; flushed as one styled table per trial."""
-        self._trial_rows.append(row)
-
-    def _flush_trial_table(self) -> None:
-        """Write the finished trial's full metrics history as a styled Rich table."""
-        if self._trial_rows and self.current_manager is not None:
-            table = self.current_manager._new_table()
-            for row in self._trial_rows:
-                table.add_row(*row)
-            self.events.append(table)
-        self._trial_rows = []
-
-    def would_qualify_for_top_k(self, loss: float) -> bool:
-        return len(self._best_configs) < self.config.top_k or loss < self._best_configs[-1][1]
-
-    def update(
-        self,
-        trial_num: int,
-        params: dict[str, Any],
-        loss: float | None,
-        status: str,
-        epoch: int | None = None,
-    ) -> None:
-        self._trials_processed += 1
-        self._progress.update(self._task, completed=self._trials_processed)
-        self._progress.update(self._epoch_task, visible=False)
-        self._current_trial_info = {}
-        self._flush_trial_table()
-        if status in self._counts:
-            self._counts[status] += 1
-
-        if loss is not None:
-            self._best_configs.append((params.copy(), loss))
-            self._best_configs.sort(key=lambda item: item[1])
-            self._best_configs = self._best_configs[: self.config.top_k]
-            self._best_loss = self._best_configs[0][1]
-
-        color = {"pruned": "yellow", "failed": "red", "done": "green"}.get(status, "white")
-        status_text = f"[{color}]{status}" + (f" @ {epoch}" if epoch is not None else "") + "[/]"
-        self._trials_data.append(
-            {
-                "trial": trial_num,
-                "depth": params.get("depth", "?"),
-                "width": params.get("width", "?"),
-                "lr_max": f"{params.get('lr_max', 0):.2e}",
-                "lr_min": f"{params.get('lr_min', 0):.2e}",
-                "wd": f"{params.get('wd', 0):.2e}",
-                "sig": f"{params.get('sig', 0):.3f}",
-                "loss": f"{loss:.4f}" if loss is not None else "--",
-                "status": status_text,
-            }
-        )
-        self.events.append(
-            f"[bold cyan]trial {trial_num}[/] {status_text}"
-            + (f"  val_loss {loss:.4f}" if loss is not None else "")
-        )
-        self._sync()
-
-    def __enter__(self) -> "OptunaProgressDisplay":
-        self._live.__enter__()
-        return self
-
-    def __exit__(self, *args: Any) -> None:  # noqa: ANN401
-        self._live.__exit__(*args)
-
-
-def build_hyperparams(trial: optuna.Trial, config: SearchSpaceConfig) -> HyperParams:
-    """Sample trainable hyperparameters and apply the study's fixed settings."""
-    depth = trial.suggest_int("depth", *config.depth_range)
-    width = trial.suggest_categorical("width", config.width_choices)
-    lr_max = trial.suggest_float("lr_max", *config.lr_max_range, log=True)
-    lr_min_ratio = trial.suggest_float("lr_min_ratio", *config.lr_min_ratio_range, log=True)
-
-    warmup_epochs = int(config.total_epochs * config.warmup_ratio)
-    return HyperParams(
-        hidden_dims=(width,) * depth,
-        learning_rate_max=lr_max,
-        learning_rate_min=lr_max * lr_min_ratio,
-        weight_decay=trial.suggest_float("weight_decay", *config.weight_decay_range, log=True),
-        weight_boundary_condition=config.weight_boundary_condition,
-        weight_flux_scale=config.weight_flux_scale,
-        soft_bc=config.soft_bc,
-        sigma_residual_adaptive_sampling=trial.suggest_float(
-            "sigma_residual", *config.sigma_residual_range
-        ),
-        n_rz_inner_samples=config.n_rz_inner,
-        n_rz_boundary_samples=config.n_rz_boundary,
-        warmup_epochs=warmup_epochs,
-        decay_epochs=config.total_epochs - warmup_epochs,
-        batch_size=config.batch_size,
-        n_train=config.n_train,
-        huber_delta=config.huber_delta,
-        n_fourier_features=config.n_fourier_features,
-        lbfgs_steps=config.lbfgs_steps,
+    db = optuna.create_study(
+        study_name="warmstart_experiments",
+        storage=storage,
+        load_if_exists=True,
+        direction="minimize",
     )
 
+    for trial in db.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,)):
+        config = trial.user_attrs.get("config")
+        hparams = config and HyperParams.from_dict(config)
+        if hparams and (mismatches := search_space.is_static_parameter_mismatch(hparams)):
+            raise ValueError(f"{trial.user_attrs.get('run')}: stale ledger entry {mismatches}")
 
-def check_capacity(config: SearchSpaceConfig) -> None:
-    """Verify that the largest architecture fits before starting the study."""
-    hp = HyperParams(
-        hidden_dims=(max(config.width_choices),) * config.depth_range[1],
-        learning_rate_max=1e-3,
-        n_rz_inner_samples=config.n_rz_inner,
-        n_rz_boundary_samples=config.n_rz_boundary,
-        batch_size=config.batch_size,
-        warmup_epochs=10,
-        decay_epochs=10,
-        huber_delta=config.huber_delta,
-        n_fourier_features=config.n_fourier_features,
-    )
-    manager = NetworkManager(hp, n_validation_size=config.n_validate)
+    return db
+
+
+def _reevaluate_config(path: Path, hp: HyperParams, static: dict[str, Any]) -> HyperParams:
+    """
+    Retrains config under search_space's static values
+    Destructively replaces previous artifacts (network/plots/kpis)
+    """
+    corrected = HyperParams(**{**hp.to_dict(), **static})
+    stale = sorted(static)
+    logger.warning(f"{path.parent}: stale vs. current search space ({stale}) -- retraining")
+    manager = NetworkManager(corrected)
+    manager.train(save_to_disk=True)
+    shutil.rmtree(path.parent)
+    shutil.move(str(manager.run_dir()), str(path.parent))
+    return corrected
+
+
+def optuna_warmstart(search_space: SearchSpaceConfig) -> optuna.Study | None:
+    """Populate the experiment database
+
+    WARMSTART_CONFIG_PATHS: reuse kpis.json, if compliant with SearchSpaceConfig, else re-evaluate
+    WARMSTART_EXPERIMENT_DATABASE: no-op (returns None) if unset, else reads from its path."""
+    db = load_experiment_db(search_space, WARMSTART_EXPERIMENT_DATABASE)
+
+    if db is None:
+        return None
+
+    for path, hp in load_configs(WARMSTART_CONFIG_PATHS):
+        mismatched = search_space.is_static_parameter_mismatch(hp)
+
+        if mismatched:
+            hp = _reevaluate_config(path, hp, mismatched)
+
+        loss = json.loads((path.parent / "kpis.json").read_text())["loss_median"]
+
+        db.add_trial(
+            optuna.trial.create_trial(
+                value=loss,
+                user_attrs={"config": hp.to_dict(), "run": str(path.parent)},
+            )
+        )
+    return db
+
+
+def _get_experiment_db_configs(db: optuna.Study | None) -> list[HyperParams]:
+    """Every config recorded in a warmstart experiment database, or [] if there is none."""
+    if db is None:
+        return []
+    return [
+        HyperParams.from_dict(t.user_attrs["config"])
+        for t in db.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
+        if "config" in t.user_attrs
+    ]
+
+
+# Types Optuna can store as a categorical choice natively.
+_STORAGE_SAFE = (type(None), bool, int, float, str)
+
+
+def _suggest(trial: optuna.Trial, name: str, spec: list | Range) -> Any:  # noqa: ANN401
+    """Ask Optuna for one value, matching the spec's shape to the right suggest_* call."""
+    if isinstance(spec, Range):
+        return trial.suggest_float(name, spec.low, spec.high, log=spec.log)
+    if all(isinstance(choice, _STORAGE_SAFE) for choice in spec):
+        return trial.suggest_categorical(name, spec)
+    # e.g. hidden_dims candidates are tuples -- not SQLite-safe for suggest_categorical
+    # directly, so search over string labels and map back to the real value.
+    label = trial.suggest_categorical(name, [str(choice) for choice in spec])
+    return {str(choice): choice for choice in spec}[label]
+
+
+def build_hyperparams(trial: optuna.Trial, search_space: SearchSpaceConfig) -> HyperParams:
+    """Sample every searchable axis and merge with the pinned ones."""
+    suggested = {
+        name: _suggest(trial, name, spec)
+        for name, spec in search_space.get_suggestable_params().items()
+    }
+    return HyperParams(**search_space.get_static_params(), **suggested)
+
+
+def check_capacity(search_space: SearchSpaceConfig, study: StudyConfig) -> None:
+    """Verify the search space's most resource-demanding config trains without crashing."""
+    suggestable = search_space.get_suggestable_params()
+    picked = {
+        # Each spec's most demanding end: Range.high, or a list's first entry
+        # (lists like _ARCHITECTURE_GRID are hand-ordered biggest-first).
+        name: spec.high if isinstance(spec, Range) else spec[0]
+        for name, spec in suggestable.items()
+    }
+    hp = HyperParams(**search_space.get_static_params(), **picked)
+    manager = NetworkManager(hp, n_validation_size=study.n_validate)
     manager.train_epoch(0)
     jax.clear_caches()
-    logger.info(f"Capacity check passed: {config.depth_range[1]}x{max(config.width_choices)}")
+    logger.info(f"Capacity check passed: {len(hp.hidden_dims)}x{hp.hidden_dims[0]}")
 
 
 def objective(
     trial: optuna.Trial,
-    config: SearchSpaceConfig,
+    search_space: SearchSpaceConfig,
+    study: StudyConfig,
     display: OptunaProgressDisplay,
     commit: str,
 ) -> float:
     """Train one normally configured network and report validation loss to Optuna."""
-    hp = build_hyperparams(trial, config)
+    hp = build_hyperparams(trial, search_space)
     display_params = {
         "depth": len(hp.hidden_dims),
         "width": hp.hidden_dims[0],
@@ -422,7 +307,7 @@ def objective(
         "sig": hp.sigma_residual_adaptive_sampling,
     }
     manager = NetworkManager(
-        hp, n_validation_size=config.n_validate, test_mode=not config.save_checkpoints
+        hp, n_validation_size=study.n_validate, test_mode=study.checkpoint_policy == "none"
     )
     total_epochs = hp.warmup_epochs + hp.decay_epochs
     display.start_trial(trial.number + 1, display_params, total_epochs)
@@ -436,24 +321,24 @@ def objective(
         display.update_epoch(epoch, val_loss)
         if val_loss is not None:
             trial.report(val_loss, epoch)
-            if config.prune_trials and trial.should_prune():
+            if study.prune_trials and trial.should_prune():
                 raise optuna.TrialPruned
 
     try:
         val_loss = manager.train(
-            save_to_disk=config.save_all and config.save_checkpoints,
+            save_to_disk=study.checkpoint_policy == "all",
             validation_callback=report,
             show_progress=False,
         )
-        if config.save_checkpoints and not config.save_all:
+        if study.checkpoint_policy == "top_k":
             completed = sorted(
                 t.value
                 for t in trial.study.get_trials(states=(optuna.trial.TrialState.COMPLETE,))
                 if t.value is not None
             )
-            if len(completed) < config.top_k or val_loss < completed[config.top_k - 1]:
+            if len(completed) < study.top_k or val_loss < completed[study.top_k - 1]:
                 trial.set_user_attr("checkpoint", manager.to_disk())
-        elif config.save_all:  # train() already saved; stem doubles as the checkpoint name
+        elif study.checkpoint_policy == "all":  # train() already saved; stem is the name
             trial.set_user_attr("checkpoint", manager.artifact_stem)
         display.update(trial.number + 1, display_params, val_loss, "done", total_epochs)
         return val_loss
@@ -476,31 +361,9 @@ def objective(
         jax.clear_caches()
 
 
-def get_warmstart_config(config: SearchSpaceConfig) -> dict[str, Any] | None:
-    """Return the best known configuration when it belongs to the search space."""
-    warmstart = {
-        "depth": 4,
-        "width": 128,
-        "lr_max": 0.002,
-        "lr_min_ratio": 0.025,
-        "weight_decay": 1e-7,
-        "sigma_residual": 0.05,
-    }
-    if (
-        config.depth_range[0] <= warmstart["depth"] <= config.depth_range[1]
-        and warmstart["width"] in config.width_choices
-    ):
-        return warmstart
-    return None
-
-
 def _write_trials_json(study: optuna.Study, commit: str) -> None:
-    """Ledger of which runs/checkpoints belong to this study.
-
-    Rewritten after every trial so an aborted study still leaves an on-disk
-    record; without it, benchmark run dirs on a shared commit could not be
-    attributed to their experiment.
-    """
+    """Ledger of which runs/checkpoints belong to this study. Rewritten after every
+    trial so an aborted study still leaves an on-disk record."""
     (study_dir(study.study_name, commit) / "trials.json").write_text(
         json.dumps(
             [
@@ -538,205 +401,120 @@ def _save_top_configs(
 
 
 def run_optimization(
-    config: SearchSpaceConfig | None = None,
+    search_space: SearchSpaceConfig | None = None,
+    study: StudyConfig | None = None,
+    *,
+    display: OptunaProgressDisplay,
     restart: bool = False,
-    display: OptunaProgressDisplay | None = None,
 ) -> list[tuple[HyperParams, float]]:
-    """Run or resume a study, guarded by a per-study single-process lock.
-
-    Concurrent create_study calls on one sqlite file race optuna's
-    check-then-insert and corrupt the db with duplicate study rows
-    (observed 2026-07-12: MultipleResultsFound on load). Crashed TUIs stay
-    open by design, so a relaunch while one is alive is the common case.
-    """
-    config = config or SearchSpaceConfig()
+    """Run or resume a study and return its best configurations."""
+    search_space = search_space or SearchSpaceConfig()
+    study = study or StudyConfig()
     # Freeze the commit once for the whole run: a commit made mid-study would
     # otherwise move study.db / optuna.log / trials.json to a different path
     # and split the study across two commit dirs.
     commit = current_commit()
-    lock = study_dir(config.study_name, commit) / ".lock"
-    if lock.exists():
-        pid = lock.read_text().strip()
-        if pid.isdigit() and Path(f"/proc/{pid}").exists():
-            raise RuntimeError(
-                f"Study '{config.study_name}' is already running (pid {pid}). "
-                "Concurrent runs corrupt the study db — quit the other process "
-                "first (crashed TUIs stay open; press q there)."
-            )
-    # ponytail: check-then-write lock; atomic O_EXCL takeover not worth it for
-    # the human-relaunch-after-crash case this guards.
-    lock.write_text(str(os.getpid()))
-    try:
-        return _run_optimization(config, restart, display, commit)
-    finally:
-        lock.unlink(missing_ok=True)
-
-
-def _run_optimization(
-    config: SearchSpaceConfig,
-    restart: bool,
-    display: OptunaProgressDisplay | None,
-    commit: str,
-) -> list[tuple[HyperParams, float]]:
-    """Run or resume a study and return its best configurations."""
-    bundle_dir = study_dir(config.study_name, commit)
+    bundle_dir = study_dir(study.study_name, commit)
     file_handler = logging.FileHandler(bundle_dir / "optuna.log")
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     )
     logger.addHandler(file_handler)
-    check_capacity(config)
+    # One ledger read/write for both check_capacity and the enqueue loop below --
+    # optuna_warmstart() may retrain stale configs, no reason to pay that twice.
+    candidates = _get_experiment_db_configs(optuna_warmstart(search_space))
+    check_capacity(search_space, study)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     storage_path = bundle_dir / "study.db"
     if restart and storage_path.exists():
         storage_path.unlink()
 
-    study = optuna.create_study(
-        study_name=config.study_name,
-        storage=f"sqlite:///{storage_path}",
-        load_if_exists=not restart,
-        direction="minimize",
-        sampler=TPESampler(seed=42, n_startup_trials=config.n_startup_trials),
-        pruner=(
-            HyperbandPruner(
-                min_resource=config.min_epochs,
-                max_resource=config.total_epochs,
-                reduction_factor=2,
-            )
-            if config.prune_trials
-            else NopPruner()
-        ),
-    )
-    if not study.trials:
-        warmstart = get_warmstart_config(config)
-        if warmstart is not None:
-            study.enqueue_trial(warmstart)
+    # Concurrent create_study calls on one sqlite file race optuna's
+    # check-then-insert and corrupt the db with duplicate study rows
+    #
+    # Crashed TUIs stay open by design, so a relaunch while one is alive is the common case.
+    # Guard with an atomically-acquired lock (O_EXCL: no check-then-write gap).
+    lock = bundle_dir / ".lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        pid = lock.read_text().strip()
+        if pid.isdigit() and Path(f"/proc/{pid}").exists():
+            raise RuntimeError(
+                f"Study '{study.study_name}' is already running (pid {pid}). "
+                "Concurrent runs corrupt the study db -- quit the other process "
+                "first (crashed TUIs stay open; press q there)."
+            ) from None
+        # Lock file names a pid that's no longer alive -- stale lock from a
+        # crashed process, safe to reclaim.
+        lock.unlink(missing_ok=True)
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    with os.fdopen(fd, "w") as f:
+        f.write(str(os.getpid()))
 
-    prior_trials = sum(t.state != optuna.trial.TrialState.WAITING for t in study.trials)
-    if display is None:  # plain-console mode owns its own Live loop
-        with OptunaProgressDisplay(config, prior_trials=prior_trials) as display:
-            study.optimize(
-                lambda trial: objective(trial, config, display, commit),
-                n_trials=max(0, config.n_trials - prior_trials),
-                catch=(Exception,),
-            )
-    else:  # TUI mode: HpoApp owns rendering, we just feed it state
+    try:
+        optuna_study = optuna.create_study(
+            study_name=study.study_name,
+            storage=f"sqlite:///{storage_path}",
+            load_if_exists=not restart,
+            direction="minimize",
+            sampler=TPESampler(seed=42, n_startup_trials=study.n_startup_trials),
+            pruner=(
+                HyperbandPruner(
+                    min_resource=study.min_epochs,
+                    max_resource=study.total_epochs,
+                    reduction_factor=2,
+                )
+                if study.prune_trials
+                else NopPruner()
+            ),
+        )
+        if not optuna_study.trials:
+            # Enqueue every valid, distinct candidate -- each one still costs a full
+            # retrain (enqueue_trial can't inject a free historical result), but there's
+            # no reason to cap how many known-good starting points TPE gets to try first.
+            seen = set()
+            for hp in candidates:
+                if not search_space.is_valid_config(hp):
+                    continue
+                warmstart = {
+                    name: getattr(hp, name) for name in search_space.get_suggestable_params()
+                }
+                key = tuple(sorted(warmstart.items()))
+                if key in seen:
+                    continue
+                seen.add(key)
+                optuna_study.enqueue_trial(warmstart)
+
+        prior_trials = sum(t.state != optuna.trial.TrialState.WAITING for t in optuna_study.trials)
         display._prior_trials = prior_trials
-        study.optimize(
-            lambda trial: objective(trial, config, display, commit),
-            n_trials=max(0, config.n_trials - prior_trials),
+        optuna_study.optimize(
+            lambda trial: objective(trial, search_space, study, display, commit),
+            n_trials=max(0, study.n_trials - prior_trials),
             catch=(Exception,),
         )
 
-    complete = sorted(
-        (
-            t
-            for t in study.trials
-            if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
-        ),
-        key=lambda trial: trial.value,
-    )[: config.top_k]
-    results = [(build_hyperparams(trial, config), trial.value) for trial in complete]
-    for rank, (hp, loss) in enumerate(results, 1):
-        architecture = f"{len(hp.hidden_dims)}x{hp.hidden_dims[0]}"
-        logger.info(
-            f"Rank {rank}: loss={loss:.6f}, architecture={architecture}, "
-            f"lr={hp.learning_rate_max:.2e}"
-        )
-    _save_top_configs(results, study, commit)
-    _write_trials_json(study, commit)
-    return results
-
-
-class _EventLogHandler(logging.Handler):
-    """Routes log records (incl. network.py's per-epoch DEBUG lines) into the detail pane."""
-
-    def __init__(self, events: deque[str]) -> None:
-        # INFO: the per-epoch DEBUG lines are already on screen as the metrics table
-        super().__init__(logging.INFO)
-        self._events = events
-
-    def emit(self, record: logging.LogRecord) -> None:
-        self._events.append(f"[dim]{record.levelname}[/]  " + escape(record.getMessage()))
-
-
-class HpoApp(App):
-    """Fullscreen HPO dashboard; Tab flips between study overview and per-trial log."""
-
-    BINDINGS: ClassVar = [
-        Binding("tab", "toggle_view", "overview/detail", priority=True),
-        Binding("q", "quit", "quit"),
-    ]
-    CSS = """
-    #overview-pane { height: 1fr; }
-    #detail { height: 1fr; display: none; }
-    """
-
-    def __init__(self, config: SearchSpaceConfig, restart: bool) -> None:
-        super().__init__()
-        # ansi-dark passes the terminal's own palette/background through instead of
-        # Textual's truecolor theme.
-        self.theme = "ansi-dark"
-        self._config, self._restart = config, restart
-        self._state = OptunaProgressDisplay(config, live=False)
-        handler = _EventLogHandler(self._state.events)
-        for source in (logger, network_logger):
-            source.addHandler(handler)
-
-    def compose(self) -> ComposeResult:
-        with VerticalScroll(id="overview-pane"):
-            yield Static(id="overview")
-        yield RichLog(id="detail", markup=True, wrap=True, max_lines=5000)
-        yield Footer()
-
-    def on_mount(self) -> None:
-        self.set_interval(0.25, self._refresh)
-        self.run_worker(self._run_study, thread=True)
-
-    def _refresh(self) -> None:
-        # ponytail: the worker thread mutates display state while we render it; the GIL makes
-        # this tear-free enough for a dashboard — add a lock only if frames visibly glitch.
-        self.query_one("#overview", Static).update(self._state._build_layout())
-        log = self.query_one("#detail", RichLog)
-        while self._state.events:
-            log.write(self._state.events.popleft())
-
-    def action_toggle_view(self) -> None:
-        overview, detail = self.query_one("#overview-pane"), self.query_one("#detail")
-        overview.display, detail.display = not overview.display, not detail.display
-
-    def _run_study(self) -> None:
-        try:
-            run_optimization(self._config, restart=self._restart, display=self._state)
-        except Exception as error:  # optuna.log keeps the record; exit so drivers never hang
-            logger.error(f"study crashed: {error!r}")
-        finally:
-            # Always auto-exit: sequential drivers (tmux benchmark runs) must
-            # not block on a TUI waiting for 'q'. Results live in top_trials.json.
-            self.call_from_thread(self.exit)
-
-
-def _resolve_reset_choice(storage_path: Path, study_name: str, commit: str) -> bool:
-    """Ask whether to reset an existing study db; only called when neither
-    --reset-sqlite nor --resume-sqlite was passed.
-
-    Shows the commit + study so the user knows exactly what they'd be
-    resuming. A resumed study can silently break once the search space has
-    changed since it was created (observed 2026-07-12: a stale trial crashed
-    build_hyperparams against a since-changed width_choices). Non-interactive
-    launches (e.g. over SSH) can't be prompted and must pass a flag.
-    """
-    if not storage_path.exists():
-        return False
-    if not sys.stdin.isatty():
-        raise RuntimeError(
-            f"{storage_path} exists. Pass --reset-sqlite or --resume-sqlite "
-            "explicitly — non-interactive launches can't be prompted."
-        )
-    print(f"\nExisting study found: {study_name} @ commit {commit}")
-    print(f"  {storage_path}")
-    return input("Reset database? (y/n): ").strip().lower().startswith("y")
+        complete = sorted(
+            (
+                t
+                for t in optuna_study.trials
+                if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+            ),
+            key=lambda trial: trial.value,
+        )[: study.top_k]
+        results = [(build_hyperparams(trial, search_space), trial.value) for trial in complete]
+        for rank, (hp, loss) in enumerate(results, 1):
+            architecture = f"{len(hp.hidden_dims)}x{hp.hidden_dims[0]}"
+            logger.info(
+                f"Rank {rank}: loss={loss:.6f}, architecture={architecture}, "
+                f"lr={hp.learning_rate_max:.2e}"
+            )
+        _save_top_configs(results, optuna_study, commit)
+        _write_trials_json(optuna_study, commit)
+        return results
+    finally:
+        lock.unlink(missing_ok=True)
 
 
 def main() -> None:
@@ -753,51 +531,31 @@ def main() -> None:
         help="Resume this study's existing study.db without prompting",
     )
     parser.add_argument("--test", action="store_true")
-    parser.add_argument(
-        "--variant", choices=("mse", "huber_ff64_lbfgs", "huber_ff64", "huber_ff128")
-    )
-    parser.add_argument("--n-trials", type=int)
     parser.add_argument("--full-trials", action="store_true")
     parser.add_argument("--save-all", action="store_true")
     args = parser.parse_args()
 
-    config = SearchSpaceConfig()
-    if args.variant == "mse":
-        config.huber_delta = 0.0
-        config.n_fourier_features = 0
-        config.study_name = "pinn_hpo_mse"
-    elif args.variant == "huber_ff64_lbfgs":
-        config.lbfgs_steps = 300
-        config.study_name = "pinn_hpo_huber_ff64_lbfgs"
-    elif args.variant == "huber_ff64":  # defaults already huber_delta=1.0, nff=64
-        config.study_name = "pinn_hpo_huber_ff64"
-    elif args.variant == "huber_ff128":
-        config.n_fourier_features = 128
-        config.study_name = "pinn_hpo_huber_ff128"
-    if args.n_trials is not None:
-        config.n_trials = args.n_trials
-    config.prune_trials = not args.full_trials
-    config.save_all = args.save_all
+    search_space = SearchSpaceConfig()
+    study = StudyConfig()
+    study.prune_trials = not args.full_trials
+    study.checkpoint_policy = "all" if args.save_all else "top_k"
 
     if args.test:
-        config.batch_size = 8
-        config.n_train = 64
-        config.n_rz_boundary = 16
-        config.n_rz_inner = 64
-        config.depth_range = (1, 2)
-        config.width_choices = (32, 128)
-        config.n_validate = 16
-        config.n_trials = 5
-        config.total_epochs = 30
-        config.min_epochs = 5
-        config.n_startup_trials = 2
-        config.save_checkpoints = False  # tests must not pollute data/networks
-        # Separate study name: --test's shrunk search space (depth/width/etc.)
-        # is incompatible with a real run's distributions. Sharing a study
-        # name let a --test run's leftover trials corrupt a later real run's
-        # build_hyperparams() (ValueError: stale width choice not in new
-        # categorical distribution) — observed 2026-07-12.
-        config.study_name = f"{config.study_name}_test"
+        # Quick run for smoke-testing
+        search_space.batch_size = 8
+        search_space.n_train = 64
+        search_space.n_rz_boundary_samples = 16
+        search_space.n_rz_inner_samples = 64
+        search_space.hidden_dims = [(32,), (128,), (32, 32), (128, 128)]
+        search_space.warmup_epochs = 5
+        search_space.decay_epochs = 25
+        study.n_validate = 16
+        study.n_trials = 5
+        study.total_epochs = 30
+        study.min_epochs = 5
+        study.n_startup_trials = 2
+        study.checkpoint_policy = "none"
+        study.study_name = f"{study.study_name}_test"
 
     if args.test:
         reset = True  # tests always start clean; never prompt
@@ -807,9 +565,11 @@ def main() -> None:
         reset = False
     else:
         commit = current_commit()
-        reset = _resolve_reset_choice(
-            study_dir(config.study_name, commit) / "study.db",
-            config.study_name,
+
+        # check if study database already exists, if yes prompt the user about reset or continue
+        reset = resolve_reset_choice(
+            study_dir(study.study_name, commit) / "study.db",
+            study.study_name,
             commit,
         )
 
@@ -817,9 +577,10 @@ def main() -> None:
     # which degrades to sequential text on non-ttys. All logging/benchmark artifacts
     # (study.db, optuna.log, trials.json, train.log, checkpoints) are identical either way.
     if sys.stdout.isatty():
-        HpoApp(config, restart=reset).run()
+        HpoApp(search_space, study, restart=reset).run()
     else:
-        run_optimization(config, restart=reset)
+        with OptunaProgressDisplay(study) as display:
+            run_optimization(search_space, study, display=display, restart=reset)
 
 
 if __name__ == "__main__":
