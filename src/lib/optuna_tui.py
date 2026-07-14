@@ -46,7 +46,7 @@ class OptunaProgressDisplay:
         # Keep a rolling window: an ever-growing table eventually exceeds the terminal height
         # and desynchronizes Rich's cursor-based redraw when the terminal scrolls.
         self._trials_data: deque[dict[str, Any]] = deque(maxlen=15)
-        self._best_configs: list[tuple[dict[str, Any], float]] = []
+        self._best_configs: list[tuple[dict[str, Any], float, float | None, float | None]] = []
         self._best_loss, self._start_time = float("inf"), datetime.now()
         self._counts = {"pruned": 0, "failed": 0, "done": 0}
         self._trials_processed, self._prior_trials = 0, prior_trials
@@ -90,7 +90,8 @@ class OptunaProgressDisplay:
             "Min LR",
             "Weight Decay",
             "Sig Adapt Sampling",
-            "Val Loss",
+            "Median",
+            "P95",
             "Status",
         ]:
             table.add_column(column, justify="left" if column == "Status" else "right")
@@ -106,7 +107,8 @@ class OptunaProgressDisplay:
                         "lr_min",
                         "wd",
                         "sig",
-                        "loss",
+                        "median",
+                        "p95",
                         "status",
                     )
                 ]
@@ -127,10 +129,11 @@ class OptunaProgressDisplay:
             "Min LR",
             "Weight Decay",
             "Sig Adapt Sampling",
-            "Val Loss",
+            "Median",
+            "P95",
         ]:
             table.add_column(column, justify="right")
-        for rank, (params, loss) in enumerate(self._best_configs, 1):
+        for rank, (params, _loss, median, p95) in enumerate(self._best_configs, 1):
             fmt = format_hpo_params(params)
             table.add_row(
                 str(rank),
@@ -140,7 +143,8 @@ class OptunaProgressDisplay:
                 fmt["lr_min"],
                 fmt["wd"],
                 fmt["sig"],
-                f"{loss:.4f}",
+                f"{median:.4f}" if median is not None else "--",
+                f"{p95:.4f}" if p95 is not None else "--",
             )
         return table
 
@@ -249,6 +253,8 @@ class OptunaProgressDisplay:
         loss: float | None,
         status: str,
         epoch: int | None = None,
+        median: float | None = None,
+        p95: float | None = None,
     ) -> None:
         self._trials_processed += 1
         self._progress.update(self._task, completed=self._trials_processed)
@@ -259,7 +265,7 @@ class OptunaProgressDisplay:
             self._counts[status] += 1
 
         if loss is not None:
-            self._best_configs.append((params.copy(), loss))
+            self._best_configs.append((params.copy(), loss, median, p95))
             self._best_configs.sort(key=lambda item: item[1])
             self._best_configs = self._best_configs[: self.config.top_k]
             self._best_loss = self._best_configs[0][1]
@@ -272,13 +278,15 @@ class OptunaProgressDisplay:
                 "depth": params.get("depth", "?"),
                 "width": params.get("width", "?"),
                 **format_hpo_params(params),
+                "median": f"{median:.4f}" if median is not None else "--",
+                "p95": f"{p95:.4f}" if p95 is not None else "--",
                 "loss": f"{loss:.4f}" if loss is not None else "--",
                 "status": status_text,
             }
         )
         self.events.append(
             f"[bold cyan]trial {trial_num}[/] {status_text}"
-            + (f"  val_loss {loss:.4f}" if loss is not None else "")
+            + (f"  median {median:.4f}  p95 {p95:.4f}" if median is not None else "")
         )
         self._sync()
 
