@@ -5,6 +5,7 @@ from datetime import datetime
 import logging
 from pathlib import Path
 import sys
+import traceback
 from typing import TYPE_CHECKING, Any, ClassVar
 
 from rich import box
@@ -325,6 +326,10 @@ class HpoApp(App):
         handler = _EventLogHandler(self._state.events)
         for source in (logger, network_logger):
             source.addHandler(handler)
+        # Filled by _run_study on a crash; read after .run() returns so the caller
+        # can print the traceback to the real terminal once Textual has restored it
+        # (prints inside the alternate screen would be wiped on exit).
+        self.crash_traceback: str | None = None
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="overview-pane"):
@@ -357,11 +362,19 @@ class HpoApp(App):
             run_optimization(
                 self._search_space, self._study, restart=self._restart, display=self._state
             )
-        except Exception as error:  # optuna.log keeps the record; exit so drivers never hang
-            logger.error(f"study crashed: {error!r}")
+        except Exception:
+            # Stash the full traceback, log it to optuna.log, and exit the app.
+            # The caller (main()) prints it to the real terminal after .run()
+            # returns — Textual's alternate screen is gone by then — and exits
+            # non-zero, matching the non-tty path so driver watchers fire on
+            # failure too (not just on a clean finish).
+            self.crash_traceback = traceback.format_exc()
+            logger.error(f"study crashed:\n{self.crash_traceback}")
         finally:
-            # Always auto-exit: sequential drivers (tmux benchmark runs) must
-            # not block on a TUI waiting for 'q'. Results live in top_trials.json.
+            # Always exit: a clean finish lets sequential drivers (tmux benchmark
+            # runs) proceed without waiting for 'q'; a crash re-enters the normal
+            # terminal where the traceback is printed. Results live in
+            # top_trials.json / optuna.log either way.
             self.call_from_thread(self.exit)
 
 

@@ -585,14 +585,26 @@ class NetworkManager:
         samples = sobol.random(self.n_validation_size)
         return np.array(qmc.scale(samples, lower, upper), dtype=np.float32)
 
+    def _ensure_validation_sampler(self) -> Sampler:
+        """Sole owner of the lazy validation-sampler init (seed offset +1000)."""
+        if self._validation_sampler is None:
+            self._validation_sampler = Sampler(self.config, seed=self.seed + 1_000)
+        return self._validation_sampler
+
+    def validation_inputs(self) -> FluxInput:
+        """Sampled flux inputs over the fixed validation configs; lazily inits the sampler.
+
+        Public so evaluation code needn't reach into the sampler/config privates.
+        """
+        configs = jnp.array(self._create_validation_configs(), dtype=jnp.float32)
+        return self._ensure_validation_sampler().sample_flux_input(plasma_configs=configs)
+
     def _calculate_validation_loss(self, val_configs: np.ndarray) -> float:
         """Calculate validation loss using gradient-free eval_step."""
         chunk_size = 128
         total_loss = 0.0
         n_chunks = 0
-        if self._validation_sampler is None:
-            self._validation_sampler = Sampler(self.config, seed=self.seed + 1_000)
-        sampler = self._validation_sampler
+        sampler = self._ensure_validation_sampler()
 
         for i in range(0, len(val_configs), chunk_size):
             end = min(i + chunk_size, len(val_configs))

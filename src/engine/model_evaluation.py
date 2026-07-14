@@ -199,6 +199,18 @@ def evaluate_plasma_kpis(
     }
 
 
+def evaluate_validation_loss_median(
+    manager: NetworkManager, sample_size: int = DEFAULT_KPI_SAMPLE_SIZE
+) -> float:
+    """Median ``|R_GS|`` over the manager's n_validate validation configs; the Optuna
+    ranking metric. Smaller/differently-seeded draw than the kpis.json grid, so a
+    trial's ranking value and its saved kpis.json loss_median differ by sampling noise.
+    """
+    inputs = manager.validation_inputs()
+    configs = [inputs.config[i] for i in range(inputs.config.shape[0])]
+    return evaluate_plasma_kpis(manager, configs, sample_size=sample_size)["loss_median"]
+
+
 def evaluate_plasma_grids(
     manager: NetworkManager,
     configs: Sequence[PlasmaConfig],
