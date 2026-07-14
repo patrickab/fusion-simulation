@@ -10,6 +10,7 @@ import sys
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 from dataclasses import dataclass, field, fields
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 
@@ -158,14 +159,26 @@ class StudyConfig:
 
 def study_dir(study_name: str, commit: str | None = None) -> Path:
     """
-    Defines storage location for optuna study artifacts:
+    Storage location for one optuna study:
 
-        data / hpo / <commit> / <study> / {study.db, optuna.log, top_trials.json, trials.json}.
+        data / hpo / <timestamp>_<study_name>_<commit> /
+            {study.db, optuna.log, top_trials.json, trials.json, pinn_<ts>/...}
+
+    The timestamp prefix keeps studies alphanumerically sortable and gives each
+    a stable id/name. An existing dir for the same name+commit is reused (so a
+    study resumes into it); otherwise a fresh timestamped one is minted.
     """
     commit = commit or current_commit()
-    path = HPO_ROOT / commit / study_name
+    # ponytail: >1 match (two runs of the same name+commit) picks the newest;
+    # that's the one a bare re-run means to resume.
+    existing = sorted(HPO_ROOT.glob(f"*_{study_name}_{commit}"))
+    path = existing[-1] if existing else HPO_ROOT / f"{_now()}_{study_name}_{commit}"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _now() -> str:
+    return datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
 
 
 def load_configs(paths: list[Path] = WARMSTART_CONFIG_PATHS) -> list[tuple[Path, HyperParams]]:
@@ -175,7 +188,6 @@ def load_configs(paths: list[Path] = WARMSTART_CONFIG_PATHS) -> list[tuple[Path,
 def load_experiment_db(
     search_space: SearchSpaceConfig, storage: str | None = WARMSTART_EXPERIMENT_DATABASE
 ) -> optuna.Study | None:
-
     if storage is None:
         return None
 
@@ -294,7 +306,7 @@ def objective(
     search_space: SearchSpaceConfig,
     study: StudyConfig,
     display: OptunaProgressDisplay,
-    commit: str,
+    hpo_benchmark_dir: Path,
 ) -> float:
     """Train one normally configured network and report validation loss to Optuna."""
     hp = build_hyperparams(trial, search_space)
@@ -307,7 +319,10 @@ def objective(
         "sig": hp.sigma_residual_adaptive_sampling,
     }
     manager = NetworkManager(
-        hp, n_validation_size=study.n_validate, test_mode=study.checkpoint_policy == "none"
+        hp,
+        n_validation_size=study.n_validate,
+        test_mode=study.checkpoint_policy == "none",
+        output_dir=hpo_benchmark_dir,
     )
     total_epochs = hp.warmup_epochs + hp.decay_epochs
     display.start_trial(trial.number + 1, display_params, total_epochs)
@@ -353,18 +368,18 @@ def objective(
             trial.set_user_attr("run", manager.artifact_stem)
         # Pruned/failed/aborted/non-top-k trials leave nothing behind;
         # study.db, optuna.log and trials.json are the record. Only this
-        # trial's own run dir is touched — sibling runs on the same commit
-        # (other experiments) are never deleted, and the commit dir is only
-        # removed once empty.
+        # trial's own run dir is touched — sibling runs in the same study dir
+        # (other trials) are never deleted, and the study dir is only removed
+        # once empty (never, while study.db/optuna.log live in it).
         manager.discard_unsaved_run()
-        _write_trials_json(trial.study, commit)
+        _write_trials_json(trial.study, hpo_benchmark_dir)
         jax.clear_caches()
 
 
-def _write_trials_json(study: optuna.Study, commit: str) -> None:
+def _write_trials_json(study: optuna.Study, hpo_benchmark_dir: Path) -> None:
     """Ledger of which runs/checkpoints belong to this study. Rewritten after every
     trial so an aborted study still leaves an on-disk record."""
-    (study_dir(study.study_name, commit) / "trials.json").write_text(
+    (hpo_benchmark_dir / "trials.json").write_text(
         json.dumps(
             [
                 {"trial": t.number, "state": t.state.name, "value": t.value, **t.user_attrs}
@@ -376,9 +391,9 @@ def _write_trials_json(study: optuna.Study, commit: str) -> None:
 
 
 def _save_top_configs(
-    results: list[tuple[HyperParams, float]], study: optuna.Study, commit: str
+    results: list[tuple[HyperParams, float]], study: optuna.Study, hpo_benchmark_dir: Path
 ) -> None:
-    output_file = study_dir(study.study_name, commit) / "top_trials.json"
+    output_file = hpo_benchmark_dir / "top_trials.json"
     output_file.write_text(
         json.dumps(
             {
@@ -414,8 +429,8 @@ def run_optimization(
     # otherwise move study.db / optuna.log / trials.json to a different path
     # and split the study across two commit dirs.
     commit = current_commit()
-    bundle_dir = study_dir(study.study_name, commit)
-    file_handler = logging.FileHandler(bundle_dir / "optuna.log")
+    hpo_benchmark_dir = study_dir(study.study_name, commit)
+    file_handler = logging.FileHandler(hpo_benchmark_dir / "optuna.log")
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     )
@@ -426,7 +441,7 @@ def run_optimization(
     check_capacity(search_space, study)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-    storage_path = bundle_dir / "study.db"
+    storage_path = hpo_benchmark_dir / "study.db"
     if restart and storage_path.exists():
         storage_path.unlink()
 
@@ -435,7 +450,7 @@ def run_optimization(
     #
     # Crashed TUIs stay open by design, so a relaunch while one is alive is the common case.
     # Guard with an atomically-acquired lock (O_EXCL: no check-then-write gap).
-    lock = bundle_dir / ".lock"
+    lock = hpo_benchmark_dir / ".lock"
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError:
@@ -490,7 +505,7 @@ def run_optimization(
         prior_trials = sum(t.state != optuna.trial.TrialState.WAITING for t in optuna_study.trials)
         display._prior_trials = prior_trials
         optuna_study.optimize(
-            lambda trial: objective(trial, search_space, study, display, commit),
+            lambda trial: objective(trial, search_space, study, display, hpo_benchmark_dir),
             n_trials=max(0, study.n_trials - prior_trials),
             catch=(Exception,),
         )
@@ -510,8 +525,8 @@ def run_optimization(
                 f"Rank {rank}: loss={loss:.6f}, architecture={architecture}, "
                 f"lr={hp.learning_rate_max:.2e}"
             )
-        _save_top_configs(results, optuna_study, commit)
-        _write_trials_json(optuna_study, commit)
+        _save_top_configs(results, optuna_study, hpo_benchmark_dir)
+        _write_trials_json(optuna_study, hpo_benchmark_dir)
         return results
     finally:
         lock.unlink(missing_ok=True)
