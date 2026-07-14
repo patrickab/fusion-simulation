@@ -1,5 +1,7 @@
 from pydantic import BaseModel, Field
 
+from src.engine.model_evaluation import EVAL_RESOLUTION
+
 
 class CoilConfigIn(BaseModel):
     distance_from_plasma: float = 1.5
@@ -34,7 +36,7 @@ class FieldLinesRequest(BaseModel):
 class GridRequest(BaseModel):
     seed: int = 0
     sample_size: int = 4
-    resolution: int = Field(default=100, ge=4, le=400)
+    resolution: int = Field(default=100, ge=4, le=EVAL_RESOLUTION)
 
 
 class RenameRequest(BaseModel):
@@ -47,4 +49,4 @@ class BenchmarkRequest(BaseModel):
     mode: str = "Both"  # "Flux Prediction" | "GS Residual" | "Both"
     seed: int = 0
     sample_size: int = 4
-    resolution: int = Field(default=100, ge=4, le=400)
+    resolution: int = Field(default=100, ge=4, le=EVAL_RESOLUTION)
