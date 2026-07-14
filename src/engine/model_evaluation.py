@@ -199,16 +199,37 @@ def evaluate_plasma_kpis(
     }
 
 
+def _validation_configs(manager: NetworkManager) -> list[PlasmaConfig]:
+    """The manager's fixed validation configs as a list (one PlasmaConfig each).
+
+    ``inputs.config`` is a batched Flax struct pytree (no ``.shape``); iterate via
+    ``BaseModel.__iter__`` instead of indexing ``.shape[0]`` (which raises).
+    """
+    inputs = manager.validation_inputs()
+    return list(inputs.config)
+
+
 def evaluate_validation_loss_median(
     manager: NetworkManager, sample_size: int = DEFAULT_KPI_SAMPLE_SIZE
 ) -> float:
-    """Median ``|R_GS|`` over the manager's n_validate validation configs; the Optuna
-    ranking metric. Smaller/differently-seeded draw than the kpis.json grid, so a
-    trial's ranking value and its saved kpis.json loss_median differ by sampling noise.
+    """Median ``|R_GS|`` over the manager's n_validate validation configs.
+    Smaller/differently-seeded draw than the kpis.json grid, so a trial's
+    ranking value and its saved kpis.json loss_median differ by sampling noise.
     """
-    inputs = manager.validation_inputs()
-    configs = [inputs.config[i] for i in range(inputs.config.shape[0])]
-    return evaluate_plasma_kpis(manager, configs, sample_size=sample_size)["loss_median"]
+    return evaluate_plasma_kpis(manager, _validation_configs(manager), sample_size=sample_size)[
+        "loss_median"
+    ]
+
+
+def evaluate_validation_loss_stats(
+    manager: NetworkManager, sample_size: int = DEFAULT_KPI_SAMPLE_SIZE
+) -> tuple[float, float]:
+    """(|R_GS| median, p95) over the manager's validation configs — the two
+    components of the fused ranking score, on one shared Sobol draw. Reuse this
+    instead of calling median and p95 separately to avoid a second eval pass.
+    """
+    kpis = evaluate_plasma_kpis(manager, _validation_configs(manager), sample_size=sample_size)
+    return kpis["loss_median"], kpis["loss_p95"]
 
 
 def evaluate_plasma_grids(

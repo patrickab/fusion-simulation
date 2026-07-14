@@ -21,7 +21,7 @@ from optuna.distributions import CategoricalDistribution, FloatDistribution
 from optuna.pruners import HyperbandPruner, NopPruner
 from optuna.samplers import TPESampler
 
-from src.engine.model_evaluation import evaluate_validation_loss_median
+from src.engine.model_evaluation import evaluate_validation_loss_stats
 from src.engine.network import NetworkManager
 from src.lib.config import Filepaths, current_commit
 from src.lib.network_config import HyperParams
@@ -30,13 +30,13 @@ from src.lib.optuna_tui import HpoApp, OptunaProgressDisplay, logger, resolve_re
 HPO_ROOT = Filepaths.DATA / "hpo"
 
 # Architectures (width * depth) to search over.
-_ARCHITECTURE_GRID = [
+_ARCHITECTURES = [
     (200,) * 5,
-    (160,) * 5,
-    (128,) * 5,
-    (200,) * 4,
-    (160,) * 4,
-    (128,) * 4,
+    # (160,) * 5,
+    # (128,) * 5,
+    # (200,) * 4,
+    # (160,) * 4,
+    # (128,) * 4,
 ]
 
 # Hand-curated list of previous experiments for warm-start of experiment database.
@@ -89,7 +89,7 @@ class SearchSpaceConfig:
     """
 
     hidden_dims: tuple[int, ...] | list[tuple[int, ...]] = field(
-        default_factory=_ARCHITECTURE_GRID.copy
+        default_factory=_ARCHITECTURES.copy
     )
     learning_rate_max: Range = Range(1e-3, 3e-3, log=True)
     learning_rate_min: Range = Range(1e-6, 2.4e-4, log=True)
@@ -151,7 +151,7 @@ class StudyConfig:
     top_k: int = 3
     n_startup_trials: int = 10
     n_validate: int = 20
-    min_epochs: int = _DEFAULT_TOTAL_EPOCHS // 2
+    min_epochs: int = _DEFAULT_TOTAL_EPOCHS // 8
     total_epochs: int = _DEFAULT_TOTAL_EPOCHS
     prune_trials: bool = True
     # "none": no checkpoints/benchmark dirs (--test). "top_k": only trials that rank in
@@ -160,6 +160,10 @@ class StudyConfig:
     # Retrain (at this study's budget) or skip warmstart configs with a mismatched budget.
     # Resolved in main(); lives on `study` so it survives the HpoApp path unchanged.
     retrain: bool = False
+    # Weight on the p95 tail in the fused ranking score
+    # ``loss_median + score_beta * loss_p95`` (both terms are |R_GS|). ~0.2-0.5
+    # trades typical vs. worst-case error; p95 ~10x median keeps the tail modest.
+    score_beta: float = 0.3
 
 
 def study_dir(study_name: str, commit: str | None = None) -> Path:
@@ -218,10 +222,14 @@ def _reevaluate_config(path: Path, hp: HyperParams, budget: dict[str, Any]) -> H
     return corrected
 
 
-def optuna_warmstart(search_space: SearchSpaceConfig, retrain: bool) -> optuna.Study | None:
+def optuna_warmstart(
+    search_space: SearchSpaceConfig, retrain: bool, score_beta: float = 0.3
+) -> optuna.Study | None:
     """Populate the experiment ledger (no-op returning None if WARMSTART_EXPERIMENT_DATABASE
     is unset). Each WARMSTART_CONFIG_PATHS entry is added if its budget is comparable, else
-    retrained or skipped per `retrain`.
+    retrained or skipped per `retrain`. The trial value is the same fused score the
+    objective uses (``loss_median + score_beta * loss_p95``), read from each entry's
+    kpis.json, so warmstart trials rank on the same scale as live ones.
     """
     db = load_experiment_db(WARMSTART_EXPERIMENT_DATABASE)
 
@@ -236,7 +244,8 @@ def optuna_warmstart(search_space: SearchSpaceConfig, retrain: bool) -> optuna.S
                 continue  # skip: never enters the ledger, never informs TPE
             hp = _reevaluate_config(path, hp, mismatched)
 
-        loss = json.loads((path.parent / "kpis.json").read_text())["loss_median"]
+        kpis = json.loads((path.parent / "kpis.json").read_text())
+        loss = kpis["loss_median"] + score_beta * kpis["loss_p95"]
 
         db.add_trial(
             optuna.trial.create_trial(
@@ -248,7 +257,7 @@ def optuna_warmstart(search_space: SearchSpaceConfig, retrain: bool) -> optuna.S
 
 
 def _get_experiment_db_configs(db: optuna.Study | None) -> list[tuple[HyperParams, float]]:
-    """Every (config, historical loss_median) pair recorded in a warmstart experiment
+    """Every (config, historical fused score) pair recorded in a warmstart experiment
     database, or [] if there is none."""
     if db is None:
         return []
@@ -317,7 +326,7 @@ def _inject_historical_trials(
     search_space: SearchSpaceConfig,
     candidates: list[tuple[HyperParams, float]],
 ) -> None:
-    """Inject historical (config, loss_median) pairs as completed trials -- teaches TPE
+    """Inject historical (config, fused score) pairs as completed trials -- teaches TPE
     for free, no retraining. Not range-filtered: out-of-range values still inform TPE via
     a widened per-trial distribution (see _distribution_for)."""
     suggestable = search_space.get_suggestable_params()
@@ -366,8 +375,9 @@ def objective(
     display: OptunaProgressDisplay,
     hpo_benchmark_dir: Path,
 ) -> float:
-    """Train one network and return its val_loss_median ranking metric to Optuna.
-    Per-epoch pruning stays on the cheap weighted val_loss (see ``report``).
+    """Train one network and return its fused val score (``median + beta*p95``)
+    ranking metric to Optuna. Per-epoch pruning stays on the cheap weighted
+    val_loss (see ``report``).
     """
     hp = build_hyperparams(trial, search_space)
     display_params = {
@@ -405,20 +415,32 @@ def objective(
             validation_callback=report,
             show_progress=False,
         )
-        # Ranking metric (median |R_GS| over validation configs)
-        val_loss_median = evaluate_validation_loss_median(manager)
+        # Ranking metric: fused median + beta*p95 of |R_GS| over validation
+        # configs (see evaluate_validation_loss_stats/score). Median alone ignores
+        # worst-case error; max is a high-variance single-point estimator.
+        # Stats are computed once and shown to the user alongside the fused score.
+        val_median, val_p95 = evaluate_validation_loss_stats(manager)
+        val_score = val_median + study.score_beta * val_p95
         if study.checkpoint_policy == "top_k":
             completed = sorted(
                 t.value
                 for t in trial.study.get_trials(states=(optuna.trial.TrialState.COMPLETE,))
                 if t.value is not None
             )
-            if len(completed) < study.top_k or val_loss_median < completed[study.top_k - 1]:
+            if len(completed) < study.top_k or val_score < completed[study.top_k - 1]:
                 trial.set_user_attr("checkpoint", manager.to_disk())
         elif study.checkpoint_policy == "all":  # train() already saved; stem is the name
             trial.set_user_attr("checkpoint", manager.artifact_stem)
-        display.update(trial.number + 1, display_params, val_loss_median, "done", total_epochs)
-        return val_loss_median
+        display.update(
+            trial.number + 1,
+            display_params,
+            val_score,
+            "done",
+            total_epochs,
+            median=val_median,
+            p95=val_p95,
+        )
+        return val_score
     except optuna.TrialPruned:
         display.update(trial.number + 1, display_params, None, "pruned", last_epoch)
         raise
@@ -521,7 +543,9 @@ def run_optimization(
     logger.addHandler(file_handler)
     # One ledger read/write for both check_capacity and the injection loop below --
     # optuna_warmstart() may retrain budget-stale configs, no reason to pay that twice.
-    candidates = _get_experiment_db_configs(optuna_warmstart(search_space, retrain=study.retrain))
+    candidates = _get_experiment_db_configs(
+        optuna_warmstart(search_space, retrain=study.retrain, score_beta=study.score_beta)
+    )
     check_capacity(search_space, study)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -563,7 +587,7 @@ def run_optimization(
                 HyperbandPruner(
                     min_resource=study.min_epochs,
                     max_resource=study.total_epochs,
-                    reduction_factor=2,
+                    reduction_factor=3,
                 )
                 if study.prune_trials
                 else NopPruner()
