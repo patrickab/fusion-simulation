@@ -104,7 +104,7 @@ export function BenchmarkView() {
             <Segmented options={MODES} value={mode} onChange={setMode} labels={MODE_LABELS} small />
           </div>
           <Slider label="Seed" value={seed} min={0} max={1000} onChange={setSeed} />
-          <Slider label="Resolution" value={resolution} min={50} max={300} step={25} onChange={setResolution} />
+          <Slider label="Resolution" value={resolution} min={50} max={600} step={50} onChange={setResolution} />
         </Section>
         <Section title="Run">
           {running ? (
@@ -208,7 +208,7 @@ function StoredRun({ commit, run, files }: { commit: string; run: string; files:
       </div>
       <div className="ctl" style={{ gap: '1rem', flexWrap: 'wrap' }}>
         <Slider label="Seed" value={seed} min={0} max={1000} onChange={setSeed} />
-        <Slider label="Resolution" value={resolution} min={50} max={300} step={25} onChange={setResolution} />
+        <Slider label="Resolution" value={resolution} min={50} max={600} step={50} onChange={setResolution} />
       </div>
       {kpis.data && (
         <div className="stats">

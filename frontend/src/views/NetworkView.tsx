@@ -136,7 +136,7 @@ export function NetworkView() {
           </label>
           {tab === 'topology' && <Slider label="Field lines" value={nLines} min={1} max={50} onChange={setNLines} />}
           {(tab === 'flux' || tab === 'residual') && (
-            <Slider label="Resolution" value={resolution} min={50} max={300} step={25} onChange={setResolution} />
+            <Slider label="Resolution" value={resolution} min={50} max={600} step={50} onChange={setResolution} />
           )}
         </Section>
       </Panel>

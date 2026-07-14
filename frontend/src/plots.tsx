@@ -122,10 +122,8 @@ export const GridHeatmap = memo(function GridHeatmap({
       colorscale,
       zmin: lo,
       zmax: hi,
-      // contourcarpet has no 'heatmap' coloring (unlike contour) — 48 fill
-      // levels reads as continuous, matching matplotlib contourf
       autocontour: false,
-      contours: { coloring: 'fill', showlines: false, start: lo, end: hi, size: (hi - lo) / 48 },
+      contours: { coloring: 'fill', showlines: false, start: lo, end: hi, size: (hi - lo) / 256 },
       line: { width: 0 },
       showscale: false,
     } as unknown as Data,
