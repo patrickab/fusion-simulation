@@ -418,7 +418,7 @@ class NetworkManager:
                         f"{entry['grad_norm']:.6f},{entry['epoch_time']:.4f}\n"
                     )
 
-        self._save_residual_plot()
+        self._benchmark_network()
         self._save_training_curves_plot()
         return self.artifact_stem
 
@@ -427,39 +427,34 @@ class NetworkManager:
         with open(pinn_path, "rb") as f:
             return flax.serialization.from_bytes(self.state.params, f.read())
 
-    def _save_residual_plot(self) -> None:
-        """Generate the post-training residual montage with KPI table.
-
-        Uses EVAL_CONFIG_COUNT fresh Sobol configs at resolution 200, KPIs at
-        4096 points. Writes residual.png, residual_grids.json (for interactive
-        Plotly rendering) and kpis.json into the run dir.
-        """
+    def _benchmark_network(self) -> None:
+        """Save the residual montage, grids and kpis.json for this run."""
         if self.test_mode:
             return
-        from scipy.stats import qmc
-
+        # model_evaluation imports NetworkManager from this module,
+        # so a top-level import here would be circular.
         from src.engine.model_evaluation import (
-            EVAL_CONFIG_COUNT,
             EVAL_RESOLUTION,
+            KPI_CONFIG_COUNT,
+            N_PLOTS,
             build_kpi_record,
             evaluate_plasma_grids,
             evaluate_plasma_kpis,
             plot_plasma_grid_montage,
         )
-        from src.lib.network_config import DomainBounds
 
         lower, upper = DomainBounds.get_bounds()
         sobol = qmc.Sobol(d=len(lower), scramble=True, seed=BASE_SEED + 200)
         val_configs = jnp.array(
-            qmc.scale(sobol.random(EVAL_CONFIG_COUNT), np.asarray(lower), np.asarray(upper)),
+            qmc.scale(sobol.random(KPI_CONFIG_COUNT), np.asarray(lower), np.asarray(upper)),
             dtype=jnp.float32,
         )
         inputs = self.sampler.sample_flux_input(plasma_configs=val_configs)
-        configs = [inputs.config[i] for i in range(EVAL_CONFIG_COUNT)]
+        configs = [inputs.config[i] for i in range(KPI_CONFIG_COUNT)]
 
         kpis = evaluate_plasma_kpis(self, configs, sample_size=4096)
         grids = evaluate_plasma_grids(
-            self, configs, resolution=EVAL_RESOLUTION, quantities=("residual",)
+            self, configs[:N_PLOTS], resolution=EVAL_RESOLUTION, quantities=("residual",)
         )
         run_dir = self.run_dir()
 
@@ -479,7 +474,7 @@ class NetworkManager:
         )
 
         # Store KPIs as valid JSON (indent=2 for terminal readability).
-        record = build_kpi_record(self, kpis, EVAL_CONFIG_COUNT, 4096, 0.85)
+        record = build_kpi_record(self, kpis, KPI_CONFIG_COUNT, 4096, 0.85)
         (run_dir / "kpis.json").write_text(json.dumps(record, indent=2) + "\n")
 
         logger.info(f"residual plot saved to {run_dir}")

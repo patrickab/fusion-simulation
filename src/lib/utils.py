@@ -1,9 +1,20 @@
 from pathlib import Path, PosixPath
+from typing import Any
 
 import numpy as np
 import pyvista as pv
 
 from src.lib.geometry_config import FusionPlasma, ToroidalCoil3D
+
+
+def format_hpo_params(params: dict[str, Any]) -> dict[str, str]:
+    """Format an HPO trial's numeric params (lr_max/lr_min/wd/sig) for display."""
+    return {
+        "lr_max": f"{params.get('lr_max', 0):.2e}",
+        "lr_min": f"{params.get('lr_min', 0):.2e}",
+        "wd": f"{params.get('wd', 0):.2e}",
+        "sig": f"{params.get('sig', 0):.3f}",
+    }
 
 
 def _coils_to_polydata(
