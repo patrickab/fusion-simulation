@@ -78,14 +78,30 @@ A network that minimises this loss provides a differentiable function for $\psi$
 
 ## Prediction of 3D magnetic field lines
 
-Magnetic field lines in a fusion reactor can be described through the spatial derivatives of poloidal flux $\psi$ and the toroidal magnetic field.
-
-Since the network is a differentiable surrogate for $\psi$, the 2D magnetic field can be recovered analytically via automatic differentiation of the network output wrt. inputs $(R,Z)$.
-
-The full 3D magnetic field can now be reconstructed by incorporating the force of the toroidal magnetic field $F(\psi)$.
+Magnetic field lines in an axisymmetric fusion equilibrium can be reconstructed from the poloidal flux function $\psi(R,Z)$ and the toroidal field function $F(\psi)$. Since the neural network provides a differentiable surrogate $\psi_\theta(R,Z)$, the poloidal magnetic field can be obtained directly through automatic differentiation:
 
 $$
-\vec{B} = \left[ -\frac{1}{R}\frac{\partial \psi}{\partial Z},\quad \frac{1}{R}\frac{\partial \psi}{\partial R},\quad \frac{F(\psi)}{R} \right]
+B_R=-\frac{1}{R}\frac{\partial\psi_\theta}{\partial Z},
+\qquad
+B_Z=\frac{1}{R}\frac{\partial\psi_\theta}{\partial R}.
+$$
+
+Together with the toroidal field contribution,
+
+$$
+B_\phi=\frac{F(\psi_\theta)}{R}
+$$
+
+gives the full axisymmetric 3D magnetic field:
+
+
+$$
+\mathbf B=
+\left(
+-\frac{1}{R}\frac{\partial\psi_\theta}{\partial Z},
+\frac{F(\psi_\theta)}{R},
+\frac{1}{R}\frac{\partial\psi_\theta}{\partial R}
+\right)_{(R,\phi,Z)}
 $$
 
 This is computationally inexpensive and can be performed on consumer hardware in a matter of milliseconds.
@@ -116,15 +132,21 @@ $$
 
 By conditioning on plasma parameters as network inputs — rather than training a separate model per configuration — the network learns a **universal flux function** across the full geometry and state space.
 
-**Training setup:**
-- **Sampler**:
-  -  Points are drawn via Sobol sequences, re-sampled every epoch
-  -  Reactor geometries are resampled every 10 epochs to prevent overfitting
-- **Mini-Batch**:
-  - Each training batch contains a set of diverse plasma configurations
-  - Each plasma configuartion contains a large set of $R,Z$ coordinates
-- **Optimizer**: Adam with warmup cosine decay schedule
-- **Loss**: Physics residual + weighted boundary conditions (Dirichlet & Neumann)
+## **Training setup:**
+
+**Physics-Informed Loss:**
+Guided solely by partial differential equations. The network learns by minimizing the violation of force balance (internal plasma physics) and boundary conditions (reactor wall constraints).
+
+**Quasi-Random Sampling:**
+Probe points (collocation coordinates) are drawn via Sobol sequences. This prevents point clustering and guarantees an even, space-filling exploration of the physical domain.
+
+**Adaptive Refinement:**
+Training engine dynamically places more probe points in highest-loss regions.
+
+**Hybrid Optimization:** 
+- *AdamW* searches globally to find the correct physical basin of attraction.
+- *L-BFGS* (quasi-Newton) polishes the solution to machine-level precision.
+- 
 
 **Simplifying assumptions:**
 - Pressure profile $p(\psi) \propto (1 - \psi_\text{norm}^\alpha)$ — power law, zero at the boundary
