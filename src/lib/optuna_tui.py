@@ -27,6 +27,7 @@ from src.lib.utils import format_hpo_params
 
 if TYPE_CHECKING:
     from src.engine.optimize_network_optuna import SearchSpaceConfig, StudyConfig
+    from src.lib.network_config import HyperParams
 
 logger = get_logger(name="OptunaHPO")
 console = Console(width=160)
@@ -50,6 +51,7 @@ class OptunaProgressDisplay:
         self._best_loss, self._start_time = float("inf"), datetime.now()
         self._counts = {"pruned": 0, "failed": 0, "done": 0}
         self._trials_processed, self._prior_trials = 0, prior_trials
+        self._warmstart_trials = 0
         self._current_trial_info: dict[str, Any] = {}
 
         self._progress = Progress(
@@ -155,6 +157,7 @@ class OptunaProgressDisplay:
             f"[bold]Elapsed:[/] {elapsed_str}\n"
             f"Session: {self._counts['done']} done  |  {self._counts['pruned']} pruned  |  "
             f"{self._counts['failed']} failed"
+            + (f"  |  Warmstart: {self._warmstart_trials}" if self._warmstart_trials else "")
             + (f"  |  Prior: {self._prior_trials}" if self._prior_trials else "")
         )
 
@@ -245,6 +248,38 @@ class OptunaProgressDisplay:
                 table.add_row(*row)
             self.events.append(table)
         self._trial_rows = []
+
+    def add_warmstart_trials(
+        self, candidates: list[tuple["HyperParams", float, float | None, float | None]]
+    ) -> None:
+        """Seed the trials table + best-configs list with injected warmstart
+        trials so they're visible (but not counted as live progress)."""
+        for hp, loss, median, p95 in candidates:
+            params = {
+                "depth": len(hp.hidden_dims),
+                "width": hp.hidden_dims[0],
+                "lr_max": hp.learning_rate_max,
+                "lr_min": hp.learning_rate_min,
+                "wd": hp.weight_decay,
+                "sig": hp.sigma_residual_adaptive_sampling,
+            }
+            self._best_configs.append((params.copy(), loss, median, p95))
+            self._best_configs.sort(key=lambda item: item[1])
+            self._best_configs = self._best_configs[: self.config.top_k]
+            self._best_loss = self._best_configs[0][1] if self._best_configs else self._best_loss
+            self._trials_data.append(
+                {
+                    "trial": f"ws{len(self._trials_data)}",
+                    "depth": params["depth"],
+                    "width": params["width"],
+                    **format_hpo_params(params),
+                    "median": f"{median:.4f}" if median is not None else "--",
+                    "p95": f"{p95:.4f}" if p95 is not None else "--",
+                    "loss": f"{loss:.4f}" if loss is not None else "--",
+                    "status": "[blue]warmstart[/]",
+                }
+            )
+        self._sync()
 
     def update(
         self,
@@ -370,6 +405,9 @@ class HpoApp(App):
             run_optimization(
                 self._search_space, self._study, restart=self._restart, display=self._state
             )
+        except KeyboardInterrupt:
+            # run_optimization already removed the study dir; just exit cleanly.
+            pass
         except Exception:
             # Stash the full traceback, log it to optuna.log, and exit the app.
             # The caller (main()) prints it to the real terminal after .run()
