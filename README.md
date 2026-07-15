@@ -146,7 +146,6 @@ Training engine dynamically places more probe points in highest-loss regions.
 **Hybrid Optimization:** 
 - *AdamW* searches globally to find the correct physical basin of attraction.
 - *L-BFGS* (quasi-Newton) polishes the solution to machine-level precision.
-- 
 
 **Simplifying assumptions:**
 - Pressure profile $p(\psi) \propto (1 - \psi_\text{norm}^\alpha)$ — power law, zero at the boundary
