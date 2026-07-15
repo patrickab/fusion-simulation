@@ -114,9 +114,9 @@ https://github.com/user-attachments/assets/4b60c624-9668-419b-a0a0-912037ec2a8b
 
 ## Evolution of network performance
 
-Through the use of Optuna & iterative optimization the average absolute residual (evaluated on $2048$ points for $100$ different configuartions) has been reduced from a value range between $[0,1]$ in April to $[0,10^{-2}]$ as of now (July 15th 2026).
+The following video shows 2-dimensional residual plots for different networks. It demonstrates the results from the latest hyperparameter optimization.
 
-The following video demonstrates the results from the latest hyperparameter optimization run.
+Through the use of Optuna & iterative optimization the average absolute residual (evaluated on $2048$ points for $100$ different configuartions) has been reduced from a value range between $[0,1]$ in April to $[0,10^{-2}]$ as of now (July 15th 2026).
 
 https://github.com/user-attachments/assets/53aa94e8-0f4e-43d7-b939-f76465dfef12
 
