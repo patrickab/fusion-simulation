@@ -8,7 +8,10 @@ Simulation of magnetic forces in a Tokamak Fusion Reactor using a Physics Inform
 - ✅ Train Physics Informed Neural Network
 - ✅ Predict magnetic flux
 - ✅ Predict magnetic field lines
+- ✅ Implement frontend for inference analysis
 - ✅ Visualize magnetic field lines in 3D
+- ✅ Implement version-controlled benchmarking in frontend & backend
+- ✅ Implement hyperparameter optimization pipeline using [Optuna](https://github.com/optuna/optuna)
 
 ---
 
@@ -40,7 +43,7 @@ $$
 
 By defining a central radius for the torus it is possible to project this geoemtry into 3D.
 
-https://github.com/user-attachments/assets/a83842f5-a1eb-4e32-8735-179937c9f00c
+<img width="2377" height="1575" alt="image" src="https://github.com/user-attachments/assets/1fc4224f-f7ff-49bb-a4b6-32f20ac72c44" />
 
 ---
 
@@ -69,7 +72,7 @@ $$
 
 A network that minimises this loss provides a differentiable function for $\psi$ for any reactor shape.
 
-<img width="2399" height="1312" alt="image" src="https://github.com/user-attachments/assets/16618ea7-0bbf-41d9-84c7-2b12ae8c20a9" />
+<img width="2366" height="1142" alt="image" src="https://github.com/user-attachments/assets/10e6db77-b49a-44d5-a831-939d507cc6ce" />
 
 ---
 
@@ -90,6 +93,16 @@ This is computationally inexpensive and can be performed on consumer hardware in
 The following demo shows real time calculations of 3D magnetic field lines on a 11th Gen Intel-i5.
 
 https://github.com/user-attachments/assets/4b60c624-9668-419b-a0a0-912037ec2a8b
+
+---
+
+## Evolution of network performance
+
+Through the use of Optuna & iterative optimization the average absolute residual (evaluated on $2048$ points for $100$ different configuartions) has been reduced from a value range between $[0,1]$ in April to $[0,10^{-2}]$ as of now (July 15th 2026).
+
+The following video demonstrates the results from the latest hyperparameter optimization run.
+
+https://github.com/user-attachments/assets/53aa94e8-0f4e-43d7-b939-f76465dfef12
 
 ---
 
