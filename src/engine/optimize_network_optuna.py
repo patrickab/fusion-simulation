@@ -1,4 +1,39 @@
-"""Optuna hyperparameter search using the standard network training path."""
+"""Optuna HPO driver for the PINN solver.
+
+Searches over network architecture (width x depth), learning rate schedule,
+weight decay, and adaptive-sampling sigma. Each trial trains a network and
+is ranked by a fused validation score: median + beta*p95 of |R_GS| over a
+held-out set. Hyperband pruning uses the cheaper per-epoch val_loss.
+
+  SearchSpaceConfig    StudyConfig
+       │                   │
+       └────────┬──────────┘
+                │
+    ┌───────────▼────────────┐
+    │  warmstart (optional)  │
+    │  benchmark study.db    ├──┐
+    │  WARMSTART_CONFIG_PATHS├──┤
+    └────────────────────────┘  │ inject as completed trials
+                                │
+    ┌───────────────────────────▼──────────────────────┐
+    │  Optuna study  (TPE sampler + Hyperband pruner)  │
+    │                                                  │
+    │  per trial:                                      │
+    │    sample HyperParams ◄── SearchSpaceConfig      │
+    │    train NetworkManager ──► val_loss ────────────┼──► prune?
+    │    evaluate |R_GS| stats                         │
+    │    score = median + β·p95                        │
+    └───────────────────────┬──────────────────────────┘
+                            │
+    ┌───────────────────────▼──────────────────────────┐
+    │  data/hpo/<timestamp>_<name>_<commit>/           │
+    │    study.db  trials.json  top_trials.json        │
+    │    benchmark_report.pdf  top-k checkpoints       │
+    └──────────────────────────────────────────────────┘
+
+Entry point: main(). Launches HpoApp (TUI) when stdout is a tty, plain
+Live dashboard otherwise. Configuration: SearchSpaceConfig, StudyConfig.
+"""
 
 import argparse
 import ast
@@ -29,36 +64,38 @@ from src.lib.optuna_tui import HpoApp, OptunaProgressDisplay, logger, resolve_re
 
 HPO_ROOT = Filepaths.DATA / "hpo"
 
-# Architectures (width * depth) to search over.
+# Architectures (width * depth) to search over. Hand-ordered biggest-first:
+# check_capacity() smoke-trains the first entry as the worst case.
 _ARCHITECTURES = [
-    (200,) * 5,
-    # (160,) * 5,
-    # (128,) * 5,
-    # (200,) * 4,
-    # (160,) * 4,
-    # (128,) * 4,
+    (320,) * 5,
+    (256,) * 6,
+    (200,) * 5,  # incumbent
 ]
 
-# Hand-curated list of previous experiments for warm-start of experiment database.
 WARMSTART_CONFIG_PATHS: list[Path] = [
-    Filepaths.BENCHMARKS
-    / "model_selection_benchmark"
-    / "pinn_2026_07_13_01_18_41_hard-bc-unoptimized"
-    / "config.json",
-    Filepaths.BENCHMARKS
-    / "model_selection_benchmark"
-    / "pinn_2026_07_13_06_59_27_hard-bc-tuned-schedule"
-    / "config.json",
-    Filepaths.BENCHMARKS
-    / "model_selection_benchmark"
-    / "pinn_2026_07_13_08_32_59_hard-bc-final"
-    / "config.json",
+    #    Filepaths.BENCHMARKS
+    #    / "model_selection_benchmark"
+    #    / "pinn_2026_07_13_01_18_41_hard-bc-unoptimized"
+    #    / "config.json",
+    #    Filepaths.BENCHMARKS
+    #    / "model_selection_benchmark"
+    #    / "pinn_2026_07_13_06_59_27_hard-bc-tuned-schedule"
+    #    / "config.json",
+    #    Filepaths.BENCHMARKS
+    #    / "model_selection_benchmark"
+    #    / "pinn_2026_07_13_08_32_59_hard-bc-final"
+    #    / "config.json",
 ]
 
-# Optuna storage URL for persistent experiment ledger, e.g.
-# "sqlite:///data/hpo/experiments.db". "" -> in-memory only (still works for a
-# single optuna_warmstart() call, just doesn't persist between processes).
-WARMSTART_EXPERIMENT_DATABASE: str | None = None
+
+# Benchmark run dir whose Optuna study.db warms up a fresh study. Its completed
+# trials are read back from each trial's run dir (config.json + kpis.json) and
+# injected as historical evidence for TPE -- no retraining. None disables it.
+# The study name is auto-discovered (the non-legacy study with the most trials).
+WARMSTART_EXPERIMENT_DB: Path | None = (
+    # None
+    Path("data/hpo/2026_07_14_10_05_06_pinn_hpo_n6_lr_sigma_2400ep_d46257d")
+)
 
 # Budget fields change what the loss *means* (sampling/training amount), so a mismatch
 # invalidates a warmstart candidate (with total epochs, see budget_mismatch); nothing else does.
@@ -77,35 +114,33 @@ class Range:
 @dataclass
 class SearchSpaceConfig:
     """
-    Search-space for HyperParams.
+    Search space for HyperParams, one field per tunable axis.
 
-    Dynamically & declaratively defines Optuna optimization run.
         - Scalar = pinned
-        - list   = discrete choices,
-        - Range  = continuous.
+        - list   = discrete choices
+        - Range  = continuous
 
-    To define a new searchable axis define a range or list of values.
     Field names mirror HyperParams.
     """
 
     hidden_dims: tuple[int, ...] | list[tuple[int, ...]] = field(
         default_factory=_ARCHITECTURES.copy
     )
-    learning_rate_max: Range = Range(1e-3, 3e-3, log=True)
-    learning_rate_min: Range = Range(1e-6, 2.4e-4, log=True)
-    weight_decay: Range = Range(1e-8, 1e-4, log=True)
-    sigma_residual_adaptive_sampling: Range = Range(0.01, 0.05)
+    learning_rate_max: Range = Range(5e-4, 1e-3, log=True)
+    learning_rate_min: float = 1e-5
+    weight_decay: Range = Range(1e-9, 1e-8, log=True)
+    sigma_residual_adaptive_sampling: Range = Range(0.02, 0.05)
     weight_boundary_condition: float = 10.0
     weight_flux_scale: float = 10.0
-    soft_bc: bool = True
+    soft_bc: bool = False
     n_rz_inner_samples: int = 512
-    n_rz_boundary_samples: int = 128
-    batch_size: int = 64
+    n_rz_boundary_samples: int = 256
+    batch_size: int = 32
     n_train: int = 1024
-    warmup_epochs: int = 100
-    decay_epochs: int = 500
-    huber_delta: float = 1.0
-    n_fourier_features: int = 64
+    warmup_epochs: int = 400
+    decay_epochs: int = 2000
+    huber_delta: float = 0.0
+    n_fourier_features: int = 0
     lbfgs_steps: int = 0
 
     def get_static_params(self) -> dict[str, Any]:
@@ -146,9 +181,9 @@ _DEFAULT_TOTAL_EPOCHS = SearchSpaceConfig.warmup_epochs + SearchSpaceConfig.deca
 class StudyConfig:
     """Orchestration knobs for the Optuna study itself -- never fed to HyperParams."""
 
-    study_name: str = "pinn_hpo"
-    n_trials: int = 5
-    top_k: int = 3
+    study_name: str = "arch_wide_or_deep_2400ep"
+    n_trials: int = 20
+    top_k: int = 5
     n_startup_trials: int = 10
     n_validate: int = 20
     min_epochs: int = _DEFAULT_TOTAL_EPOCHS // 8
@@ -164,18 +199,20 @@ class StudyConfig:
     # ``loss_median + score_beta * loss_p95`` (both terms are |R_GS|). ~0.2-0.5
     # trades typical vs. worst-case error; p95 ~10x median keeps the tail modest.
     score_beta: float = 0.3
+    # Inject the WARMSTART_EXPERIMENT_DB benchmark trials as historical evidence.
+    # Disabled in --test: a smoke test's tiny budget is incomparable, and injected
+    # trials would consume the small n_trials budget.
+    warmstart: bool = True
 
 
 def study_dir(study_name: str, commit: str | None = None) -> Path:
     """
-    Storage location for one optuna study:
+    Storage root for one Optuna study under data/hpo/.
 
-        data / hpo / <timestamp>_<study_name>_<commit> /
-            {study.db, optuna.log, top_trials.json, trials.json, pinn_<ts>/...}
+        data/hpo/<timestamp>_<study_name>_<commit>/
 
-    The timestamp prefix keeps studies alphanumerically sortable and gives each
-    a stable id/name. An existing dir for the same name+commit is reused (so a
-    study resumes into it); otherwise a fresh timestamped one is minted.
+    An existing directory for the same name and commit is reused (resume);
+    otherwise a fresh timestamped one is created.
     """
     commit = commit or current_commit()
     # ponytail: >1 match (two runs of the same name+commit) picks the newest;
@@ -196,22 +233,32 @@ def load_configs(paths: list[Path] = WARMSTART_CONFIG_PATHS) -> list[tuple[Path,
     return [(path, HyperParams.from_json(str(path))) for path in paths]
 
 
-def load_experiment_db(storage: str | None = WARMSTART_EXPERIMENT_DATABASE) -> optuna.Study | None:
-    if storage is None:
-        return None
+def load_experiment_db(db_dir: Path | None = WARMSTART_EXPERIMENT_DB) -> optuna.Study | None:
+    """Open the benchmark Optuna study living under ``db_dir/study.db``.
 
-    return optuna.create_study(
-        study_name="warmstart_experiments",
-        storage=storage,
-        load_if_exists=True,
-        direction="minimize",
-    )
+    The study name is auto-discovered: the non-legacy study (i.e. not
+    "warmstart_experiments") with the most trials. Returns None if ``db_dir``
+    is None, the db is missing, or it holds no eligible study.
+    """
+    if db_dir is None:
+        return None
+    storage_path = db_dir / "study.db"
+    if not storage_path.exists():
+        return None
+    storage = f"sqlite:///{storage_path}"
+    eligible = [
+        s
+        for s in optuna.get_all_study_summaries(storage)
+        if s.study_name != "warmstart_experiments" and s.n_trials > 0
+    ]
+    if not eligible:
+        return None
+    chosen = max(eligible, key=lambda s: s.n_trials)
+    return optuna.load_study(study_name=chosen.study_name, storage=storage)
 
 
 def _reevaluate_config(path: Path, hp: HyperParams, budget: dict[str, Any]) -> HyperParams:
-    """Retrain config at the study's current budget, destructively replacing its
-    artifacts (network/plots/kpis). Only called on an explicit retrain choice.
-    """
+    """Retrain config at the study's current budget, destructively replacing its run artifacts."""
     corrected = HyperParams(**{**hp.to_dict(), **budget})
     stale = sorted(budget)
     logger.warning(f"{path.parent}: stale budget vs. current search space ({stale}) -- retraining")
@@ -225,16 +272,20 @@ def _reevaluate_config(path: Path, hp: HyperParams, budget: dict[str, Any]) -> H
 def optuna_warmstart(
     search_space: SearchSpaceConfig, retrain: bool, score_beta: float = 0.3
 ) -> optuna.Study | None:
-    """Populate the experiment ledger (no-op returning None if WARMSTART_EXPERIMENT_DATABASE
-    is unset). Each WARMSTART_CONFIG_PATHS entry is added if its budget is comparable, else
-    retrained or skipped per `retrain`. The trial value is the same fused score the
-    objective uses (``loss_median + score_beta * loss_p95``), read from each entry's
-    kpis.json, so warmstart trials rank on the same scale as live ones.
-    """
-    db = load_experiment_db(WARMSTART_EXPERIMENT_DATABASE)
+    """Populate the legacy ``warmstart_experiments`` ledger from WARMSTART_CONFIG_PATHS.
 
-    if db is None:
+    No-op returning None if the list is empty or no benchmark db is configured.
+    Budget-mismatched entries are retrained or skipped depending on ``retrain``.
+    """
+    if WARMSTART_EXPERIMENT_DB is None or not WARMSTART_CONFIG_PATHS:
         return None
+
+    db = optuna.create_study(
+        study_name="warmstart_experiments",
+        storage=f"sqlite:///{WARMSTART_EXPERIMENT_DB / 'study.db'}",
+        load_if_exists=True,
+        direction="minimize",
+    )
 
     for path, hp in load_configs(WARMSTART_CONFIG_PATHS):
         mismatched = search_space.budget_mismatch(hp)
@@ -256,16 +307,29 @@ def optuna_warmstart(
     return db
 
 
-def _get_experiment_db_configs(db: optuna.Study | None) -> list[tuple[HyperParams, float]]:
-    """Every (config, historical fused score) pair recorded in a warmstart experiment
-    database, or [] if there is none."""
+def _get_experiment_db_configs(
+    db: optuna.Study | None, db_dir: Path | None = None, score_beta: float = 0.3
+) -> list[tuple[HyperParams, float, float | None, float | None]]:
+    """Configs and scores recorded in a warmstart database, empty if none exists.
+
+    Ledger trials carry a precomputed score; raw benchmark trials are
+    rescored from their kpis so both rank on the same scale.
+    """
     if db is None:
         return []
-    return [
-        (HyperParams.from_dict(t.user_attrs["config"]), t.value)
-        for t in db.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
-        if "config" in t.user_attrs and t.value is not None
-    ]
+    candidates = []
+    for t in db.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,)):
+        if t.value is None:
+            continue
+        if "config" in t.user_attrs:
+            candidates.append((HyperParams.from_dict(t.user_attrs["config"]), t.value, None, None))
+        elif db_dir is not None and "run" in t.user_attrs:
+            run_dir = db_dir / t.user_attrs["run"]
+            hp = HyperParams.from_json(str(run_dir / "config.json"))
+            kpis = json.loads((run_dir / "kpis.json").read_text())
+            fused = kpis["loss_median"] + score_beta * kpis["loss_p95"]
+            candidates.append((hp, fused, kpis["loss_median"], kpis["loss_p95"]))
+    return candidates
 
 
 # Types Optuna can store as a categorical choice natively.
@@ -301,8 +365,7 @@ def build_hyperparams(trial: optuna.Trial, search_space: SearchSpaceConfig) -> H
 
 
 def _param_value(spec: list | Range, value: Any) -> Any:  # noqa: ANN401
-    """Value as Optuna stores it in trial.params: tuple choices (hidden_dims) become
-    their str() label, matching _suggest()'s mapping for live trials."""
+    """Value in Optuna's storage format: tuple choices are str()-encoded."""
     if isinstance(spec, Range) or all(isinstance(choice, _STORAGE_SAFE) for choice in spec):
         return value
     return str(value)
@@ -324,14 +387,15 @@ def _distribution_for(spec: list | Range, value: Any) -> optuna.distributions.Ba
 def _inject_historical_trials(
     optuna_study: optuna.Study,
     search_space: SearchSpaceConfig,
-    candidates: list[tuple[HyperParams, float]],
+    candidates: list[tuple[HyperParams, float, float | None, float | None]],
 ) -> None:
-    """Inject historical (config, fused score) pairs as completed trials -- teaches TPE
-    for free, no retraining. Not range-filtered: out-of-range values still inform TPE via
-    a widened per-trial distribution (see _distribution_for)."""
+    """Inject historical pairs as completed Optuna trials to seed TPE.
+
+    Out-of-range values are widened rather than filtered, so every candidate informs the sampler.
+    """
     suggestable = search_space.get_suggestable_params()
     seen = set()
-    for hp, loss in candidates:
+    for hp, loss, _median, _p95 in candidates:
         searched = {
             name: _param_value(spec, getattr(hp, name)) for name, spec in suggestable.items()
         }
@@ -348,6 +412,7 @@ def _inject_historical_trials(
                 value=loss,
                 params=searched,
                 distributions=distributions,
+                user_attrs={"warmstart": True},
             )
         )
 
@@ -375,9 +440,9 @@ def objective(
     display: OptunaProgressDisplay,
     hpo_benchmark_dir: Path,
 ) -> float:
-    """Train one network and return its fused val score (``median + beta*p95``)
-    ranking metric to Optuna. Per-epoch pruning stays on the cheap weighted
-    val_loss (see ``report``).
+    """Train one network and return its fused ranking score (median + beta*p95 of |R_GS|).
+
+    Per-epoch Hyperband pruning uses the running val_loss, not the fused score.
     """
     hp = build_hyperparams(trial, search_space)
     display_params = {
@@ -498,11 +563,9 @@ def _save_top_configs(
 
 
 def _generate_benchmark_report(study: optuna.Study, hpo_benchmark_dir: Path) -> None:
-    """Render the LaTeX benchmark PDF for all kept (non-pruned) configs.
+    """Render the LaTeX benchmark PDF for completed trials with a saved run directory.
 
-    A kept config = COMPLETE trial with a surviving run dir (network.flax on
-    disk). Pruned/failed trials never wrote one. Failures here never propagate --
-    a broken report must not fail a finished study.
+    Failures do not propagate -- a broken report must not fail a finished study.
     """
     run_dirs = [
         hpo_benchmark_dir / t.user_attrs["run"]
@@ -541,11 +604,20 @@ def run_optimization(
         logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     )
     logger.addHandler(file_handler)
-    # One ledger read/write for both check_capacity and the injection loop below --
-    # optuna_warmstart() may retrain budget-stale configs, no reason to pay that twice.
+    # Warmstart candidates from two sources, both optional:
+    #   * the benchmark db -- raw trials read back from each run dir's
+    #     config.json + kpis.json, fused score recomputed.
+    #   * the legacy WARMSTART_CONFIG_PATHS ledger -- trials carry their own
+    #     config + pre-fused value; optuna_warmstart() may retrain budget-stale
+    #     configs, so it runs before check_capacity.
+    benchmark_study = load_experiment_db(WARMSTART_EXPERIMENT_DB) if study.warmstart else None
     candidates = _get_experiment_db_configs(
-        optuna_warmstart(search_space, retrain=study.retrain, score_beta=study.score_beta)
+        benchmark_study, WARMSTART_EXPERIMENT_DB, study.score_beta
     )
+    legacy_ledger = optuna_warmstart(
+        search_space, retrain=study.retrain, score_beta=study.score_beta
+    )
+    candidates += _get_experiment_db_configs(legacy_ledger, None, study.score_beta)
     check_capacity(search_space, study)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -593,11 +665,65 @@ def run_optimization(
                 else NopPruner()
             ),
         )
-        if not optuna_study.trials:  # fresh study only
-            _inject_historical_trials(optuna_study, search_space, candidates)
+        # Reap zombie RUNNING trials left by a crashed/interrupted prior run --
+        # they'd otherwise block the budget forever (Optuna never auto-stales
+        # them for sqlite).
+        for t in optuna_study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.RUNNING,)):
+            logger.info(f"Reaping zombie trial {t.number} (RUNNING from a prior run)")
+            optuna_study.tell(trial=t.number, values=None, state=optuna.trial.TrialState.FAIL)
 
-        prior_trials = sum(t.state != optuna.trial.TrialState.WAITING for t in optuna_study.trials)
+        # If the study has no real results (only failed zombies / warmstart from
+        # an interrupted prior run), discard it and start fresh. This keeps
+        # abort→restart cycles clean: no accumulating failed trials, no
+        # ever-incrementing trial numbers. Warmstart comes from the benchmark db,
+        # not this dir, so nothing is lost.
+        has_real_results = any(
+            t.state in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
+            and not t.user_attrs.get("warmstart", False)
+            for t in optuna_study.trials
+        )
+        if not restart and not has_real_results and optuna_study.trials:
+            logger.info("Study has no completed trials -- discarding for a fresh start")
+            del optuna_study
+            storage_path.unlink()
+            optuna_study = optuna.create_study(
+                study_name=study.study_name,
+                storage=f"sqlite:///{storage_path}",
+                direction="minimize",
+                sampler=TPESampler(seed=42, n_startup_trials=study.n_startup_trials),
+                pruner=(
+                    HyperbandPruner(
+                        min_resource=study.min_epochs,
+                        max_resource=study.total_epochs,
+                        reduction_factor=3,
+                    )
+                    if study.prune_trials
+                    else NopPruner()
+                ),
+            )
+
+        # Inject warmstart candidates once (dedup by the warmstart user_attr, so
+        # a resume of an already-warmstarted study skips re-injecting).
+        already_warmstarted = any(t.user_attrs.get("warmstart", False) for t in optuna_study.trials)
+        if candidates and not already_warmstarted:
+            _inject_historical_trials(optuna_study, search_space, candidates)
+        # Always seed the display with warmstart candidates -- on a resume the
+        # injection is skipped (already in the db) but the TUI was just started
+        # and its trials table is empty.
+        if candidates:
+            display.add_warmstart_trials(candidates)
+
+        # Only completed/pruned trials of *this* study count against the budget
+        # -- failed trials (incl. reaped zombies) produced no result, and
+        # warmstart trials inform TPE but don't consume n_trials.
+        prior_trials = sum(
+            t.state in (optuna.trial.TrialState.COMPLETE, optuna.trial.TrialState.PRUNED)
+            and not t.user_attrs.get("warmstart", False)
+            for t in optuna_study.trials
+        )
+        warmstart_trials = sum(t.user_attrs.get("warmstart", False) for t in optuna_study.trials)
         display._prior_trials = prior_trials
+        display._warmstart_trials = warmstart_trials
         optuna_study.optimize(
             lambda trial: objective(trial, search_space, study, display, hpo_benchmark_dir),
             n_trials=max(0, study.n_trials - prior_trials),
@@ -623,19 +749,27 @@ def run_optimization(
         _write_trials_json(optuna_study, hpo_benchmark_dir)
         _generate_benchmark_report(optuna_study, hpo_benchmark_dir)
         return results
+    except KeyboardInterrupt:
+        # Discard the study dir so the next launch starts fresh. Warmstart
+        # trials come from the benchmark db (not this dir), so nothing is lost.
+        shutil.rmtree(hpo_benchmark_dir)
+        logger.info("Interrupted by user -- removed study directory")
+        raise
     finally:
         lock.unlink(missing_ok=True)
 
 
 def resolve_retrain_choice(search_space: SearchSpaceConfig) -> bool:
-    """Prompt whether to retrain budget-mismatched warmstart configs; called only when
-    neither --retrain nor --no-retrain was passed. Like resolve_reset_choice
-    (src/lib/optuna_tui.py): prompts only on a real mismatch, raises on non-tty (the
-    choice -- destructive retrain vs. skip -- can't be silently guessed).
+    """Whether to retrain budget-mismatched warmstart configs.
+
+    Returns False immediately if there are no mismatches or warmstart is disabled.
+    Raises on non-tty when mismatches exist -- the destructive choice cannot be silently guessed.
     """
-    # Warmstart disabled -> nothing to reconcile. Return before touching the fail-fast
-    # load_configs, whose paths need not exist when the ledger is off.
-    if WARMSTART_EXPERIMENT_DATABASE is None:
+    # Retrain only applies to the legacy WARMSTART_CONFIG_PATHS path (the
+    # benchmark-db path injects already-trained trials as-is). Nothing to
+    # reconcile if that path is off -- return before touching the fail-fast
+    # load_configs, whose paths need not exist then.
+    if WARMSTART_EXPERIMENT_DB is None or not WARMSTART_CONFIG_PATHS:
         return False
     mismatched = [
         path
@@ -700,12 +834,13 @@ def main() -> None:
         search_space.warmup_epochs = 5
         search_space.decay_epochs = 25
         study.n_validate = 16
-        study.n_trials = 5
+        study.n_trials = 3
         study.total_epochs = 30
         study.min_epochs = 5
         study.n_startup_trials = 2
         study.checkpoint_policy = "none"
         study.study_name = f"{study.study_name}_test"
+        study.warmstart = False
 
     if args.test:
         reset = True  # tests always start clean; never prompt
