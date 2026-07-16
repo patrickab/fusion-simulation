@@ -643,7 +643,6 @@ class NetworkManager:
     ]:
         """Perform a single training step using physics-informed gradients."""
 
-        @jax.checkpoint
         def loss_wrapper(
             params: any,
         ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
