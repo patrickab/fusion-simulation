@@ -3,11 +3,13 @@ import {
   api,
   invalidate,
   kpiEntries,
+  parseArtifactSlug,
   useApi,
   useDebounced,
   type FieldLinesResponse,
   type GeometryResponse,
   type Grid2D,
+  type HpoStudies,
   type SampleResponse,
 } from '../api'
 import { useStore } from '../store'
@@ -24,8 +26,10 @@ import { FieldLines, PlasmaWireframe } from '../three/Reactor3D'
 import { plasmaGradient } from '../three/colormap'
 import { Colorbar, JsonBlock, Panel, Popover, Section, Segmented, Slider, Spinner, Stat } from '../ui'
 
-const VIEW_MODES = ['New Benchmarks', 'Archive', 'All'] as const
-const MODE_LABELS = { 'New Benchmarks': 'New', Archive: 'Archive', All: 'All' } as const
+const VIEW_MODES = ['Single-Configs', 'HPO runs', 'Archive'] as const
+const ARCHIVE_MODES = ['Single-Configs', 'HPO runs'] as const
+const MODE_LABELS = { 'Single-Configs': 'Single', 'HPO runs': 'HPO', Archive: 'Archive' } as const
+const ARCHIVE_LABELS = { 'Single-Configs': 'Single', 'HPO runs': 'HPO' } as const
 const TABS = ['sampling', 'flux', 'residual', 'topology'] as const
 type Tab = (typeof TABS)[number]
 const TAB_LABELS: Record<Tab, string> = {
@@ -35,25 +39,46 @@ const TAB_LABELS: Record<Tab, string> = {
   topology: '3D topology',
 }
 
-const short = (name: string) => name.split('/')[1] ?? name
-
 export function NetworkView() {
-  const [viewMode, setViewMode] = useState<(typeof VIEW_MODES)[number]>('New Benchmarks')
+  const [viewMode, setViewMode] = useState<(typeof VIEW_MODES)[number]>('Single-Configs')
+  const [archiveMode, setArchiveMode] = useState<(typeof ARCHIVE_MODES)[number]>('Single-Configs')
   const [bump, setBump] = useState(0)
   const network = useStore((s) => s.network)
   const setNetwork = useStore((s) => s.setNetwork)
+  const [study, setStudy] = useState('')
   const [tab, setTab] = useState<Tab>('sampling')
   const [seed, setSeed] = useState(0)
   const [sampleSize, setSampleSize] = useState(4)
   const [resolution, setResolution] = useState(50)
   const [nLines, setNLines] = useState(50)
 
-  const networks = useApi<string[]>(`networks:${viewMode}:${bump}`, () => api.networks(viewMode))
+  const singleConfigs = viewMode === 'Single-Configs' || (viewMode === 'Archive' && archiveMode === 'Single-Configs')
+  const hpo = viewMode === 'HPO runs' || (viewMode === 'Archive' && archiveMode === 'HPO runs')
+  const archived = viewMode === 'Archive'
+  const networks = useApi<string[]>(
+    singleConfigs ? `networks:${archived ? 'Archive' : 'Single-Configs'}:${bump}` : null,
+    () => api.networks(archived ? 'Archive' : 'Single-Configs'),
+  )
+  const hpoStudies = useApi<HpoStudies>(hpo ? `hpo:${archived}:${bump}` : null, () => api.hpoStudies(archived))
+  const studies = Object.keys(hpoStudies.data ?? {})
+  const trialRuns = study ? (hpoStudies.data?.[study] ?? []) : []
+  const hpoNetwork = study && network?.startsWith(`hpo/${study}/`) ? network : null
+  const actionTarget = hpo ? (hpoNetwork ?? (study ? `hpo/${study}` : null)) : network
 
   useEffect(() => {
+    if (!singleConfigs) return
     const list = networks.data
     if (list && (!network || !list.includes(network))) setNetwork(list[0] ?? null)
-  }, [networks.data, network, setNetwork])
+  }, [singleConfigs, networks.data, network, setNetwork])
+  useEffect(() => {
+    if (hpo && !studies.includes(study)) setStudy(studies[0] ?? '')
+  }, [hpo, studies, study])
+  useEffect(() => {
+    if (!hpo) return
+    const next = study && trialRuns[0] ? `hpo/${study}/${trialRuns[0]}` : null
+    const currentRun = hpoNetwork?.split('/')[2]
+    if ((!currentRun || !trialRuns.includes(currentRun)) && network !== next) setNetwork(next)
+  }, [hpo, study, trialRuns, hpoNetwork, network, setNetwork])
 
   const dSeed = useDebounced(seed, 400)
   const dLines = useDebounced(nLines, 400)
@@ -66,24 +91,30 @@ export function NetworkView() {
     setBump((b) => b + 1)
   }
   const doArchive = async () => {
-    if (!network) return
-    await api.archive(network)
+    if (!actionTarget) return
+    await api.archive(actionTarget)
     setNetwork(null)
+    setStudy('')
     refresh()
   }
   const doRename = async () => {
-    if (!network) return
-    // ponytail: native prompt; inline editor if it ever grates
-    const newName = window.prompt('New name (without extension):', short(network))
+    if (!actionTarget) return
+    const slug = hpo ? study : actionTarget
+    const current = parseArtifactSlug(slug)?.name
+    if (!current) return
+    // ponytail: native prompt is the smallest editor with a prefilled current name.
+    const newName = window.prompt('New name:', current)
     if (!newName) return
-    const r = await api.rename(network, newName)
+    const r = await api.rename(actionTarget, newName)
     setNetwork(r.name)
+    if (hpo) setStudy(r.name.split('/')[1])
     refresh()
   }
-  const doDelete = async () => {
-    if (!network || !window.confirm(`Delete ${short(network)}?`)) return
-    await api.remove(network)
+  const doDelete = async (target: string, label: string) => {
+    if (!window.confirm(`Delete ${label}?`)) return
+    await api.remove(target)
     setNetwork(null)
+    if (target === `hpo/${study}`) setStudy('')
     refresh()
   }
 
@@ -94,26 +125,50 @@ export function NetworkView() {
           <div className="ctl">
             <Segmented options={VIEW_MODES} value={viewMode} onChange={setViewMode} labels={MODE_LABELS} small />
           </div>
-          <div className="row">
-            <select className="select" value={network ?? ''} onChange={(e) => setNetwork(e.target.value)}>
-              {(networks.data ?? []).map((n) => (
-                <option key={n} value={n}>
-                  {short(n)}
-                </option>
-              ))}
-            </select>
-            <Popover label="⋯" buttonClassName="pop-btn icon" align="right">
-              {(close) => (
-                <>
-                  <button onClick={() => { close(); void doArchive() }}>Archive</button>
-                  <button onClick={() => { close(); void doRename() }}>Rename…</button>
-                  <button className="danger" onClick={() => { close(); void doDelete() }}>
-                    Delete
-                  </button>
-                </>
-              )}
-            </Popover>
-          </div>
+          {viewMode === 'Archive' && (
+            <div className="ctl">
+              <Segmented options={ARCHIVE_MODES} value={archiveMode} onChange={setArchiveMode} labels={ARCHIVE_LABELS} small />
+            </div>
+          )}
+          {singleConfigs ? (
+            <div className="row">
+              <select className="select" value={network ?? ''} onChange={(e) => setNetwork(e.target.value)}>
+                {(networks.data ?? []).map((slug) => <option key={slug} value={slug}>{slug}</option>)}
+              </select>
+              <Actions
+                archived={archived}
+                hpo={false}
+                target={network}
+                onArchive={doArchive}
+                onRename={doRename}
+                onDelete={doDelete}
+              />
+            </div>
+          ) : (
+            <>
+              <label className="ctl">
+                <span className="ctl-row"><span>HPO study</span></span>
+                <select className="select" value={study} onChange={(e) => setStudy(e.target.value)}>
+                  {studies.map((slug) => <option key={slug} value={slug}>{slug}</option>)}
+                </select>
+              </label>
+              <div className="row">
+                <select className="select" value={hpoNetwork?.split('/')[2] ?? ''} disabled={!study || trialRuns.length === 0} onChange={(e) => setNetwork(`hpo/${study}/${e.target.value}`)}>
+                  {trialRuns.length === 0 ? <option>No retained trials</option> : trialRuns.map((run) => <option key={run} value={run}>{run}</option>)}
+                </select>
+                <Actions
+                  archived={archived}
+                  hpo
+                  target={actionTarget}
+                  network={hpoNetwork}
+                  study={study}
+                  onArchive={doArchive}
+                  onRename={doRename}
+                  onDelete={doDelete}
+                />
+              </div>
+            </>
+          )}
         </Section>
         {config.data && (
           <Section title="Training config">
@@ -166,6 +221,42 @@ export function NetworkView() {
         )}
       </div>
     </div>
+  )
+}
+
+function Actions({
+  archived,
+  hpo,
+  target,
+  network,
+  study,
+  onArchive,
+  onRename,
+  onDelete,
+}: {
+  archived: boolean
+  hpo: boolean
+  target: string | null
+  network?: string | null
+  study?: string
+  onArchive: () => Promise<void>
+  onRename: () => Promise<void>
+  onDelete: (target: string, label: string) => Promise<void>
+}) {
+  if (!target) return null
+  return (
+    <Popover label="⋯" buttonClassName="pop-btn icon" align="right">
+      {(close) => (
+        <>
+          {!archived && <button onClick={() => { close(); void onArchive() }}>{hpo ? 'Archive study' : 'Archive'}</button>}
+          {!archived && <button onClick={() => { close(); void onRename() }}>{hpo ? 'Rename study…' : 'Rename…'}</button>}
+          {hpo && network && <button className="danger" onClick={() => { close(); void onDelete(network, 'network') }}>Delete network</button>}
+          <button className="danger" onClick={() => { close(); void onDelete(hpo ? `hpo/${study}` : target, hpo ? 'HPO study' : 'network') }}>
+            {hpo ? 'Delete study' : 'Delete'}
+          </button>
+        </>
+      )}
+    </Popover>
   )
 }
 

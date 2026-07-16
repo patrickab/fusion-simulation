@@ -37,4 +37,11 @@ def get_manager(name: str) -> NetworkManager:
 
 
 def invalidate(name: str) -> None:
+    """Drop one cached manager."""
     _managers.pop(name, None)
+
+
+def invalidate_prefix(prefix: str) -> None:
+    """Drop cached managers below a renamed, archived, or deleted study."""
+    for name in [key for key in _managers if key.startswith(prefix)]:
+        _managers.pop(name, None)
