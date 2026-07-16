@@ -7,6 +7,11 @@ import optax
 
 from src.lib.geometry_config import PlasmaConfig
 
+# TF32 matmuls (Ampere f32 default) put a ~1e-2 starburst noise floor in |R_GS|:
+# the GS operator's second derivatives amplify boundary-Fourier-fit harmonic m
+# by ~m². Full f32 reproduces the CPU field exactly (measured 2026-07-17, RTX 3060).
+jax.config.update("jax_default_matmul_precision", "highest")
+
 MU_0 = 4 * jnp.pi * 1e-7
 PSI_EDGE = 0.0  # Poloidal flux at plasma boundary
 
