@@ -130,6 +130,8 @@ def _second_derivative(
     return jax.jvp(d_fn, (x,), (jnp.ones_like(x),))[1]
 
 
+# Rematerialize the high-order PDE graph while retaining its primal flux for profile losses.
+@partial(jax.checkpoint, static_argnums=0)
 def shafranov_operator_and_psi(
     psi_fn: Callable,
     params: any,
@@ -163,10 +165,39 @@ def shafranov_operator_and_psi(
     return delta_star, psi
 
 
-# Rematerialization trades compute for memory by recomputing activations during backprop.
-# In PINNs, high-order PDE residuals create massive graphs; remat keeps memory footprint
-# near-constant relative to depth, enabling larger networks and point batches.
-@partial(jax.checkpoint, static_argnums=0)
+def _grad_shafranov_residual_from_operator(
+    delta_star: jnp.ndarray,
+    psi: jnp.ndarray,
+    R: jnp.ndarray,
+    psi_axis: float,
+    config: PlasmaConfig,
+) -> jnp.ndarray:
+    flux_scale = config.State.F_axis * config.Geometry.a
+
+    dp_dpsi = jax.jvp(
+        lambda p: pressure_profile(
+            p, psi_axis, config.State.p0, config.State.pressure_alpha, flux_scale
+        ),
+        (psi,),
+        (jnp.ones_like(psi),),
+    )[1]
+
+    F_val, dF_dpsi = jax.jvp(
+        lambda p: toroidal_field_flux_function(
+            p, psi_axis, config.State.F_axis, config.State.field_exponent, flux_scale
+        ),
+        (psi,),
+        (jnp.ones_like(psi),),
+    )
+
+    rhs = -(MU_0 * R**2 * dp_dpsi) - (F_val * dF_dpsi)
+
+    # Normalize by magnetic pressure scale (B_toroidal^2)
+    # This handles high-field/low-beta regimes robustly
+    scale = (config.State.F_axis / config.Geometry.R0) ** 2 + 1.0
+    return (delta_star - rhs) / scale
+
+
 def grad_shafranov_residual(
     psi_fn: callable,
     params: any,
@@ -199,31 +230,7 @@ def grad_shafranov_residual(
         The residual value (error) at the specified point.
     """
     delta_star, psi = shafranov_operator_and_psi(psi_fn, params, R, Z, config)
-
-    flux_scale = config.State.F_axis * config.Geometry.a
-
-    dp_dpsi = jax.jvp(
-        lambda p: pressure_profile(
-            p, psi_axis, config.State.p0, config.State.pressure_alpha, flux_scale
-        ),
-        (psi,),
-        (jnp.ones_like(psi),),
-    )[1]
-
-    F_val, dF_dpsi = jax.jvp(
-        lambda p: toroidal_field_flux_function(
-            p, psi_axis, config.State.F_axis, config.State.field_exponent, flux_scale
-        ),
-        (psi,),
-        (jnp.ones_like(psi),),
-    )
-
-    rhs = -(MU_0 * R**2 * dp_dpsi) - (F_val * dF_dpsi)
-
-    # Normalize by magnetic pressure scale (B_toroidal^2)
-    # This handles high-field/low-beta regimes robustly
-    scale = (config.State.F_axis / config.Geometry.R0) ** 2 + 1.0
-    return (delta_star - rhs) / scale
+    return _grad_shafranov_residual_from_operator(delta_star, psi, R, psi_axis, config)
 
 
 @partial(jax.jit, static_argnums=(0,), static_argnames=("soft_bc",))
@@ -252,7 +259,9 @@ def pinn_loss_function(
         R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         # 1. Axis for PDE profiles: |ψ| extremum (stop-grad — discovery, not trainable).
-        psi_int = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R, Z)
+        delta_star, psi_int = jax.vmap(
+            lambda r, z: shafranov_operator_and_psi(psi_fn, params, r, z, config)
+        )(R, Z)
         psi_axis = estimate_psi_axis(psi_int)
 
         # 2. Collapse guard: hinge on the interior-mean flux. The GS equation
@@ -268,17 +277,14 @@ def pinn_loss_function(
         loss_scale = jnp.maximum(0.0, 1.0 - jnp.mean(psi_int) / floor) ** 2
 
         # 3. PDE Residual Loss
-        residual_fn = jax.vmap(
-            lambda r, z: grad_shafranov_residual(psi_fn, params, r, z, psi_axis, config)
-        )
-        res_vals = residual_fn(R, Z)
+        res_vals = _grad_shafranov_residual_from_operator(delta_star, psi_int, R, psi_axis, config)
         loss_res = jnp.where(
             huber_delta > 0,
             jnp.mean(optax.losses.huber_loss(res_vals, delta=huber_delta)),
             jnp.mean(res_vals**2),
         )
 
-        # 3. Boundary losses
+        # 4. Boundary losses
         R_b, Z_b = config.Boundary.R, config.Boundary.Z
         psi_b = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R_b, Z_b)
         loss_dir = jnp.mean((psi_b - PSI_EDGE) ** 2)
