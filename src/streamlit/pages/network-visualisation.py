@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 import shutil
 
 import jax.numpy as jnp
@@ -24,6 +23,8 @@ from src.streamlit.network_utils import (
     get_available_commits,
     get_available_networks,
     move_run_dir,
+    parse_slug,
+    renamed_slug,
     resolve_run_directory,
     to_plasma_config,
 )
@@ -160,8 +161,7 @@ def render_3d_topology_tab():  # noqa
 
 def handle_archive() -> None:
     old_run_dir = resolve_run_directory(st.session_state.selected_pinn)
-    commit = old_run_dir.parent.name
-    new_path = Filepaths.BENCHMARK_ARCHIVE / commit / old_run_dir.name
+    new_path = Filepaths.BENCHMARK_ARCHIVE / old_run_dir.name
     move_run_dir(st.session_state.selected_pinn, new_path)
     _update_networks_after_action()
 
@@ -171,12 +171,12 @@ def handle_rename(new_name: str) -> None:
         return
 
     old_path = resolve_run_directory(st.session_state.selected_pinn)
-    new_path = old_path.parent / new_name
+    new_path = old_path.parent / renamed_slug(old_path.name, new_name)
 
     move_run_dir(st.session_state.selected_pinn, new_path)
 
     st.session_state.available_networks = _get_networks()
-    st.session_state._next_pinn = f"{new_path.parent.name}/{new_path.name}"
+    st.session_state._next_pinn = new_path.name
     st.session_state.rename_mode = False
     st.rerun()
 
@@ -218,7 +218,8 @@ def render_network_actions() -> None:
         st.session_state.rename_mode = not st.session_state.get("rename_mode", False)
 
     if st.session_state.get("rename_mode", False):
-        new_name = st.text_input("New Name", value=Path(st.session_state.selected_pinn).stem)
+        _, current_name, _ = parse_slug(st.session_state.selected_pinn)
+        new_name = st.text_input("New Name", value=current_name)
         if st.button("Save Name"):
             handle_rename(new_name)
 
@@ -235,7 +236,7 @@ def render_sidebar() -> None:
 
         st.radio(
             "View",
-            options=["New Benchmarks", "Archive", "All"],
+            options=["Single-Configs", "Archive", "All"],
             horizontal=True,
             key="network_view_mode",
         )
@@ -318,7 +319,7 @@ def init_session_state() -> None:
         st.session_state.seed = 0
         st.session_state.sample_size = 4
         st.session_state.filter_commit = "All"
-        st.session_state.network_view_mode = "New Benchmarks"
+        st.session_state.network_view_mode = "Single-Configs"
 
         networks = _get_networks()
         st.session_state.available_networks = networks

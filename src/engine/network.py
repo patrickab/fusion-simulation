@@ -8,6 +8,7 @@ from functools import partial
 import json
 import logging
 from pathlib import Path
+import re
 import shutil
 import time
 from typing import Callable, Literal
@@ -337,14 +338,19 @@ class NetworkManager:
         n_validation_size: int = N_VALIDATION_SIZE,
         test_mode: bool = False,
         output_dir: Path | None = None,
+        name: str = "default",
     ) -> None:
         self.config = config
         self.seed = seed
         self.n_validation_size = n_validation_size
         self.test_mode = test_mode
-        # Where run dirs land. None -> the per-commit benchmark tree; HPO passes
-        # its bundle dir so trained nets live under data/hpo/<slug>/ instead.
+        # None writes a flattened benchmark slug; HPO supplies its study dir.
         self.output_dir = output_dir
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
+            raise ValueError(
+                "Network name must contain only letters, numbers, underscores, or hyphens"
+            )
+        self.name = name
         self.model = FluxPINN(
             hidden_dims=config.hidden_dims,
             n_fourier_features=config.n_fourier_features,
@@ -362,24 +368,23 @@ class NetworkManager:
             upper_bounds=self.sampler._domain_upper_bounds,
         )
         self.training_log: list[dict] = []
-        # Run identity (pinn_<timestamp>); the commit is the parent dir in the
-        # benchmark tree, so it's not duplicated in the stem.
         self.artifact_stem: str | None = None
 
-    @staticmethod
-    def _new_artifact_stem() -> str:
+    def _new_artifact_stem(self) -> str:
+        """Create a flat benchmark slug or an HPO-local trial stem."""
         # Second resolution: fast runs (HPO --test trials take ~8s) collided at
         # minute resolution and silently overwrote each other's artifacts.
         # ponytail: same-second parallel runs on one machine would still collide.
         timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-        return f"pinn_{timestamp}"
+        if self.output_dir:
+            return f"pinn_{timestamp}"
+        return f"{timestamp}_{self.name}_{current_commit()}"
 
     def run_dir(self) -> Path:
-        """Per-run dir: data/benchmarks/<commit>/<run>, or <output_dir>/<run>
-        when an output_dir was given (e.g. an HPO study bundle)."""
+        """Return this manager's direct benchmark or HPO trial directory."""
         if self.artifact_stem is None:
             self.artifact_stem = self._new_artifact_stem()
-        base = self.output_dir or Filepaths.BENCHMARKS / current_commit()
+        base = self.output_dir or Filepaths.BENCHMARKS
         return base / self.artifact_stem
 
     def discard_unsaved_run(self) -> None:
@@ -394,8 +399,9 @@ class NetworkManager:
         if (run_dir / "network.flax").exists():
             return
         shutil.rmtree(run_dir, ignore_errors=True)
-        with suppress(OSError):  # drop the commit dir when now empty
-            run_dir.parent.rmdir()
+        if self.output_dir:
+            with suppress(OSError):
+                run_dir.parent.rmdir()
 
     def to_disk(self) -> str:
         if self.artifact_stem is None:
@@ -993,7 +999,7 @@ def _metrics_row(
 def show_run(run: str) -> None:
     """Re-render the Training Metrics table for a stored run from training.csv.
 
-    Accepts a run dir path, a 'commit/run' name, or a bare 'pinn_<timestamp>' stem.
+    Accepts a run dir path, a flat benchmark slug, or a bare HPO trial stem.
     """
     run_dir = Path(run)
     if not run_dir.is_dir():
@@ -1038,6 +1044,9 @@ if __name__ == "__main__":
     )
     parser.add_argument("--lr", type=float, default=None, help="Override learning_rate_max")
     parser.add_argument(
+        "--name", default="default", help="Artifact name in <timestamp>_<name>_<commit>"
+    )
+    parser.add_argument(
         "--fourier-features",
         type=int,
         default=64,
@@ -1074,7 +1083,7 @@ if __name__ == "__main__":
         metavar="RUN",
         default=None,
         help="Render the stored Training Metrics table for a run "
-        "(dir path, commit/run, or pinn_<timestamp>) and exit",
+        "(dir path, artifact slug, or pinn_<timestamp>) and exit",
     )
     args = parser.parse_args()
 
@@ -1100,7 +1109,7 @@ if __name__ == "__main__":
                     warmup_epochs=max(1, args.epochs // 6),
                     decay_epochs=args.epochs - max(1, args.epochs // 6),
                 )
-            manager = NetworkManager(config, test_mode=args.test)
+            manager = NetworkManager(config, test_mode=args.test, name=args.name)
             manager.train(save_to_disk=True)
         else:
             globals()["N_VALIDATION_SIZE"] = 16

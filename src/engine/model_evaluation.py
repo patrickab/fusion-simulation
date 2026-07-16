@@ -13,7 +13,6 @@ from scipy.stats import qmc
 from src.engine.network import BASE_SEED, NetworkManager
 from src.engine.physics import estimate_psi_axis, grad_shafranov_residual
 from src.engine.plasma import get_poloidal_points
-from src.lib.config import current_commit
 from src.lib.geometry_config import PlasmaConfig
 from src.lib.network_config import HyperParams
 
@@ -49,13 +48,13 @@ def build_kpi_record(
 ) -> dict:
     """Assemble the kpis.json record dict shared by training and CLI eval.
 
-    When network_name is None (training path), derive it from the current
-    commit + the manager's artifact_stem. When provided (CLI path), use it
+    When network_name is None (training path), derive it from the manager's
+    artifact slug. When provided (CLI path), use it
     directly — the manager may not have artifact_stem set if loaded from disk.
     """
     hp = manager.config
     if network_name is None:
-        network_name = f"{current_commit()}/{manager.artifact_stem}"
+        network_name = manager.artifact_stem
     loss_label = f"huber={hp.huber_delta:g}" if hp.huber_delta > 0 else "mse"
     return {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
@@ -503,7 +502,7 @@ def _add_kpi_table(fig: object, kpis: Mapping[str, float]) -> None:
 if __name__ == "__main__":
     # Region-split |GS residual| report: selection metric is the plasma core
     # (rho < --core-rho); the edge shell is reported but tolerated by design.
-    # Each run dir (data/benchmarks/<commit>/<run>/) already holds network.flax,
+    # Each run dir (data/benchmarks/<slug>/) already holds network.flax,
     # config.json and training.csv from training; this CLI adds kpis.json and the
     # montage PNG (fixed linear color scale for comparability) into the same dir.
     import argparse
@@ -516,7 +515,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "networks",
         nargs="*",
-        help="Network names as commit/run (default: all in data/benchmarks/)",
+        help="Network slugs (default: all saved networks)",
     )
     parser.add_argument("--n-configs", type=int, default=KPI_CONFIG_COUNT)
     parser.add_argument(

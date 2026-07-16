@@ -1,5 +1,5 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react'
-import { api, benchmarkFileUrl, benchmarkStream, kpiEntries, useApi, useDebounced, type BenchmarkEvent, type Grid2D } from '../api'
+import { api, benchmarkFileUrl, benchmarkStream, kpiEntries, parseArtifactSlug, useApi, useDebounced, type BenchmarkEvent, type Grid2D } from '../api'
 import {
   DEFAULT_RESIDUAL_RANGE,
   FLUX_COLORBAR,
@@ -15,8 +15,8 @@ const MODE_LABELS = { 'Flux Prediction': 'Flux', 'GS Residual': 'Residual', Both
 
 type Row = Extract<BenchmarkEvent, { type: 'row' | 'row_error' }>
 
-const short = (name: string) => name.split('/')[1] ?? name
-const commitOf = (name: string) => name.split('/')[0]
+const short = (name: string) => name.startsWith('hpo/') ? name.slice(4) : name
+const commitOf = (name: string) => parseArtifactSlug(name.startsWith('hpo/') ? name.split('/')[1] : name)?.commit
 
 export function BenchmarkView() {
   const networks = useApi<string[]>('networks:All', () => api.networks('All'))
@@ -153,7 +153,7 @@ function SavedBenchmarks() {
   const [selected, setSelected] = useState('')
   const commits = Object.entries(tree.data ?? {}).filter(([, runs]) => Object.keys(runs).length > 0)
   if (commits.length === 0) return null
-  const [commit, run] = selected.split('/')
+  const [commit, run] = selected.split('/', 2)
   const files = tree.data?.[commit]?.[run]
   return (
     <div className="bench-saved">
@@ -166,7 +166,7 @@ function SavedBenchmarks() {
           {commits.map(([c, runs]) => (
             <optgroup key={c} label={c}>
               {Object.keys(runs).map((r) => (
-                <option key={r} value={`${c}/${r}`}>
+                  <option key={r} value={`${c}/${r}`}>
                   {r}
                 </option>
               ))}
@@ -174,13 +174,13 @@ function SavedBenchmarks() {
           ))}
         </select>
       </label>
-      {files && <StoredRun key={selected} commit={commit} run={run} files={files} />}
+      {files && <StoredRun key={selected} run={run} files={files} />}
     </div>
   )
 }
 
-function StoredRun({ commit, run, files }: { commit: string; run: string; files: string[] }) {
-  const networkName = `${commit}/${run}`
+function StoredRun({ run, files }: { run: string; files: string[] }) {
+  const networkName = run
   const cfg = useApi('config', api.config)
   const evalConfigCount = cfg.data?.eval_config_count ?? 8
   const residualRange = cfg.data?.residual_color_range ?? DEFAULT_RESIDUAL_RANGE
@@ -201,7 +201,7 @@ function StoredRun({ commit, run, files }: { commit: string; run: string; files:
       <div className="bench-head">
         <span className="name">{run}</span>
         {dataFiles.map((f) => (
-          <a className="chip" key={f} href={benchmarkFileUrl(commit, run, f)} target="_blank" rel="noreferrer">
+          <a className="chip" key={f} href={benchmarkFileUrl(run, f)} target="_blank" rel="noreferrer">
             {f}
           </a>
         ))}

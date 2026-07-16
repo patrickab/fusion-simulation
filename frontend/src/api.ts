@@ -39,6 +39,7 @@ export interface SampleResponse {
 }
 
 export type GridQuantity = 'flux' | 'residual'
+export type HpoStudies = Record<string, string[]>
 
 export interface Grid2D {
   theta: number[]
@@ -102,6 +103,8 @@ export const api = {
     ),
   networks: (viewMode: string) =>
     fetch(`/api/networks?view_mode=${encodeURIComponent(viewMode)}`).then((r) => toJson<string[]>(r)),
+  hpoStudies: (archived: boolean) =>
+    fetch(`/api/hpo?archived=${archived}`).then((r) => toJson<HpoStudies>(r)),
   config_file: (name: string) =>
     fetch(`/api/network/${enc(name)}/config`).then((r) => toJson<Record<string, unknown>>(r)),
   kpis: (name: string) => fetch(`/api/network/${enc(name)}/kpis`).then((r) => toJson<Kpis>(r)),
@@ -119,12 +122,16 @@ export const api = {
   fieldlines: (name: string, seed: number, sampleSize: number, nLines: number) =>
     post<FieldLinesResponse>(`/api/network/${enc(name)}/fieldlines`, { seed, sample_size: sampleSize, n_lines: nLines }),
   geometry: (body: GeometryRequest) => post<GeometryResponse>('/api/geometry', body),
-  // data/benchmarks tree: {commit: {run: [file, ...]}}
+  // Flattened data/benchmarks tree grouped by the commit embedded in each slug.
   benchmarks: () => fetch('/api/benchmarks').then((r) => toJson<Record<string, Record<string, string[]>>>(r)),
 }
 
-export const benchmarkFileUrl = (commit: string, run: string, file: string) =>
-  `/api/benchmarks/files/${commit}/${run}/${file}`
+export const benchmarkFileUrl = (run: string, file: string) => `/api/benchmarks/files/${run}/${file}`
+
+export function parseArtifactSlug(slug: string): { timestamp: string; name: string; commit: string } | null {
+  const match = slug.match(/^(\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2})_(.+)_([^_]+)$/)
+  return match ? { timestamp: match[1], name: match[2], commit: match[3] } : null
+}
 
 export async function* benchmarkStream(
   body: {

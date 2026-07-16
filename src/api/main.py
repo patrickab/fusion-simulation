@@ -1,6 +1,5 @@
 """FastAPI layer wrapping the existing src/ physics + network code for the React frontend."""
 
-import contextlib
 import json
 import shutil
 
@@ -21,7 +20,18 @@ from src.api.schemas import (
 )
 from src.lib.config import Filepaths
 from src.lib.geometry_config import ToroidalCoilConfig
-from src.streamlit.network_utils import get_available_networks, move_run_dir, resolve_run_directory
+from src.streamlit.network_utils import (
+    get_available_networks,
+    get_hpo_studies,
+    hpo_network_name,
+    is_hpo_name,
+    move_run_dir,
+    move_study_dir,
+    renamed_slug,
+    resolve_run_directory,
+    resolve_study_directory,
+    split_hpo_name,
+)
 
 app = FastAPI(title="fusion-simulation API")
 
@@ -35,12 +45,19 @@ app.add_middleware(
 
 
 Filepaths.BENCHMARKS.mkdir(parents=True, exist_ok=True)
+Filepaths.HPO_ROOT.mkdir(parents=True, exist_ok=True)
 app.mount("/api/benchmarks/files", StaticFiles(directory=Filepaths.BENCHMARKS), name="benchmarks")
 
 
 @app.get("/api/networks")
 def list_networks(view_mode: str = "New Benchmarks") -> list[str]:
     return get_available_networks(view_mode)
+
+
+@app.get("/api/hpo")
+def list_hpo_studies(archived: bool = False) -> dict[str, list[str]]:
+    """List HPO study slugs with their direct trial-network slugs."""
+    return get_hpo_studies(archived)
 
 
 @app.get("/api/config")
@@ -61,14 +78,17 @@ def get_config() -> dict:
 
 @app.get("/api/benchmarks")
 def list_benchmarks() -> dict[str, dict[str, list[str]]]:
-    """data/benchmarks tree: {commit: {run: [file, ...]}}."""
+    """Flattened benchmark tree grouped by the commit encoded in each slug."""
+    from src.streamlit.network_utils import parse_slug
+
     tree: dict[str, dict[str, list[str]]] = {}
-    for commit_dir in sorted(p for p in Filepaths.BENCHMARKS.iterdir() if p.is_dir()):
-        runs: dict[str, list[str]] = {}
-        for run in sorted(p for p in commit_dir.iterdir() if p.is_dir()):
-            runs[run.name] = sorted(f.name for f in run.iterdir() if f.is_file())
-        if runs:
-            tree[commit_dir.name] = runs
+    runs = sorted(p for p in Filepaths.BENCHMARKS.iterdir() if p.is_dir() and p.name != "_archive")
+    for run in runs:
+        try:
+            _, _, commit = parse_slug(run.name)
+        except ValueError:
+            continue
+        tree.setdefault(commit, {})[run.name] = sorted(f.name for f in run.iterdir() if f.is_file())
     return tree
 
 
@@ -99,38 +119,79 @@ def network_kpis(name: str) -> dict:
 
 @app.post("/api/network/{name:path}/archive")
 def archive_network(name: str) -> dict:
+    if is_hpo_name(name):
+        try:
+            study, _ = split_hpo_name(name)
+            move_study_dir(study, Filepaths.HPO_ARCHIVE / study)
+        except FileExistsError as exc:
+            raise HTTPException(409, str(exc)) from None
+        except (FileNotFoundError, ValueError):
+            raise HTTPException(404, f"HPO study not found: {name}") from None
+        state.invalidate_prefix(f"hpo/{study}")
+        return {"ok": True}
     try:
         run_dir = resolve_run_directory(name)
     except FileNotFoundError:
         raise HTTPException(404, f"Run dir not found: {name}") from None
-    commit = run_dir.parent.name
-    target = Filepaths.BENCHMARK_ARCHIVE / commit / run_dir.name
-    move_run_dir(name, target)
+    target = Filepaths.BENCHMARK_ARCHIVE / run_dir.name
+    try:
+        move_run_dir(name, target)
+    except FileExistsError as exc:
+        raise HTTPException(409, str(exc)) from None
     state.invalidate(name)
     return {"ok": True}
 
 
 @app.post("/api/network/{name:path}/rename")
 def rename_network(name: str, body: RenameRequest) -> dict:
+    if is_hpo_name(name):
+        try:
+            study, run = split_hpo_name(name)
+            new_study = renamed_slug(study, body.new_name)
+            move_study_dir(study, resolve_study_directory(study).parent / new_study)
+        except FileExistsError as exc:
+            raise HTTPException(409, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        except FileNotFoundError:
+            raise HTTPException(404, f"HPO study not found: {name}") from None
+        state.invalidate_prefix(f"hpo/{study}")
+        return {"name": hpo_network_name(new_study, run) if run else f"hpo/{new_study}"}
     try:
         run_dir = resolve_run_directory(name)
     except FileNotFoundError:
         raise HTTPException(404, f"Run dir not found: {name}") from None
-    new_path = run_dir.parent / body.new_name
-    move_run_dir(name, new_path)
+    try:
+        new_path = run_dir.parent / renamed_slug(run_dir.name, body.new_name)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    try:
+        move_run_dir(name, new_path)
+    except FileExistsError as exc:
+        raise HTTPException(409, str(exc)) from None
     state.invalidate(name)
-    return {"name": f"{new_path.parent.name}/{new_path.name}"}
+    return {"name": new_path.name}
 
 
 @app.delete("/api/network/{name:path}")
 def delete_network(name: str) -> dict:
+    if is_hpo_name(name):
+        try:
+            study, run = split_hpo_name(name)
+            target = resolve_study_directory(study) if run is None else resolve_run_directory(name)
+        except (FileNotFoundError, ValueError):
+            raise HTTPException(404, f"HPO target not found: {name}") from None
+        shutil.rmtree(target, ignore_errors=True)
+        if run is None:
+            state.invalidate_prefix(f"hpo/{study}")
+        else:
+            state.invalidate(name)
+        return {"ok": True}
     try:
         run_dir = resolve_run_directory(name)
     except FileNotFoundError:
         raise HTTPException(404, f"Run dir not found: {name}") from None
     shutil.rmtree(run_dir, ignore_errors=True)
-    with contextlib.suppress(OSError):
-        run_dir.parent.rmdir()
     state.invalidate(name)
     return {"ok": True}
 

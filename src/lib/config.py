@@ -37,6 +37,8 @@ class Filepaths:
     # Per-commit benchmark tree: <commit>/<run>/{network.flax,config.json,...}
     BENCHMARKS = DATA / "benchmarks"
     BENCHMARK_ARCHIVE = BENCHMARKS / "_archive"
+    HPO_ROOT = DATA / "hpo"
+    HPO_ARCHIVE = HPO_ROOT / "_archive"
 
     PLASMA_SURFACE = DATA / "plasma_surface.ply"
     TOROIDAL_COILS = DATA / "toroidal_field_coils.ply"
