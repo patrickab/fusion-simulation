@@ -13,6 +13,13 @@ from src.lib.geometry_config import (
 )
 
 
+def _fourier_basis(alpha: jnp.ndarray, n_harmonics: int) -> jnp.ndarray:
+    angles = alpha[..., None] * jnp.arange(1, n_harmonics + 1)
+    return jnp.concatenate(
+        [jnp.ones_like(alpha)[..., None], jnp.cos(angles), jnp.sin(angles)], axis=-1
+    )
+
+
 def get_poloidal_points(
     theta: float, plasma_geometry: PlasmaGeometry, scaling_factor: float = 1.0
 ) -> tuple[float, float]:
@@ -59,11 +66,20 @@ def calculate_poloidal_boundary(
     phi_array = jnp.full_like(R, phi)
     coords = CylindricalCoordinates(R=R, phi=phi_array, Z=Z)
 
+    dR = R - plasma_geometry.R0
+    radius = jnp.sqrt(dR**2 + Z**2)
+    alpha = jnp.arctan2(Z, dR)
+    n_harmonics = min(32, R.shape[0] // 4)
+    design = _fourier_basis(alpha, n_harmonics)
+    gram = design.T @ design + 1e-6 * jnp.eye(2 * n_harmonics + 1)
+    radius_fourier_coeffs = jnp.linalg.solve(gram, design.T @ radius)
+
     return PlasmaBoundary(
         coords=coords,
         theta=theta,
         dR_dtheta=dR_dtheta,
         dZ_dtheta=dZ_dtheta,
+        radius_fourier_coeffs=radius_fourier_coeffs,
         R_center=plasma_geometry.R0,
         Z_center=0.0,
     )
@@ -127,8 +143,8 @@ def boundary_normalized_radius(
     conditioning), so psi=0 is enforced on the fitted curve; the
     model_evaluation boundary-leakage KPI tracks the effect.
 
-    Under an inner vmap over points the fit depends only on the (unbatched)
-    boundary, so it is computed once per config, not per point.
+    The boundary stores the fitted coefficients, so flux evaluations only
+    construct the basis at the query angle.
     """
     dR = R - boundary.R_center
     dZ = Z - boundary.Z_center
@@ -136,25 +152,8 @@ def boundary_normalized_radius(
     r_test = jnp.sqrt(dR**2 + dZ**2 + 1e-12)
     alpha_test = jnp.arctan2(dZ, dR)
 
-    dR_boundary = boundary.R - boundary.R_center
-    dZ_boundary = boundary.Z - boundary.Z_center
-    r_geom = jnp.sqrt(dR_boundary**2 + dZ_boundary**2)
-    alpha_geom = jnp.arctan2(dZ_boundary, dR_boundary)
-
-    n_harmonics = min(32, boundary.R.shape[0] // 4)
-    k = jnp.arange(1, n_harmonics + 1)
-
-    def basis(alpha: jnp.ndarray) -> jnp.ndarray:
-        angles = alpha[..., None] * k
-        return jnp.concatenate(
-            [jnp.ones_like(alpha)[..., None], jnp.cos(angles), jnp.sin(angles)], axis=-1
-        )
-
-    design = basis(alpha_geom)
-    gram = design.T @ design + 1e-6 * jnp.eye(2 * n_harmonics + 1)
-    coeffs = jnp.linalg.solve(gram, design.T @ r_geom)
-
-    r_boundary = basis(alpha_test) @ coeffs
+    n_harmonics = (boundary.radius_fourier_coeffs.shape[0] - 1) // 2
+    r_boundary = _fourier_basis(alpha_test, n_harmonics) @ boundary.radius_fourier_coeffs
     return r_test / r_boundary
 
 
