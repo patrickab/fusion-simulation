@@ -143,10 +143,8 @@ def shafranov_operator_and_psi(
 
     Δ*ψ = ∂²ψ/∂R² - (1/R)(∂ψ/∂R) + ∂²ψ/∂Z²
 
-    Note: Uses nested jax.jvp to compute diagonal elements of Hessian (d²ψ/dR², d²ψ/dZ²).
-          Avoids memory allocation and unused cross-derivatives, minimizing VRAM usage.
-
-          Measured speedup: 1.31x
+    The nested R pass returns the primal, first, and second terms together,
+    avoiding a separate network traversal for dpsi/dR.
     """
     R_stable = R + 1e-8
 
@@ -154,11 +152,9 @@ def shafranov_operator_and_psi(
     psi_along_R = lambda r: psi_fn(params, r, Z, *args)  # noqa
     psi_along_Z = lambda z: psi_fn(params, R_stable, z, *args)  # noqa
 
-    # returns (primal, first_derivative) in one pas
-    psi, dpsi_dR = jax.jvp(psi_along_R, (R_stable,), (jnp.ones_like(R_stable),))
-
-    # Diagonal second derivative without cross-derivatives
-    d2psi_dR2 = _second_derivative(psi_along_R, R_stable)
+    tangent_R = jnp.ones_like(R_stable)
+    first_order_R = lambda r: jax.jvp(psi_along_R, (r,), (tangent_R,))  # noqa
+    (psi, dpsi_dR), (_, d2psi_dR2) = jax.jvp(first_order_R, (R_stable,), (tangent_R,))
     d2psi_dZ2 = _second_derivative(psi_along_Z, Z)
 
     delta_star = d2psi_dR2 - (1.0 / R_stable) * dpsi_dR + d2psi_dZ2
