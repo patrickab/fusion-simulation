@@ -1,9 +1,11 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
+from functools import partial
 import json
 from pathlib import Path
 from typing import Literal
+import weakref
 
 import jax
 import jax.numpy as jnp
@@ -11,7 +13,7 @@ import numpy as np
 from scipy.stats import qmc
 
 from src.engine.network import BASE_SEED, NetworkManager
-from src.engine.physics import estimate_psi_axis, grad_shafranov_residual
+from src.engine.physics import PsiFn, estimate_psi_axis, grad_shafranov_residual
 from src.engine.plasma import get_poloidal_points
 from src.lib.geometry_config import PlasmaConfig
 from src.lib.network_config import HyperParams
@@ -125,6 +127,121 @@ def compute_gs_residual_on_points(
     return residual_fn(R_pts, Z_pts)
 
 
+# make_psi_fn returns a fresh closure per call, and jit's static-argument cache
+# keys closures by identity — passing them straight through would retrace the
+# KPI core on every evaluation. One memoized psi_fn per manager instance keeps
+# repeated calls (training-time tracking, HPO ranking) on a single trace;
+# params stay traced arguments, so the trace itself is checkpoint-independent.
+_PSI_FN_CACHE: weakref.WeakKeyDictionary[NetworkManager, PsiFn] = weakref.WeakKeyDictionary()
+
+
+def _shared_psi_fn(manager: NetworkManager) -> PsiFn:
+    psi_fn = _PSI_FN_CACHE.get(manager)
+    if psi_fn is None:
+        psi_fn = manager.make_psi_fn()
+        _PSI_FN_CACHE[manager] = psi_fn
+    return psi_fn
+
+
+def _kpi_sample_points(sample_size: int, seed: int) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Deterministic area-uniform ``(theta, rho)`` sample shared by all KPI paths.
+
+    Generate a power-of-two Sobol block (its balance guarantee), then truncate
+    so callers can still request any exact sample size without SciPy warnings.
+    """
+    unit_points = qmc.Sobol(d=2, scramble=True, seed=seed).random_base2(
+        (sample_size - 1).bit_length()
+    )[:sample_size]
+    theta = jnp.asarray(2.0 * np.pi * unit_points[:, 0], dtype=jnp.float32)
+    # sqrt maps uniform unit-square samples to uniform area in the normalized disk.
+    rho = jnp.asarray(np.sqrt(unit_points[:, 1]), dtype=jnp.float32)
+    return theta, rho
+
+
+@partial(jax.jit, static_argnums=(0,))
+def _residual_samples_core(
+    psi_fn: PsiFn,
+    params: any,
+    batched_config: PlasmaConfig,
+    theta: jnp.ndarray,
+    rho: jnp.ndarray,
+) -> jnp.ndarray:
+    """``|R_GS|`` per sample point, vmapped over configs.
+
+    The inner point dimension is chunked (same OOM rationale as
+    ``evaluate_plasma_grids``): the outer vmap already scales memory with
+    n_configs, so capping the inner batch keeps the peak flat regardless of
+    sample_size.
+    """
+
+    def per_config(config: PlasmaConfig) -> jnp.ndarray:
+        R, Z = jax.vmap(lambda t, r: get_poloidal_points(t, config.Geometry, r))(theta, rho)
+        # psi once per point, reused for the axis estimate — numerically identical
+        # to estimate_axis_for_config, without re-evaluating the network on the
+        # same sample.
+        psi = jax.lax.map(
+            lambda rz: psi_fn(params, rz[0], rz[1], config), (R, Z), batch_size=GRID_EVAL_CHUNK
+        )
+        psi_axis = estimate_psi_axis(psi)
+        residual = jax.lax.map(
+            lambda rz: grad_shafranov_residual(psi_fn, params, rz[0], rz[1], psi_axis, config),
+            (R, Z),
+            batch_size=GRID_EVAL_CHUNK,
+        )
+        return jnp.abs(residual)
+
+    return jax.vmap(per_config)(batched_config)
+
+
+@partial(jax.jit, static_argnums=(0,))
+def _boundary_leak_core(
+    psi_fn: PsiFn,
+    params: any,
+    batched_config: PlasmaConfig,
+    theta: jnp.ndarray,
+    rho: jnp.ndarray,
+    boundary_theta: jnp.ndarray,
+) -> jnp.ndarray:
+    """``max |psi_boundary| / flux_depth`` per config, vmapped over configs."""
+
+    def per_config(config: PlasmaConfig) -> jnp.ndarray:
+        R, Z = jax.vmap(lambda t, r: get_poloidal_points(t, config.Geometry, r))(theta, rho)
+        psi = jax.lax.map(
+            lambda rz: psi_fn(params, rz[0], rz[1], config), (R, Z), batch_size=GRID_EVAL_CHUNK
+        )
+        # Use the strongest 5% by magnitude so leakage remains meaningful for
+        # checkpoints that converged to either flux sign.
+        n_axis = max(1, psi.shape[0] // 20)
+        flux_depth = jnp.mean(jnp.sort(jnp.abs(psi))[-n_axis:])
+        R_boundary, Z_boundary = get_poloidal_points(boundary_theta, config.Geometry, 1.0)
+        psi_boundary = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R_boundary, Z_boundary)
+        return jnp.max(jnp.abs(psi_boundary)) / (flux_depth + 1e-12)
+
+    return jax.vmap(per_config)(batched_config)
+
+
+def evaluate_residual_samples(
+    manager: NetworkManager,
+    configs: Sequence[PlasmaConfig],
+    sample_size: int = DEFAULT_KPI_SAMPLE_SIZE,
+    seed: int = BASE_SEED + 124,
+) -> np.ndarray:
+    """Per-point ``|R_GS|`` samples, shape ``(len(configs), sample_size)``.
+
+    The single batched, jitted KPI core: training-time tracking, post-training
+    eval and HPO ranking all evaluate the same deterministic area-uniform Sobol
+    sample here, so their statistics are directly comparable.
+    """
+    if not configs:
+        raise ValueError("At least one plasma config is required")
+    theta, rho = _kpi_sample_points(sample_size, seed)
+    batched_config = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *configs)
+    residual = _residual_samples_core(
+        _shared_psi_fn(manager), manager.state.params, batched_config, theta, rho
+    )
+    return np.asarray(residual)
+
+
 def evaluate_plasma_kpis(
     manager: NetworkManager,
     configs: Sequence[PlasmaConfig],
@@ -140,47 +257,21 @@ def evaluate_plasma_kpis(
     if not 0.0 < core_rho < 1.0:
         raise ValueError("core_rho must be between 0 and 1")
 
-    # Generate a power-of-two Sobol block (its balance guarantee), then truncate
-    # so callers can still request any exact sample size without SciPy warnings.
-    unit_points = qmc.Sobol(d=2, scramble=True, seed=seed).random_base2(
-        (sample_size - 1).bit_length()
-    )[:sample_size]
-    theta = jnp.asarray(2.0 * np.pi * unit_points[:, 0], dtype=jnp.float32)
-    # sqrt maps uniform unit-square samples to uniform area in the normalized disk.
-    rho = jnp.asarray(np.sqrt(unit_points[:, 1]), dtype=jnp.float32)
+    theta, rho = _kpi_sample_points(sample_size, seed)
     core = np.asarray(rho) < core_rho
     if not core.any() or core.all():
         raise ValueError("KPI sample does not cover both core and edge regions")
 
-    psi_fn = manager.make_psi_fn()
-    params = manager.state.params
+    loss = evaluate_residual_samples(manager, configs, sample_size=sample_size, seed=seed)
+
+    # Boundary leak stays a separate small pass: the boundary itself is only 256
+    # points, but the flux-depth denominator needs one psi-only forward pass over
+    # the same interior sample.
+    batched_config = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *configs)
     boundary_theta = jnp.linspace(0.0, 2.0 * jnp.pi, 257)[:-1]
-    losses = []
-    boundary_leaks = []
-    for config in configs:
-        R, Z = jax.vmap(lambda t, r, cfg=config: get_poloidal_points(t, cfg.Geometry, r))(
-            theta, rho
-        )
-        psi = jax.vmap(lambda r, z, cfg=config: psi_fn(params, r, z, cfg))(R, Z)
-        psi_axis = estimate_axis_for_config(manager, config, sample_size, seed)
-        residual = jax.vmap(
-            lambda r, z, axis=psi_axis, cfg=config: grad_shafranov_residual(
-                psi_fn, params, r, z, axis, cfg
-            )
-        )(R, Z)
-        losses.append(np.abs(np.asarray(residual)))
-
-        R_boundary, Z_boundary = get_poloidal_points(boundary_theta, config.Geometry, 1.0)
-        psi_boundary = jax.vmap(lambda r, z, cfg=config: psi_fn(params, r, z, cfg))(
-            R_boundary, Z_boundary
-        )
-        # Use the strongest 5% by magnitude so leakage remains meaningful for
-        # checkpoints that converged to either flux sign.
-        n_axis = max(1, sample_size // 20)
-        flux_depth = jnp.mean(jnp.sort(jnp.abs(psi))[-n_axis:])
-        boundary_leaks.append(float(jnp.max(jnp.abs(psi_boundary)) / (flux_depth + 1e-12)))
-
-    loss = np.stack(losses)
+    boundary_leaks = _boundary_leak_core(
+        _shared_psi_fn(manager), manager.state.params, batched_config, theta, rho, boundary_theta
+    )
 
     def summary(values: np.ndarray, prefix: str) -> dict[str, float]:
         return {
@@ -194,7 +285,7 @@ def evaluate_plasma_kpis(
         **summary(loss.ravel(), ""),
         **summary(loss[:, core].ravel(), "core_"),
         "edge_loss_p95": float(np.percentile(loss[:, ~core], 95)),
-        "boundary_leak_max": max(boundary_leaks),
+        "boundary_leak_max": float(np.max(np.asarray(boundary_leaks))),
     }
 
 
