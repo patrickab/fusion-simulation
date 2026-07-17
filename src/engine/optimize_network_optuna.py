@@ -97,7 +97,7 @@ WARMSTART_CONFIG_PATHS: list[Path] = [
 # The study name is auto-discovered (the non-legacy study with the most trials).
 WARMSTART_EXPERIMENT_DB: Path | None = (
     # None
-    Path("data/hpo/2026_07_14_10_05_06_pinn_hpo_n6_lr_sigma_2400ep_d46257d")
+    Path("data/hpo/2026_07_16_00_16_02_arch_wide_or_deep_2400ep_4a25aff/")
 )
 
 # Budget fields change what the loss *means* (sampling/training amount), so a mismatch
