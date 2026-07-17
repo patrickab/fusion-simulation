@@ -14,6 +14,15 @@ passes, cache boundary Fourier fit, fuse radial JVP. Train step 42.7 → 28.4 ms
 (−33%), XLA temp memory 863 → 823 MiB. Each has a note in `docs/performance/`
 with the runnable benchmark; follow that format for further perf work.
 
+KPI tracking unified (2026-07-17): one batched+jitted eval core
+(`evaluate_residual_samples`) feeds training-time validation, kpis.json and HPO
+ranking; budgets calibrated by a 10-checkpoint × 200-config study
+(`docs/evaluation/kpi-accuracy-benchmark.md`, harness
+`scripts/kpi_accuracy_benchmark.py`): benchmark 4,096 pts × 100 configs
+(was 16,384 pts), training tracking 1,024 pts (`val_kpi_median` replaces the
+composite-loss `val_loss`). Ranking is protected by the fixed eval seed
+(common random numbers) — don't change the seed casually.
+
 ## Design decisions that shape the code
 1. **Hard Dirichlet BC**: `psi_fn` output × envelope `1 - ρ̃²`,
    `ρ̃ = boundary_normalized_radius(R,Z,boundary)` (`src/engine/plasma.py`).
