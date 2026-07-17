@@ -15,20 +15,18 @@ from scipy.stats import qmc
 from src.engine.network import BASE_SEED, NetworkManager
 from src.engine.physics import PsiFn, estimate_psi_axis, grad_shafranov_residual
 from src.engine.plasma import get_poloidal_points
+from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG
 from src.lib.geometry_config import PlasmaConfig
-from src.lib.network_config import HyperParams
+from src.lib.network_config import DomainBounds, HyperParams
 
 GridQuantity = Literal["flux", "residual"]
-# calibrated: median ≤1.2% vs 16,384-pt reference, ranking unchanged
-# (docs/evaluation/kpi-accuracy-benchmark.md)
-DEFAULT_KPI_SAMPLE_SIZE = 4_096
-TRACKING_KPI_SAMPLE_SIZE = 1_024  # training-time tracking / HPO pruning budget
 # Plot count - kept small to ensure plots do not become too large
 N_PLOTS = 8
 
-# Config count for KPI *statistics* (median/p95/etc).
-# Increasing this value increases stability of these estimators
-KPI_CONFIG_COUNT = 100
+# Bounds live second-order-JVP point evals per jitted call: 100 configs x 4,096
+# points in one vmap is ~10 GB for a 5x320 net on a 12 GB card.  This value keeps
+# existing call-site chunk shapes stable while preventing OOM for large networks.
+KPI_EVAL_POINT_BUDGET = 163_840
 
 # Grid resolution for montage plots -- collapses flat-filled wedge artifacts
 # near the O-point back down to their real footprint.
@@ -91,7 +89,7 @@ class PlasmaGridBatch:
 def estimate_axis_for_config(
     manager: NetworkManager,
     config: PlasmaConfig,
-    sample_size: int = DEFAULT_KPI_SAMPLE_SIZE,
+    sample_size: int = KPI_POINTS_PER_CONFIG,
     seed: int = BASE_SEED + 124,
 ) -> jnp.ndarray:
     """psi_axis on the fixed area-uniform Sobol sample used for KPI ranking.
@@ -226,7 +224,7 @@ def _boundary_leak_core(
 def evaluate_residual_samples(
     manager: NetworkManager,
     configs: Sequence[PlasmaConfig],
-    sample_size: int = DEFAULT_KPI_SAMPLE_SIZE,
+    sample_size: int = KPI_POINTS_PER_CONFIG,
     seed: int = BASE_SEED + 124,
 ) -> np.ndarray:
     """Per-point ``|R_GS|`` samples, shape ``(len(configs), sample_size)``.
@@ -234,21 +232,33 @@ def evaluate_residual_samples(
     The single batched, jitted KPI core: training-time tracking, post-training
     eval and HPO ranking all evaluate the same deterministic area-uniform Sobol
     sample here, so their statistics are directly comparable.
+
+    Config chunking: ``KPI_EVAL_POINT_BUDGET`` bounds the number of live
+    second-order-JVP point evals per jitted call.  The outer vmap already scales
+    memory with n_configs, so capping the config batch keeps peak memory flat for
+    large networks.  Per-config values are bit-identical to the unchunked result.
     """
     if not configs:
         raise ValueError("At least one plasma config is required")
     theta, rho = _kpi_sample_points(sample_size, seed)
-    batched_config = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *configs)
-    residual = _residual_samples_core(
-        _shared_psi_fn(manager), manager.state.params, batched_config, theta, rho
-    )
-    return np.asarray(residual)
+    psi_fn = _shared_psi_fn(manager)
+    params = manager.state.params
+
+    config_chunk = max(1, KPI_EVAL_POINT_BUDGET // min(sample_size, GRID_EVAL_CHUNK))
+    chunks: list[np.ndarray] = []
+    for start in range(0, len(configs), config_chunk):
+        batch = configs[start : start + config_chunk]
+        batched_config = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *batch)
+        chunk_result = _residual_samples_core(psi_fn, params, batched_config, theta, rho)
+        chunks.append(np.asarray(chunk_result))
+
+    return np.concatenate(chunks, axis=0)
 
 
 def evaluate_plasma_kpis(
     manager: NetworkManager,
     configs: Sequence[PlasmaConfig],
-    sample_size: int = DEFAULT_KPI_SAMPLE_SIZE,
+    sample_size: int = KPI_POINTS_PER_CONFIG,
     core_rho: float = 0.85,
     seed: int = BASE_SEED + 124,
 ) -> dict[str, float]:
@@ -292,36 +302,43 @@ def evaluate_plasma_kpis(
     }
 
 
-def _validation_configs(manager: NetworkManager) -> list[PlasmaConfig]:
-    """The manager's fixed validation configs as a list (one PlasmaConfig each).
+def kpi_benchmark_configs(
+    manager: NetworkManager,
+    n_configs: int = KPI_EVAL_CONFIGS,
+) -> list[PlasmaConfig]:
+    """THE shared config stream for kpis.json / CLI eval / validation tracking.
 
-    ``inputs.config`` is a batched Flax struct pytree (no ``.shape``); iterate via
-    ``BaseModel.__iter__`` instead of indexing ``.shape[0]`` (which raises).
+    Validation configs are drawn from the same Sobol stream (BASE_SEED + 123),
+    so training-time KPI tracking, post-training kpis.json, and CLI re-eval all
+    score the same set of reactor configurations.
     """
-    inputs = manager.validation_inputs()
+    lower, upper = DomainBounds.get_bounds()
+    sobol = qmc.Sobol(d=len(lower), scramble=True, seed=BASE_SEED + 123)
+    plasma_configs = jnp.array(
+        qmc.scale(sobol.random(n_configs), np.asarray(lower), np.asarray(upper)),
+        dtype=jnp.float32,
+    )
+    inputs = manager.sampler.sample_flux_input(plasma_configs=plasma_configs)
     return list(inputs.config)
 
 
 def evaluate_validation_loss_median(
-    manager: NetworkManager, sample_size: int = DEFAULT_KPI_SAMPLE_SIZE
+    manager: NetworkManager, sample_size: int = KPI_POINTS_PER_CONFIG
 ) -> float:
-    """Median ``|R_GS|`` over the manager's n_validate validation configs.
-    Smaller/differently-seeded draw than the kpis.json grid, so a trial's
-    ranking value and its saved kpis.json loss_median differ by sampling noise.
-    """
-    return evaluate_plasma_kpis(manager, _validation_configs(manager), sample_size=sample_size)[
+    """Median ``|R_GS|`` over the manager's n_validate validation configs."""
+    return evaluate_plasma_kpis(manager, manager.validation_configs(), sample_size=sample_size)[
         "loss_median"
     ]
 
 
 def evaluate_validation_loss_stats(
-    manager: NetworkManager, sample_size: int = DEFAULT_KPI_SAMPLE_SIZE
+    manager: NetworkManager, sample_size: int = KPI_POINTS_PER_CONFIG
 ) -> tuple[float, float]:
     """(|R_GS| median, p95) over the manager's validation configs — the two
     components of the fused ranking score, on one shared Sobol draw. Reuse this
     instead of calling median and p95 separately to avoid a second eval pass.
     """
-    kpis = evaluate_plasma_kpis(manager, _validation_configs(manager), sample_size=sample_size)
+    kpis = evaluate_plasma_kpis(manager, manager.validation_configs(), sample_size=sample_size)
     return kpis["loss_median"], kpis["loss_p95"]
 
 
@@ -615,7 +632,7 @@ if __name__ == "__main__":
     import argparse
     from datetime import datetime
 
-    from src.lib.network_config import DomainBounds, HyperParams
+    from src.lib.network_config import HyperParams
     from src.streamlit.network_utils import get_available_networks, resolve_run_directory
 
     parser = argparse.ArgumentParser(description="Region-split |GS residual| KPIs per checkpoint")
@@ -624,14 +641,14 @@ if __name__ == "__main__":
         nargs="*",
         help="Network slugs (default: all saved networks)",
     )
-    parser.add_argument("--n-configs", type=int, default=KPI_CONFIG_COUNT)
+    parser.add_argument("--n-configs", type=int, default=KPI_EVAL_CONFIGS)
     parser.add_argument(
         "--plot-n-configs",
         type=int,
         default=N_PLOTS,
         help="Configs rendered in the montage (subset of --n-configs)",
     )
-    parser.add_argument("--n-points", type=int, default=DEFAULT_KPI_SAMPLE_SIZE)
+    parser.add_argument("--n-points", type=int, default=KPI_POINTS_PER_CONFIG)
     parser.add_argument("--core-rho", type=float, default=0.85)
     parser.add_argument("--no-plots", action="store_true")
     parser.add_argument("--plot-resolution", type=int, default=96)
@@ -647,12 +664,6 @@ if __name__ == "__main__":
 
     names = args.networks or get_available_networks(view_mode="All")
 
-    lower, upper = DomainBounds.get_bounds()
-    sobol = qmc.Sobol(d=len(lower), scramble=True, seed=BASE_SEED + 123)
-    val_configs = jnp.array(
-        qmc.scale(sobol.random(args.n_configs), np.asarray(lower), np.asarray(upper)),
-        dtype=jnp.float32,
-    )
     print(
         f"{'network':<50} {'loss':>10} {'lr_max':>8} {'nff':>4} "
         f"{'lbfgs':>6} {'median':>9} {'mean':>9} {'p95':>9} {'p05':>9} "
@@ -674,8 +685,7 @@ if __name__ == "__main__":
         manager = NetworkManager(hp)
         loaded = manager.from_disk(pinn_path=flax_path)
         manager.state = manager.state.replace(params=loaded)
-        inputs = manager.sampler.sample_flux_input(plasma_configs=val_configs)
-        configs = [inputs.config[i] for i in range(args.n_configs)]
+        configs = kpi_benchmark_configs(manager, args.n_configs)
         kpis = evaluate_plasma_kpis(
             manager, configs, sample_size=args.n_points, core_rho=args.core_rho
         )

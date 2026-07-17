@@ -116,11 +116,19 @@ cross-study tail numbers, go to 200 configs — not more points.
 
 ## Calibrated budgets
 
+The protocol is defined globally by two constants in `src/lib/config.py`:
+`KPI_POINTS_PER_CONFIG = 4_096` and `KPI_EVAL_CONFIGS = 100`. Every metric
+path derives from them — training-time tracking, HPO pruning/ranking,
+end-of-training `kpis.json`, the eval CLI, and
+`scripts/reevaluate_hpo_kpis.py` — and all of them score the **same 100
+`PlasmaConfig` objects** (domain-Sobol stream `BASE_SEED+123`, built through
+`kpi_benchmark_configs`), so the tracked `val_kpi_median`, `kpis.json`'s
+`loss_median` and the HPO ranking median are bit-identical at end of training.
+
 | Use | configs | points | accuracy (worst net) | cost/checkpoint |
 |---|---:|---:|---|---:|
-| Model benchmark: `kpis.json`, CLI eval, HPO final ranking | 100 | 4,096 | median ≤ ~1.2% (points) + config spread ±2.5%; ranking exact | ~1.6 s |
-| Training-time tracking + HPO pruning | fixed validation set (20 HPO / 128 direct) | 1,024 | ±3.3% point noise, but fixed-seed CRN makes the curve smooth and trials comparable | ≤ ~0.3 s per eval |
-| previously | 100–128 | 16,384 | median ≤ ~0.5% (points), same config spread | ~2.5 s (was minutes pre-unification) |
+| One global protocol (tracking, kpis.json, CLI, HPO) | 100 | 4,096 | median ≤ ~1.2% (points) + config spread ±2.5%; ranking exact | ~0.2 s cached / ~1.6 s cold |
+| previously | 20–128 | 16,384 | median ≤ ~0.5% (points), same config spread | ~2.5 s (was minutes pre-unification) |
 
 Rationale:
 
@@ -129,11 +137,11 @@ Rationale:
   spread (±2.5%) that dominates either way, and irrelevant to ranking, which is
   seed-pinned (common random numbers) and never flipped at 4,096 in 16
   independent draws.
-- **Training-time tracking doesn't need benchmark accuracy.** It needs a smooth,
-  trial-comparable curve of the *same metric* the benchmark reports. 1,024
-  points on the fixed validation configs gives that at ≤0.3 s per evaluation
-  (every 50 epochs ≈ 20+ s of training), so unified KPI tracking costs ~1% of
-  training time.
+- **Training-time tracking can afford the full protocol.** The batched core
+  makes the full 4,096 × 100 evaluation ~0.2 s cached (measured, RTX 3060) —
+  ~1% of training time at the 50-epoch validation cadence — so tracking runs
+  the identical protocol instead of a reduced budget, and the tracked curve
+  lands exactly on the reported benchmark value.
 - **Keep the evaluation seed fixed.** All ranking-stability results rely on
   every candidate seeing the same points and configs. Changing the seed (or
   comparing across studies evaluated with different seeds) degrades comparisons
@@ -141,12 +149,21 @@ Rationale:
 
 ## Follow-ups applied from these findings
 
-- `DEFAULT_KPI_SAMPLE_SIZE`: 16,384 → 4,096 (`src/engine/model_evaluation.py`).
-- End-of-training `_benchmark_network` now evaluates on the same domain-Sobol
-  config stream as the CLI (`BASE_SEED+123`, of which the validation configs
-  are a prefix), so training-time tracking, `kpis.json` and CLI re-evaluation
-  agree up to config count.
-- Training validation (`val` in `training.csv`, HPO pruning signal) now reports
-  median `|R_GS|` from the unified KPI path at 1,024 points instead of the
-  composite training loss — the tracked curve, the post-training KPIs and the
-  HPO objective are the same quantity at different budgets.
+- Global protocol constants `KPI_POINTS_PER_CONFIG = 4_096` /
+  `KPI_EVAL_CONFIGS = 100` in `src/lib/config.py` replaced the scattered
+  `DEFAULT_KPI_SAMPLE_SIZE` (16,384), `TRACKING_KPI_SAMPLE_SIZE`,
+  `KPI_CONFIG_COUNT`, `N_VALIDATION_SIZE` (128) and HPO `n_validate` (20).
+- All paths draw configs via `kpi_benchmark_configs` (stream `BASE_SEED+123`);
+  the separately-seeded validation `Sampler` was removed — `PlasmaConfig`
+  construction bakes the building sampler's boundary-theta draw into the
+  Fourier fit, so a dedicated sampler produced subtly different boundaries for
+  the same domain vectors (a ~2e-4 relative KPI offset).
+- Training validation (`val_kpi_median` in `training.csv`, HPO pruning signal)
+  reports median `|R_GS|` from the unified path at the full protocol — the
+  tracked curve, `kpis.json` and the HPO objective are the same quantity on
+  the same configs.
+- One accepted trade-off: `kpis.json` is no longer out-of-sample with respect
+  to HPO selection (trials are ranked on the very configs the benchmark
+  reports). Selection bias is bounded by the ±2.5% config-draw spread above;
+  for an unbiased check, re-evaluate finalists on independent draws with
+  `scripts/kpi_accuracy_benchmark.py`-style seeds.

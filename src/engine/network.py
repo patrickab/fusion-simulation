@@ -18,7 +18,6 @@ import flax.serialization
 from flax.training import train_state
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
 from rich.console import Console, Group
 from rich.live import Live
@@ -33,7 +32,7 @@ from src.engine.plasma import (
     calculate_poloidal_boundary,
     get_poloidal_points,
 )
-from src.lib.config import Filepaths, current_commit
+from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG, Filepaths, current_commit
 from src.lib.geometry_config import (
     PlasmaConfig,
     PlasmaGeometry,
@@ -153,7 +152,7 @@ class FluxPINN(nn.Module):
 BASE_SEED = 42
 RESAMPLING_FREQUENCY = 10  # Resample training set every N epochs
 LOG_FREQUENCY = 10  # Log training metrics every N epochs
-N_VALIDATION_SIZE = 128  # Number of validation plasma configs
+N_VALIDATION_SIZE = KPI_EVAL_CONFIGS  # Number of validation plasma configs
 VALIDATION_FREQUENCY = 5 * LOG_FREQUENCY  # Evaluate validation set every N epochs
 # Cap rows shown in the live table; unbounded growth desyncs Rich's redraw
 # once it overflows the terminal, corrupting scrollback.
@@ -357,7 +356,6 @@ class NetworkManager:
             fourier_sigma=config.fourier_sigma,
         )
         self.sampler: Sampler = Sampler(config, seed=self.seed)
-        self._validation_sampler: Sampler | None = None
         self._validation_kpi_configs: list | None = None
         self.state = self._init_state()
 
@@ -451,28 +449,18 @@ class NetworkManager:
         # model_evaluation imports NetworkManager from this module,
         # so a top-level import here would be circular.
         from src.engine.model_evaluation import (
-            DEFAULT_KPI_SAMPLE_SIZE,
             EVAL_RESOLUTION,
-            KPI_CONFIG_COUNT,
             N_PLOTS,
             build_kpi_record,
             evaluate_plasma_grids,
             evaluate_plasma_kpis,
+            kpi_benchmark_configs,
             plot_plasma_grid_montage,
         )
 
-        lower, upper = DomainBounds.get_bounds()
-        # Same domain-Sobol stream as the eval CLI and validation configs (BASE_SEED + 123),
-        # so tracked KPI / kpis.json / CLI re-eval agree up to config count.
-        sobol = qmc.Sobol(d=len(lower), scramble=True, seed=BASE_SEED + 123)
-        val_configs = jnp.array(
-            qmc.scale(sobol.random(KPI_CONFIG_COUNT), np.asarray(lower), np.asarray(upper)),
-            dtype=jnp.float32,
-        )
-        inputs = self.sampler.sample_flux_input(plasma_configs=val_configs)
-        configs = [inputs.config[i] for i in range(KPI_CONFIG_COUNT)]
+        configs = kpi_benchmark_configs(self, KPI_EVAL_CONFIGS)
 
-        kpis = evaluate_plasma_kpis(self, configs, sample_size=DEFAULT_KPI_SAMPLE_SIZE)
+        kpis = evaluate_plasma_kpis(self, configs, sample_size=KPI_POINTS_PER_CONFIG)
         grids = evaluate_plasma_grids(
             self, configs[:N_PLOTS], resolution=EVAL_RESOLUTION, quantities=("residual",)
         )
@@ -494,7 +482,7 @@ class NetworkManager:
         )
 
         # Store KPIs as valid JSON (indent=2 for terminal readability).
-        record = build_kpi_record(self, kpis, KPI_CONFIG_COUNT, DEFAULT_KPI_SAMPLE_SIZE, 0.85)
+        record = build_kpi_record(self, kpis, KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG, 0.85)
         (run_dir / "kpis.json").write_text(json.dumps(record, indent=2) + "\n")
 
         logger.info(f"residual plot saved to {run_dir}")
@@ -592,46 +580,35 @@ class NetworkManager:
         )
         return total, l_res, l_dir, l_per_cfg
 
-    def _create_validation_configs(self) -> np.ndarray:
-        """Create fixed validation plasma configs using Sobol sampling."""
-        lower, upper = DomainBounds.get_bounds()
-        sobol = qmc.Sobol(d=len(lower), scramble=True, seed=BASE_SEED + 123)
-        samples = sobol.random(self.n_validation_size)
-        return np.array(qmc.scale(samples, lower, upper), dtype=np.float32)
+    def validation_configs(self) -> list:
+        """The manager's fixed validation configs: the first n_validation_size of the
+        shared KPI config stream (kpi_benchmark_configs), so training-time tracking,
+        HPO ranking and kpis.json all score identical PlasmaConfig objects.
 
-    def _ensure_validation_sampler(self) -> Sampler:
-        """Sole owner of the lazy validation-sampler init (seed offset +1000)."""
-        if self._validation_sampler is None:
-            self._validation_sampler = Sampler(self.config, seed=self.seed + 1_000)
-        return self._validation_sampler
-
-    def validation_inputs(self) -> FluxInput:
-        """Sampled flux inputs over the fixed validation configs; lazily inits the sampler.
-
-        Public so evaluation code needn't reach into the sampler/config privates.
-        """
-        configs = jnp.array(self._create_validation_configs(), dtype=jnp.float32)
-        return self._ensure_validation_sampler().sample_flux_input(plasma_configs=configs)
-
-    def _calculate_validation_kpi(self) -> float:
-        """Median |R_GS| over the manager's fixed validation configs at TRACKING_KPI_SAMPLE_SIZE.
-
-        Replaces the old chunked eval_step composite-loss path: the training-time
-        validation metric is now the same quantity (median |R_GS|) as the post-training
-        kpis.json and the HPO ranking score, just at a smaller sample budget.
-        model_evaluation imports network, so this uses a lazy import (same pattern as
-        _benchmark_network).
+        PlasmaConfig construction bakes the building sampler's boundary-theta draw
+        into the Fourier fit, so configs must come from ``self.sampler`` — a
+        separately-seeded sampler yields subtly different boundaries for the same
+        domain vectors.
         """
         # model_evaluation imports NetworkManager from this module — lazy import avoids
         # the circular dependency at module load time.
-        from src.engine.model_evaluation import TRACKING_KPI_SAMPLE_SIZE, evaluate_plasma_kpis
+        from src.engine.model_evaluation import kpi_benchmark_configs
 
         if self._validation_kpi_configs is None:
-            configs = jnp.array(self._create_validation_configs(), dtype=jnp.float32)
-            inputs = self._ensure_validation_sampler().sample_flux_input(plasma_configs=configs)
-            self._validation_kpi_configs = list(inputs.config)
+            self._validation_kpi_configs = kpi_benchmark_configs(self, self.n_validation_size)
+        return self._validation_kpi_configs
+
+    def _calculate_validation_kpi(self) -> float:
+        """Median |R_GS| over the fixed validation configs at KPI_POINTS_PER_CONFIG.
+
+        Runs the FULL global protocol, so when n_validation_size equals
+        KPI_EVAL_CONFIGS the tracked val_kpi_median matches kpis.json's
+        loss_median exactly.
+        """
+        from src.engine.model_evaluation import evaluate_plasma_kpis
+
         return evaluate_plasma_kpis(
-            self, self._validation_kpi_configs, sample_size=TRACKING_KPI_SAMPLE_SIZE
+            self, self.validation_configs(), sample_size=KPI_POINTS_PER_CONFIG
         )["loss_median"]
 
     @staticmethod

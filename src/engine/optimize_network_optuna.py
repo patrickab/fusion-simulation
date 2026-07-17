@@ -4,8 +4,9 @@ Searches over network architecture (width x depth), learning rate schedule,
 weight decay, and adaptive-sampling sigma. Each trial trains a network and
 is ranked by a fused validation score: median + beta*p95 of |R_GS| over a
 held-out set. Hyperband pruning uses the per-epoch val_kpi_median (median
-|R_GS| at TRACKING_KPI_SAMPLE_SIZE=1,024 points) — the same quantity as the
-fused score's median term, just at a smaller budget.
+|R_GS| at KPI_POINTS_PER_CONFIG x the fixed validation configs) — the same
+quantity as the fused score's median term, evaluated at the global protocol
+budget (docs/evaluation/kpi-accuracy-benchmark.md).
 
   SearchSpaceConfig    StudyConfig
        │                   │
@@ -60,7 +61,7 @@ from optuna.samplers import TPESampler
 
 from src.engine.model_evaluation import evaluate_validation_loss_stats
 from src.engine.network import NetworkManager
-from src.lib.config import Filepaths, current_commit
+from src.lib.config import KPI_EVAL_CONFIGS, Filepaths, current_commit
 from src.lib.network_config import HyperParams
 from src.lib.optuna_tui import HpoApp, OptunaProgressDisplay, logger, resolve_reset_choice
 
@@ -187,7 +188,7 @@ class StudyConfig:
     n_trials: int = 20
     top_k: int = 5
     n_startup_trials: int = 10
-    n_validate: int = 20
+    n_validate: int = KPI_EVAL_CONFIGS
     min_epochs: int = _DEFAULT_TOTAL_EPOCHS // 8
     total_epochs: int = _DEFAULT_TOTAL_EPOCHS
     prune_trials: bool = True
@@ -444,10 +445,9 @@ def objective(
 ) -> float:
     """Train one network and return its fused ranking score (median + beta*p95 of |R_GS|).
 
-    Per-epoch Hyperband pruning uses val_kpi_median (median |R_GS| at
-    TRACKING_KPI_SAMPLE_SIZE), not the composite training loss. This is the
-    same quantity as the fused score's median term — just at a smaller budget
-    — so pruning and ranking measure the same thing.
+    Per-epoch Hyperband pruning uses val_kpi_median (median |R_GS| at the global
+    protocol: KPI_POINTS_PER_CONFIG x fixed validation configs), not the composite
+    training loss.  Pruning and ranking therefore measure the same quantity.
     """
     hp = build_hyperparams(trial, search_space)
     display_params = {
@@ -471,7 +471,7 @@ def objective(
     last_epoch = 0
 
     def report(epoch: int, val_kpi_median: float | None) -> None:
-        # val_kpi_median is median |R_GS| at TRACKING_KPI_SAMPLE_SIZE from NetworkManager.
+        # val_kpi_median is median |R_GS| at KPI_POINTS_PER_CONFIG from NetworkManager.
         nonlocal last_epoch
         last_epoch = epoch
         display.update_epoch(epoch, val_kpi_median)
