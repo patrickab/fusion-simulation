@@ -1162,6 +1162,13 @@ if __name__ == "__main__":
         "entry is one residual block of that width (default: HyperParams default)",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Plasma configs per train step (default: HyperParams 64); smaller batches "
+        "halve activation memory, unlocking wider nets on 12GB",
+    )
+    parser.add_argument(
         "--show",
         metavar="RUN",
         default=None,
@@ -1198,6 +1205,8 @@ if __name__ == "__main__":
                 config = config.replace(
                     hidden_dims=tuple(int(d) for d in args.hidden_dims.split(","))
                 )
+            if args.batch_size is not None:
+                config = config.replace(batch_size=args.batch_size)
             manager = NetworkManager(config, test_mode=args.test, name=args.name)
             manager.train(save_to_disk=True)
         else:
