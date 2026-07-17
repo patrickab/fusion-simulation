@@ -43,6 +43,12 @@ class HyperParams(BaseModel):
     weight_flux_scale: float = 10.0
     # Train like legacy bb503b0: raw ψ output + Dirichlet/Neumann penalties (no envelope).
     soft_bc: bool = False
+    # Random Weight Factorization (Wang et al. arXiv 2210.01274): reparametrize each
+    # dense kernel as W = diag(exp(s)) · V to improve PINN accuracy. Default must stay
+    # False for checkpoint compat — enabling it changes the params tree (same constraint
+    # as n_fourier_features: old config.json files without this field deserialize to False,
+    # i.e. plain Dense, and saved params remain loadable).
+    rwf: bool = False
     sigma_residual_adaptive_sampling: float = 0.05
     batch_size: int = 64
     n_rz_inner_samples: int = 512
