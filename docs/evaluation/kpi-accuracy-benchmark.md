@@ -117,18 +117,37 @@ cross-study tail numbers, go to 200 configs — not more points.
 ## Calibrated budgets
 
 The protocol is defined globally by two constants in `src/lib/config.py`:
-`KPI_POINTS_PER_CONFIG = 4_096` and `KPI_EVAL_CONFIGS = 100`. Every metric
+`KPI_POINTS_PER_CONFIG = 8_192` and `KPI_EVAL_CONFIGS = 200`. Every metric
 path derives from them — training-time tracking, HPO pruning/ranking,
 end-of-training `kpis.json`, the eval CLI, and
-`scripts/reevaluate_hpo_kpis.py` — and all of them score the **same 100
+`scripts/reevaluate_hpo_kpis.py` — and all of them score the **same 200
 `PlasmaConfig` objects** (domain-Sobol stream `BASE_SEED+123`, built through
 `kpi_benchmark_configs`), so the tracked `val_kpi_median`, `kpis.json`'s
-`loss_median` and the HPO ranking median are bit-identical at end of training.
+`loss_median` and the HPO ranking median are bit-identical at end of training
+(verified).
+
+4,096 × 100 is the calibrated *minimum* from runs 1–3; the shipped protocol
+doubles both knobs for report-grade absolute statistics, because at 200
+configs the point- and config-noise terms are comparable so both must move
+together. Measured at 8 fully independent joint draws (worst network,
+relative range; raw data `run3.json`, the 4,096 × 100 study preserved as
+`run3_4096x100.json`):
+
+| protocol | median | p95 | edge_p95 | ranking stable | cost/eval (cached) |
+|---|---:|---:|---:|---:|---:|
+| 4,096 × 100 (minimum) | 5.1% | 9.0% | 11.1% | 8/8 | 0.21 s |
+| **8,192 × 200 (shipped)** | **3.8%** | **4.9%** | **6.8%** | **8/8** | **0.64 s** |
+
+At the shipped baseline the escalation probes (16,384 × 200 and 8,192 × 400,
+4 draws each) still shave the median range to 2.7% / 1.8% respectively —
+configs remain the better lever if even tighter absolute tails are ever
+needed. Training overhead at the 50-epoch validation cadence is ~3%
+(0.64 s per eval), negligible against 7-min dev and 1.5-h full runs.
 
 | Use | configs | points | accuracy (worst net) | cost/checkpoint |
 |---|---:|---:|---|---:|
-| One global protocol (tracking, kpis.json, CLI, HPO) | 100 | 4,096 | median ≤ ~1.2% (points) + config spread ±2.5%; ranking exact | ~0.2 s cached / ~1.6 s cold |
-| previously | 20–128 | 16,384 | median ≤ ~0.5% (points), same config spread | ~2.5 s (was minutes pre-unification) |
+| One global protocol (tracking, kpis.json, CLI, HPO) | 200 | 8,192 | median range 3.8%, tails ≤ 6.8% (independent draws); ranking exact | ~0.64 s cached |
+| previously | 20–128 | 16,384 | median ≤ ~0.5% (points), config spread up to ~26% at 20 configs | ~2.5 s (was minutes pre-unification) |
 
 Rationale:
 
@@ -138,10 +157,10 @@ Rationale:
   seed-pinned (common random numbers) and never flipped at 4,096 in 16
   independent draws.
 - **Training-time tracking can afford the full protocol.** The batched core
-  makes the full 4,096 × 100 evaluation ~0.2 s cached (measured, RTX 3060) —
-  ~1% of training time at the 50-epoch validation cadence — so tracking runs
-  the identical protocol instead of a reduced budget, and the tracked curve
-  lands exactly on the reported benchmark value.
+  makes even the report-grade 8,192 × 200 evaluation 0.64 s cached (measured,
+  RTX 3060) — ~3% of training time at the 50-epoch validation cadence — so
+  tracking runs the identical protocol instead of a reduced budget, and the
+  tracked curve lands exactly on the reported benchmark value.
 - **Keep the evaluation seed fixed.** All ranking-stability results rely on
   every candidate seeing the same points and configs. Changing the seed (or
   comparing across studies evaluated with different seeds) degrades comparisons
@@ -149,8 +168,9 @@ Rationale:
 
 ## Follow-ups applied from these findings
 
-- Global protocol constants `KPI_POINTS_PER_CONFIG = 4_096` /
-  `KPI_EVAL_CONFIGS = 100` in `src/lib/config.py` replaced the scattered
+- Global protocol constants `KPI_POINTS_PER_CONFIG` / `KPI_EVAL_CONFIGS` in
+  `src/lib/config.py` (shipped at the report-grade 8,192 / 200; calibrated
+  minimum 4,096 / 100) replaced the scattered
   `DEFAULT_KPI_SAMPLE_SIZE` (16,384), `TRACKING_KPI_SAMPLE_SIZE`,
   `KPI_CONFIG_COUNT`, `N_VALIDATION_SIZE` (128) and HPO `n_validate` (20).
 - All paths draw configs via `kpi_benchmark_configs` (stream `BASE_SEED+123`);
