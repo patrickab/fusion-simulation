@@ -1041,16 +1041,24 @@ class NetworkManager:
     ) -> float:
         self._files.artifact_stem = self._files.new_artifact_stem()
         self.artifact_stem = self._files.artifact_stem
-        run_dir = self._files.run_dir()
-        run_dir.mkdir(parents=True, exist_ok=True)
 
-        file_handler = logging.FileHandler(run_dir / "train.log")
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+        # Only materialise a benchmark run dir + train.log when we intend to keep
+        # artifacts. Correctors (save_to_disk=False) train purely in memory and
+        # persist themselves under <stage1>/stage2/.
+        run_dir = None
+        file_handler = None
         previous_level = logger.level
-        logger.setLevel(logging.DEBUG)
-        logger.addHandler(file_handler)
-        logger.debug(f"run {self.artifact_stem} hyperparams: {self.config.to_dict()}")
+        if save_to_disk:
+            run_dir = self._files.run_dir()
+            run_dir.mkdir(parents=True, exist_ok=True)
+            file_handler = logging.FileHandler(run_dir / "train.log")
+            file_handler.setLevel(logging.DEBUG)
+            file_handler.setFormatter(
+                logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+            )
+            logger.setLevel(logging.DEBUG)
+            logger.addHandler(file_handler)
+            logger.debug(f"run {self.artifact_stem} hyperparams: {self.config.to_dict()}")
 
         try:
             self._metrics = _MetricsManager(total_epochs=self.epochs)
@@ -1092,22 +1100,23 @@ class NetworkManager:
 
             if val_kpi_median is None:
                 val_kpi_median = self._calculate_validation_kpi()
-            logger.debug(f"run {self.artifact_stem} final val_kpi_median={val_kpi_median:.3f}")
-            with open(run_dir / "train.log", "a", encoding="utf-8") as log_f:
-                Console(file=log_f, width=100, color_system=None).print(
-                    Panel(self._metrics._table, border_style="cyan")
-                )
 
             # Expose training_log for backward compat (to_disk, HPO, etc.)
             self.training_log = self._metrics.rows
 
             if save_to_disk:
+                logger.debug(f"run {self.artifact_stem} final val_kpi_median={val_kpi_median:.3f}")
+                with open(run_dir / "train.log", "a", encoding="utf-8") as log_f:
+                    Console(file=log_f, width=100, color_system=None).print(
+                        Panel(self._metrics._table, border_style="cyan")
+                    )
                 self.to_disk()
             return val_kpi_median
         finally:
-            logger.removeHandler(file_handler)
-            file_handler.close()
-            logger.setLevel(previous_level)
+            if file_handler is not None:
+                logger.removeHandler(file_handler)
+                file_handler.close()
+                logger.setLevel(previous_level)
 
     def lbfgs(self, steps: int) -> None:
         """Polish AdamW-trained params with L-BFGS on one fixed batch."""
