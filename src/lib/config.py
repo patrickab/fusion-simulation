@@ -18,8 +18,12 @@ import numpy as np
 # tracking, end-of-training kpis.json, eval CLI, HPO pruning/ranking, and the
 # re-eval script all sample the same |R_GS| budget.
 # ---------------------------------------------------------------------------
-KPI_POINTS_PER_CONFIG = 4_096  # |R_GS| sample points per reactor config
-KPI_EVAL_CONFIGS = 100  # reactor configs per evaluation
+# Report-grade budget (~±1% absolute median accuracy): both noise sources are
+# comparable at this size, so points and configs are doubled together from the
+# calibrated 4,096 x 100 minimum. ~0.8 s cached per eval — negligible against
+# 7 min dev / 1.5 h full training runs.
+KPI_POINTS_PER_CONFIG = 8_192  # |R_GS| sample points per reactor config
+KPI_EVAL_CONFIGS = 200  # reactor configs per evaluation
 
 
 @functools.lru_cache(maxsize=1)
