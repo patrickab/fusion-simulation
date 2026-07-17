@@ -66,11 +66,17 @@ reports — not yet confirmed installed.
   width/depth question: best 5x200 at 0.00647, with 5x320 and 6x256 within
   1.2% — the whole top-5 is a tie at the same ~1.9e-3 residual floor.
 - **The floor is the O-point singularity, not spectral bias** (`todo.md`,
-  bottom section): median 1.9e-3 vs p95 1.4e-2 is a heavy tail localized at
-  the magnetic axis, where ∇ψ→0 and the coarse `estimate_psi_axis` injects
-  coherent source error. Planned fixes: ε-disk mask/down-weight around the
-  axis, sharper axis estimate, Cartesian-window eval to rule out polar-grid
-  aliasing.
+  bottom section): a heavy tail localized at the magnetic axis, where ∇ψ→0
+  and the coarse `estimate_psi_axis` injects coherent source error. Planned
+  fixes: ε-disk mask/down-weight around the axis, sharper axis estimate,
+  Cartesian-window eval to rule out polar-grid aliasing.
+- **The old 1.9e-3 "floor" was mostly TF32 noise.** After the precision fix
+  (36caa61) the 2026-07-17 full re-evaluation (new 8,192×200 protocol) puts
+  the same checkpoints at median ~3.1e-4, p95 ~1.3e-3 (best n6 trial fused
+  7.1e-4, was 6.5e-3). All stored kpis.json / study.db values were refreshed
+  (`scripts/reevaluate_hpo_kpis.py`); pre-2026-07-17 numbers in reports and
+  todo.md are on the old TF32 scale and not comparable. The O-point tail
+  shape survives the fix, but absolute targets in todo.md need rebasing.
 
 ## Open threads (each has a root-level handoff note)
 - **`todo.md` — near-floor HPO plan**, in priority order: (1) relative
