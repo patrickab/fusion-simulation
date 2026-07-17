@@ -1,0 +1,21 @@
+{
+  "date": "2026-07-17 16:45",
+  "network": "2026_07_17_14_54_43_arch-pirate2_f3dd0c8/stage2",
+  "loss": "huber=1",
+  "lr_max": 0.002,
+  "n_fourier_features": 64,
+  "lbfgs_steps": 0,
+  "n_configs": 200,
+  "n_points": 8192,
+  "core_rho": 0.85,
+  "loss_median": 0.001539158634841442,
+  "loss_mean": 0.0019700604025274515,
+  "loss_p95": 0.005084109492599964,
+  "loss_p05": 0.0001412120764143765,
+  "core_loss_median": 0.0016321598086506128,
+  "core_loss_mean": 0.0020817273762077093,
+  "core_loss_p95": 0.00529391597956419,
+  "core_loss_p05": 0.00015087488282006234,
+  "edge_loss_p95": 0.004443397745490074,
+  "boundary_leak_max": 0.0004743076569866389
+}
