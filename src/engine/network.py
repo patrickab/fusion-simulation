@@ -94,6 +94,47 @@ def apply_psi_fn(
     return denormalize_psi(psi_n, R, Z, cfg, soft_bc=soft_bc)
 
 
+# --- Random Weight Factorization dense layer ---
+class RWFDense(nn.Module):
+    """Dense layer with Random Weight Factorization (Wang et al. arXiv 2210.01274).
+
+    Reparametrizes the kernel as W = V * exp(s) where s ~ N(1.0, 0.1) and
+    V is initialized so that the effective kernel V * exp(s) equals a standard
+    glorot_normal draw at init. Both s and V are stored as a single structured
+    param ("w_fact") so their initialization is coupled via one PRNG key.
+
+    See also: "An Expert's Guide to Training PINNs" (arXiv 2308.08468) §4.3.
+    """
+
+    features: int
+    dtype: jnp.dtype = jnp.float32
+
+    _mu: float = 1.0
+    _sigma: float = 0.1
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        in_features = x.shape[-1]
+
+        def w_fact_init(
+            key: jax.Array,
+            shape: tuple[int, ...],
+        ) -> dict[str, jnp.ndarray]:
+            # shape is (in_features, features) — used only to derive the two
+            # sub-shapes; both sub-arrays are drawn from splits of `key`.
+            in_f, out_f = shape
+            key_w, key_s = jax.random.split(key)
+            w0 = nn.initializers.glorot_normal()(key_w, (in_f, out_f), self.dtype)
+            s = self._mu + self._sigma * jax.random.normal(key_s, (out_f,), self.dtype)
+            v = w0 / jnp.exp(s)
+            return {"s": s, "v": v}
+
+        w = self.param("w_fact", w_fact_init, (in_features, self.features))
+        kernel = w["v"] * jnp.exp(w["s"])  # effective kernel = glorot draw at init
+        bias = self.param("bias", nn.initializers.zeros, (self.features,))
+        return (x @ kernel + bias).astype(self.dtype)
+
+
 # --- Network (simple MLP) ---
 class FluxPINN(nn.Module):
     hidden_dims: tuple[int, ...]
@@ -102,6 +143,9 @@ class FluxPINN(nn.Module):
     # a fixed PRNG key so train and reload see the identical embedding.
     n_fourier_features: int = 0
     fourier_sigma: float = 2.0
+    # Random Weight Factorization (Wang et al. arXiv 2210.01274). Default False
+    # for checkpoint compat — enabling changes the params tree.
+    rwf: bool = False
 
     @nn.compact
     def __call__(
@@ -128,6 +172,12 @@ class FluxPINN(nn.Module):
         Returns:
             Normalized Flux prediction of shape (B, N, 1)
         """
+        dense = (
+            (lambda f: RWFDense(features=f, dtype=jnp.float32))
+            if self.rwf
+            else (lambda f: nn.Dense(features=f, dtype=jnp.float32))
+        )
+
         # Broadcast all inputs to match coordinate shape (B, N)
         target_shape = r.shape
         inputs = [r, z, r0, a, kappa, delta, p0, f_axis, alpha, exponent]
@@ -141,10 +191,10 @@ class FluxPINN(nn.Module):
             x = jnp.concatenate([x, jnp.cos(proj), jnp.sin(proj)], axis=-1)
 
         for dim in self.hidden_dims:
-            x = nn.Dense(features=dim, dtype=jnp.float32)(x)
+            x = dense(dim)(x)
             x = nn.swish(x)
 
-        psi_hat = nn.Dense(features=1)(x)
+        psi_hat = dense(1)(x)
         return psi_hat
 
 
@@ -354,6 +404,7 @@ class NetworkManager:
             hidden_dims=config.hidden_dims,
             n_fourier_features=config.n_fourier_features,
             fourier_sigma=config.fourier_sigma,
+            rwf=config.rwf,
         )
         self.sampler: Sampler = Sampler(config, seed=self.seed)
         self._validation_kpi_configs: list | None = None
@@ -1061,6 +1112,12 @@ if __name__ == "__main__":
         help="Legacy soft-BC training: raw ψ + Dirichlet/Neumann penalties (no envelope)",
     )
     parser.add_argument(
+        "--rwf",
+        action="store_true",
+        help="Random Weight Factorization (Wang et al. arXiv 2210.01274): reparametrize "
+        "each dense kernel as W = V * exp(s) to improve PINN accuracy",
+    )
+    parser.add_argument(
         "--show",
         metavar="RUN",
         default=None,
@@ -1081,6 +1138,7 @@ if __name__ == "__main__":
                 n_fourier_features=args.fourier_features,
                 lbfgs_steps=args.lbfgs,
                 soft_bc=args.soft_bc,
+                rwf=args.rwf,
             )
             if args.lr is not None:
                 config = config.replace(learning_rate_max=args.lr)
