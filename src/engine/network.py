@@ -2,6 +2,7 @@ import argparse
 from collections import deque
 from contextlib import nullcontext, suppress
 import csv
+from dataclasses import dataclass
 from datetime import datetime
 import functools
 from functools import partial
@@ -403,6 +404,303 @@ class Sampler:
         return FluxInput(R_sample=R_int, Z_sample=Z_int, config=configs)
 
 
+# ---------------------------------------------------------------------------
+# FoundationModel — frozen checkpoint used as a constant prior
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FoundationModel:
+    """A converged FluxPINN bound to a specific frozen checkpoint.
+
+    Its params are a constant prior — never part of the trainable pytree.
+    Used by the multistage corrector: stage-1 is wrapped here so jax.grad
+    differentiates only stage-2 params while R/Z derivatives still flow through
+    the sum (arXiv 2407.17213 / 2507.16636).
+    """
+
+    model: FluxPINN
+    params: any
+
+    @property
+    def apply_fn(self) -> Callable:
+        return self.model.apply
+
+
+# ---------------------------------------------------------------------------
+# _Field — owns the psi-function (single net or composed with a frozen prior)
+# ---------------------------------------------------------------------------
+
+
+class _Field:
+    """Builds and owns the psi-function for a NetworkManager.
+
+    For a plain network: ``psi_fn(params, R, Z, cfg) = apply_psi_fn(head, params, ...)``.
+    For a corrector: ``psi_fn(params, R, Z, cfg) = psi_stage1(frozen) + scale *
+    psi_stage2(params)``.
+    The prior's params are closed over as constants so jax.grad on the corrector
+    differentiates only stage-2 params.
+    """
+
+    def __init__(
+        self,
+        head_apply_fn: Callable,
+        *,
+        soft_bc: bool,
+        prior: FoundationModel | None = None,
+        scale: float = 1.0,
+    ) -> None:
+        self._head_apply_fn = head_apply_fn
+        self._soft_bc = soft_bc
+        self._prior = prior
+        self._scale = scale
+
+    @property
+    def is_corrector(self) -> bool:
+        return self._prior is not None
+
+    def make_psi_fn(
+        self,
+    ) -> Callable[[any, jnp.ndarray, jnp.ndarray, PlasmaConfig], jnp.ndarray]:
+        """Return a ``(params, R, Z, cfg) -> psi`` callable for this field."""
+        soft_bc = self._soft_bc
+        head_apply_fn = self._head_apply_fn
+        if self._prior is None:
+            return functools.partial(apply_psi_fn, head_apply_fn, soft_bc=soft_bc)
+
+        prior_apply_fn = self._prior.apply_fn
+        prior_params = self._prior.params  # closed over as constant
+        scale = self._scale
+
+        def psi_fn(params: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
+            psi1 = apply_psi_fn(prior_apply_fn, prior_params, R, Z, cfg, soft_bc=soft_bc)
+            psi2 = apply_psi_fn(head_apply_fn, params, R, Z, cfg, soft_bc=soft_bc)
+            return psi1 + scale * psi2
+
+        return psi_fn
+
+
+# ---------------------------------------------------------------------------
+# _MetricsManager — Rich display + per-epoch accumulation
+# ---------------------------------------------------------------------------
+
+
+class _MetricsManager:
+    """Owns the Rich training table, progress bar, accumulators, and training_log rows."""
+
+    def __init__(self, total_epochs: int) -> None:
+        self._total_epochs = total_epochs
+        self.rows: list[dict] = []  # persisted log entries (written to training.csv)
+        self._table_rows: deque[tuple[str, ...]] = deque(maxlen=LIVE_TABLE_MAX_ROWS)
+        self._table = _new_table()
+        self._progress = Progress(
+            TextColumn("[bold cyan]{task.description}"),
+            BarColumn(style="cyan", complete_style="bold cyan"),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console,
+            transient=False,
+        )
+        self._epoch_task = self._progress.add_task("Training", total=total_epochs)
+        self._acc_loss = self._acc_res = self._acc_bnd = self._acc_gn = self._acc_t = 0.0
+        self._live: Live | None = None
+        self.metrics_row_sink: Callable[[tuple[str, ...]], None] | None = None
+
+    def renderable(self) -> Panel:
+        return Panel(Group(self._table, self._progress), border_style="cyan")
+
+    def log(
+        self,
+        epoch: int,
+        loss: float,
+        residual: float,
+        boundary: float,
+        val_kpi_median: float | None,
+        lr: float,
+        grad_norm: float,
+        epoch_time: float,
+    ) -> None:
+        self._acc_loss += loss
+        self._acc_res += residual
+        self._acc_bnd += boundary
+        self._acc_gn += grad_norm
+        self._acc_t += epoch_time
+
+        if (epoch + 1) % LOG_FREQUENCY == 0:
+            avg = LOG_FREQUENCY
+            self.rows.append(
+                {
+                    "epoch": epoch + 1,
+                    "lr": lr,
+                    "moving_avg_loss": self._acc_loss / avg,
+                    "val_kpi_median": val_kpi_median,
+                    "residual": self._acc_res / avg,
+                    "boundary": self._acc_bnd / avg,
+                    "grad_norm": self._acc_gn / avg,
+                    "epoch_time": self._acc_t / avg,
+                }
+            )
+            row = _metrics_row(
+                epoch=epoch + 1,
+                total_epochs=self._total_epochs,
+                lr=lr,
+                grad_norm=self._acc_gn / avg,
+                loss=self._acc_loss / avg,
+                val_kpi_median=val_kpi_median,
+                epoch_time=self._acc_t / avg,
+            )
+            self._table_rows.append(row)
+            if self.metrics_row_sink is not None:
+                self.metrics_row_sink(row)
+            table = _new_table()
+            for r in self._table_rows:
+                table.add_row(*r)
+            self._table = table
+            self._acc_loss = self._acc_res = self._acc_bnd = self._acc_gn = self._acc_t = 0.0
+        else:
+            count = (epoch + 1) % LOG_FREQUENCY
+            self.rows.append(
+                {
+                    "epoch": epoch + 1,
+                    "lr": lr,
+                    "moving_avg_loss": self._acc_loss / count,
+                    "val_kpi_median": val_kpi_median,
+                    "residual": self._acc_res / count,
+                    "boundary": self._acc_bnd / count,
+                    "grad_norm": self._acc_gn / count,
+                    "epoch_time": self._acc_t / count,
+                }
+            )
+
+        self._progress.update(self._epoch_task, advance=1)
+        if self._live is not None:
+            self._live.update(self.renderable())
+
+
+# ---------------------------------------------------------------------------
+# _FileStorageManager — run-dir + artifact I/O
+# ---------------------------------------------------------------------------
+
+
+class _FileStorageManager:
+    """Owns the run directory, artifact stem, and all file I/O for one training run."""
+
+    def __init__(
+        self,
+        name: str,
+        output_dir: Path | None,
+        *,
+        is_corrector: bool = False,
+        stage1_run_dir: Path | None = None,
+    ) -> None:
+        self.name = name
+        self.output_dir = output_dir
+        self._is_corrector = is_corrector
+        self._stage1_run_dir = stage1_run_dir
+        self.artifact_stem: str | None = None
+
+    def new_artifact_stem(self) -> str:
+        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+        if self.output_dir:
+            return f"pinn_{timestamp}"
+        return f"{timestamp}_{self.name}_{current_commit()}"
+
+    def run_dir(self) -> Path:
+        if self.artifact_stem is None:
+            self.artifact_stem = self.new_artifact_stem()
+        if self._is_corrector and self._stage1_run_dir is not None:
+            return self._stage1_run_dir / "stage2"
+        base = self.output_dir or Filepaths.BENCHMARKS
+        return base / self.artifact_stem
+
+    def discard_unsaved_run(self) -> None:
+        """Delete the run dir unless a checkpoint was saved."""
+        if self.artifact_stem is None:
+            return
+        run_dir = self.run_dir()
+        if (run_dir / "network.flax").exists():
+            return
+        shutil.rmtree(run_dir, ignore_errors=True)
+        if self.output_dir:
+            with suppress(OSError):
+                run_dir.parent.rmdir()
+
+    def write_params(self, run_dir: Path, params: any) -> None:
+        (run_dir / "network.flax").write_bytes(flax.serialization.to_bytes(params))
+
+    def read_params(self, pinn_path: Path, target_params: any) -> any:
+        with open(pinn_path, "rb") as f:
+            return flax.serialization.from_bytes(target_params, f.read())
+
+    def write_config(self, run_dir: Path, config: HyperParams) -> None:
+        config.to_json(path=str(run_dir / "config.json"))
+
+    def write_training_csv(self, run_dir: Path, rows: list[dict]) -> None:
+        if not rows:
+            return
+        with open(run_dir / "training.csv", "w") as f:
+            f.write(
+                "epoch,lr,moving_avg_loss,val_kpi_median,residual,boundary,grad_norm,epoch_time\n"
+            )
+            for entry in rows:
+                vl = f"{entry['val_kpi_median']:.6f}" if entry["val_kpi_median"] is not None else ""
+                f.write(
+                    f"{entry['epoch']},{entry['lr']:.2e},{entry['moving_avg_loss']:.6f},"
+                    f"{vl},{entry['residual']:.6f},{entry['boundary']:.6f},"
+                    f"{entry['grad_norm']:.6f},{entry['epoch_time']:.4f}\n"
+                )
+
+    def write_stage2_meta(self, run_dir: Path, scale: float) -> None:
+        (run_dir / "stage2_meta.json").write_text(json.dumps({"scale": scale}) + "\n")
+
+    def benchmark(self, manager: "NetworkManager", test_mode: bool) -> None:
+        """Save residual montage, grids, and kpis.json for this run."""
+        if test_mode:
+            return
+        from src.engine.model_evaluation import (
+            EVAL_RESOLUTION,
+            N_PLOTS,
+            build_kpi_record,
+            evaluate_plasma_grids,
+            evaluate_plasma_kpis,
+            kpi_benchmark_configs,
+            plot_plasma_grid_montage,
+        )
+
+        run_dir = self.run_dir()
+        configs = kpi_benchmark_configs(manager, KPI_EVAL_CONFIGS)
+        kpis = evaluate_plasma_kpis(manager, configs, sample_size=KPI_POINTS_PER_CONFIG)
+        grids = evaluate_plasma_grids(
+            manager, configs[:N_PLOTS], resolution=EVAL_RESOLUTION, quantities=("residual",)
+        )
+        plot_plasma_grid_montage(
+            grids,
+            run_dir / "residual.png",
+            quantity="residual",
+            title=self.artifact_stem,
+            metadata=manager.config.to_dict(),
+            display_parameters=(
+                "huber_delta",
+                "learning_rate_max",
+                "n_fourier_features",
+                "lbfgs_steps",
+            ),
+            kpis=kpis,
+        )
+        record = build_kpi_record(manager, kpis, KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG, 0.85)
+        (run_dir / "kpis.json").write_text(json.dumps(record, indent=2) + "\n")
+        logger.info(f"residual plot saved to {run_dir}")
+
+    def save_training_curves(self, run_dir: Path, rows: list[dict], artifact_stem: str) -> None:
+        if not rows:
+            return
+        from src.engine.model_evaluation import plot_training_curves
+
+        plot_training_curves(
+            run_dir / "training.csv", run_dir / "training_curves.png", title=artifact_stem
+        )
+
+
 # --- Manager for Training / Inference ---
 class NetworkManager:
     # Optional consumer of finalized metrics-table rows (the HPO TUI appends them
@@ -417,12 +715,14 @@ class NetworkManager:
         test_mode: bool = False,
         output_dir: Path | None = None,
         name: str = "default",
+        *,
+        prior: FoundationModel | None = None,
+        scale: float = 1.0,
     ) -> None:
         self.config = config
         self.seed = seed
         self.n_validation_size = n_validation_size
         self.test_mode = test_mode
-        # None writes a flattened benchmark slug; HPO supplies its study dir.
         self.output_dir = output_dir
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
             raise ValueError(
@@ -440,7 +740,24 @@ class NetworkManager:
         self._validation_kpi_configs: list | None = None
         self.state = self._init_state()
 
-        self._psi_fn_jit = jax.jit(self.make_psi_fn())
+        # _Field owns the psi-function; for a corrector it closes over prior.params as a constant.
+        self._field = _Field(
+            self.model.apply,
+            soft_bc=config.soft_bc,
+            prior=prior,
+            scale=scale,
+        )
+        self._psi_fn = self._field.make_psi_fn()
+        self._psi_fn_jit = jax.jit(self._psi_fn)
+
+        # Corrector: if stage1_run_dir is not supplied at to_disk time it must be set externally.
+        self._prior = prior
+        self._scale = scale
+        self._files = _FileStorageManager(
+            name=name,
+            output_dir=output_dir,
+            is_corrector=prior is not None,
+        )
 
         self.train_set = self.sampler._get_sobol_sample(
             n_samples=self.config.n_train,
@@ -450,134 +767,86 @@ class NetworkManager:
         self.training_log: list[dict] = []
         self.artifact_stem: str | None = None
 
+        # Instance-level jitted train_step — closed over self._psi_fn so both the plain
+        # and composed cases use one kernel.  soft_bc must stay static (pinn_loss_function
+        # declares it static_argnames) so it is declared static here too.
+        self._train_step_jit = jax.jit(self._train_step, static_argnames=("soft_bc",))
+
+    @classmethod
+    def for_inference(
+        cls,
+        config: HyperParams,
+        params: any,
+        *,
+        prior: FoundationModel | None = None,
+        scale: float = 1.0,
+        seed: int = BASE_SEED,
+    ) -> "NetworkManager":
+        """Construct a minimal manager for inference only (no training artifacts needed).
+
+        Builds the full NetworkManager (sampler is needed by kpi_benchmark_configs /
+        build_sample_response) but skips any disk I/O. Params are injected directly.
+        """
+        mgr = cls(config, seed=seed, prior=prior, scale=scale)
+        mgr.state = mgr.state.replace(params=params)
+        return mgr
+
+    # ------------------------------------------------------------------
+    # Artifact stem / run-dir (delegates to _FileStorageManager)
+    # ------------------------------------------------------------------
+
     def _new_artifact_stem(self) -> str:
-        """Create a flat benchmark slug or an HPO-local trial stem."""
-        # Second resolution: fast runs (HPO --test trials take ~8s) collided at
-        # minute resolution and silently overwrote each other's artifacts.
-        # ponytail: same-second parallel runs on one machine would still collide.
-        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-        if self.output_dir:
-            return f"pinn_{timestamp}"
-        return f"{timestamp}_{self.name}_{current_commit()}"
+        return self._files.new_artifact_stem()
 
     def run_dir(self) -> Path:
-        """Return this manager's direct benchmark or HPO trial directory."""
-        if self.artifact_stem is None:
-            self.artifact_stem = self._new_artifact_stem()
-        base = self.output_dir or Filepaths.BENCHMARKS
-        return base / self.artifact_stem
+        stem = self._files.artifact_stem or self._files.new_artifact_stem()
+        self._files.artifact_stem = stem
+        self.artifact_stem = stem
+        return self._files.run_dir()
 
     def discard_unsaved_run(self) -> None:
-        """Delete the benchmark run dir unless this run's checkpoint was saved.
+        """Delete the benchmark run dir unless this run's checkpoint was saved."""
+        self._files.discard_unsaved_run()
 
-        A run dir exists iff its checkpoint was kept: --test, pruned, failed
-        and aborted runs leave nothing behind.
+    # ------------------------------------------------------------------
+    # Persistence
+    # ------------------------------------------------------------------
+
+    def to_disk(self, stage1_run_dir: Path | None = None) -> str:
+        """Save params, config, training CSV, and benchmark artifacts.
+
+        For a corrector pass ``stage1_run_dir`` to nest the stage-2 artifacts
+        under ``<stage1_run_dir>/stage2/``.  Also writes ``stage2_meta.json``.
         """
-        if self.artifact_stem is None:
-            return
-        run_dir = self.run_dir()
-        if (run_dir / "network.flax").exists():
-            return
-        shutil.rmtree(run_dir, ignore_errors=True)
-        if self.output_dir:
-            with suppress(OSError):
-                run_dir.parent.rmdir()
+        if self._files.artifact_stem is None:
+            self._files.artifact_stem = self._files.new_artifact_stem()
+        self.artifact_stem = self._files.artifact_stem
 
-    def to_disk(self) -> str:
-        if self.artifact_stem is None:
-            self.artifact_stem = self._new_artifact_stem()
+        if stage1_run_dir is not None:
+            self._files._is_corrector = True
+            self._files._stage1_run_dir = stage1_run_dir
 
-        run_dir = self.run_dir()
+        run_dir = self._files.run_dir()
         run_dir.mkdir(parents=True, exist_ok=True)
 
-        artifact_flax_path = run_dir / "network.flax"
-        artifact_json_path = run_dir / "config.json"
-        artifact_log_path = run_dir / "training.csv"
+        self._files.write_params(run_dir, self.state.params)
+        self._files.write_config(run_dir, self.config)
+        self._files.write_training_csv(run_dir, self.training_log)
 
-        artifact_flax_path.write_bytes(flax.serialization.to_bytes(self.state.params))
-        self.config.to_json(path=str(artifact_json_path))
+        if self._prior is not None:
+            self._files.write_stage2_meta(run_dir, self._scale)
 
-        if self.training_log:
-            with open(artifact_log_path, "w") as f:
-                f.write(
-                    "epoch,lr,moving_avg_loss,val_kpi_median,residual,boundary,grad_norm,epoch_time\n"
-                )
-                for entry in self.training_log:
-                    vl = (
-                        f"{entry['val_kpi_median']:.6f}"
-                        if entry["val_kpi_median"] is not None
-                        else ""
-                    )
-                    f.write(
-                        f"{entry['epoch']},{entry['lr']:.2e},{entry['moving_avg_loss']:.6f},"
-                        f"{vl},{entry['residual']:.6f},{entry['boundary']:.6f},"
-                        f"{entry['grad_norm']:.6f},{entry['epoch_time']:.4f}\n"
-                    )
-
-        self._benchmark_network()
-        self._save_training_curves_plot()
+        self._files.benchmark(self, self.test_mode)
+        self._files.save_training_curves(run_dir, self.training_log, self.artifact_stem)
         return self.artifact_stem
 
     def from_disk(self, pinn_path) -> any:  # noqa
         """Load Flax model parameters from disk."""
-        with open(pinn_path, "rb") as f:
-            return flax.serialization.from_bytes(self.state.params, f.read())
+        return self._files.read_params(pinn_path, self.state.params)
 
-    def _benchmark_network(self) -> None:
-        """Save the residual montage, grids and kpis.json for this run."""
-        if self.test_mode:
-            return
-        # model_evaluation imports NetworkManager from this module,
-        # so a top-level import here would be circular.
-        from src.engine.model_evaluation import (
-            EVAL_RESOLUTION,
-            N_PLOTS,
-            build_kpi_record,
-            evaluate_plasma_grids,
-            evaluate_plasma_kpis,
-            kpi_benchmark_configs,
-            plot_plasma_grid_montage,
-        )
-
-        configs = kpi_benchmark_configs(self, KPI_EVAL_CONFIGS)
-
-        kpis = evaluate_plasma_kpis(self, configs, sample_size=KPI_POINTS_PER_CONFIG)
-        grids = evaluate_plasma_grids(
-            self, configs[:N_PLOTS], resolution=EVAL_RESOLUTION, quantities=("residual",)
-        )
-        run_dir = self.run_dir()
-
-        plot_plasma_grid_montage(
-            grids,
-            run_dir / "residual.png",
-            quantity="residual",
-            title=self.artifact_stem,
-            metadata=self.config.to_dict(),
-            display_parameters=(
-                "huber_delta",
-                "learning_rate_max",
-                "n_fourier_features",
-                "lbfgs_steps",
-            ),
-            kpis=kpis,
-        )
-
-        # Store KPIs as valid JSON (indent=2 for terminal readability).
-        record = build_kpi_record(self, kpis, KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG, 0.85)
-        (run_dir / "kpis.json").write_text(json.dumps(record, indent=2) + "\n")
-
-        logger.info(f"residual plot saved to {run_dir}")
-
-    def _save_training_curves_plot(self) -> None:
-        """Loss/val-loss + LR/grad-norm overview, straight from training.csv."""
-        if self.test_mode or not self.training_log:
-            return
-        from src.engine.model_evaluation import plot_training_curves
-
-        run_dir = self.run_dir()
-        plot_training_curves(
-            run_dir / "training.csv", run_dir / "training_curves.png", title=self.artifact_stem
-        )
+    # ------------------------------------------------------------------
+    # Training internals
+    # ------------------------------------------------------------------
 
     def _init_state(self) -> train_state.TrainState:
         """Initialize the training state with dummy data."""
@@ -616,16 +885,19 @@ class NetworkManager:
     @staticmethod
     def compute_loss(
         params: any,
-        apply_fn: Callable,
+        psi_fn: Callable,
         inputs: FluxInput,
         weight_boundary_condition: float,
         huber_delta: float,
         weight_flux_scale: float,
         soft_bc: bool,
     ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-        """Pure function to compute physics loss. Reusable for both training and evaluation."""
-        psi_fn = functools.partial(apply_psi_fn, apply_fn, soft_bc=soft_bc)
+        """Pure function to compute physics loss given an explicit psi_fn.
 
+        ``psi_fn`` is ``(params, R, Z, cfg) -> psi``.  For a plain network pass
+        ``functools.partial(apply_psi_fn, apply_fn, soft_bc=soft_bc)``; for a
+        corrector pass the composed fn from ``_Field.make_psi_fn()``.
+        """
         total, l_res, l_dir, l_per_cfg = pinn_loss_function(
             psi_fn,
             params,
@@ -650,9 +922,10 @@ class NetworkManager:
         soft_bc: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Fast, gradient-free evaluation step returning all loss components."""
+        psi_fn = functools.partial(apply_psi_fn, state.apply_fn, soft_bc=soft_bc)
         total, (l_res, l_dir, l_per_cfg) = NetworkManager.compute_loss(
             state.params,
-            state.apply_fn,
+            psi_fn,
             inputs,
             weight_boundary_condition,
             huber_delta,
@@ -671,8 +944,6 @@ class NetworkManager:
         separately-seeded sampler yields subtly different boundaries for the same
         domain vectors.
         """
-        # model_evaluation imports NetworkManager from this module — lazy import avoids
-        # the circular dependency at module load time.
         from src.engine.model_evaluation import kpi_benchmark_configs
 
         if self._validation_kpi_configs is None:
@@ -680,21 +951,15 @@ class NetworkManager:
         return self._validation_kpi_configs
 
     def _calculate_validation_kpi(self) -> float:
-        """Median |R_GS| over the fixed validation configs at KPI_POINTS_PER_CONFIG.
-
-        Runs the FULL global protocol, so when n_validation_size equals
-        KPI_EVAL_CONFIGS the tracked val_kpi_median matches kpis.json's
-        loss_median exactly.
-        """
+        """Median |R_GS| over the fixed validation configs at KPI_POINTS_PER_CONFIG."""
         from src.engine.model_evaluation import evaluate_plasma_kpis
 
         return evaluate_plasma_kpis(
             self, self.validation_configs(), sample_size=KPI_POINTS_PER_CONFIG
         )["loss_median"]
 
-    @staticmethod
-    @partial(jax.jit, static_argnames=("soft_bc",))
-    def train_step(
+    def _train_step(
+        self,
         state: train_state.TrainState,
         inputs: FluxInput,
         weight_boundary_condition: float,
@@ -704,14 +969,16 @@ class NetworkManager:
     ) -> tuple[
         train_state.TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray
     ]:
-        """Perform a single training step using physics-informed gradients."""
+        """Single training step; closed over self._psi_fn so plain/corrector share one kernel."""
+        psi_fn = self._psi_fn
 
+        @jax.checkpoint
         def loss_wrapper(
             params: any,
         ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
             return NetworkManager.compute_loss(
                 params,
-                state.apply_fn,
+                psi_fn,
                 inputs,
                 weight_boundary_condition,
                 huber_delta,
@@ -740,13 +1007,13 @@ class NetworkManager:
         for i in range(0, len(self.train_set), self.config.batch_size):
             train_batch = self.train_set[i : i + self.config.batch_size]
             inputs = self.sampler.sample_flux_input(plasma_configs=train_batch)
-            self.state, loss, l_res, l_dir, per_config_loss, b_grad_norm = self.train_step(
-                state=self.state,
-                inputs=inputs,
-                weight_boundary_condition=self.config.weight_boundary_condition,
-                huber_delta=self.config.huber_delta,
-                weight_flux_scale=self.config.weight_flux_scale,
-                soft_bc=self.config.soft_bc,
+            self.state, loss, l_res, l_dir, per_config_loss, b_grad_norm = self._train_step_jit(
+                self.state,
+                inputs,
+                self.config.weight_boundary_condition,
+                self.config.huber_delta,
+                self.config.weight_flux_scale,
+                self.config.soft_bc,
             )
             all_losses.append(per_config_loss)
             grad_norms.append(b_grad_norm)
@@ -762,132 +1029,9 @@ class NetworkManager:
 
         return float(loss), float(l_res), float(l_dir), avg_grad_norm
 
-    @staticmethod
-    def _new_table() -> Table:
-        table = Table(title="Training Metrics", show_header=True, header_style="bold cyan")
-        table.add_column("Epoch", justify="right", style="cyan")
-        table.add_column("LR", justify="right", style="yellow")
-        table.add_column("||∇L||", justify="right", style="magenta")
-        table.add_column("Loss", justify="right", style="magenta")
-        table.add_column("Val KPI", justify="right", style="green")
-        table.add_column("Time/Ep", justify="right")
-        return table
-
-    def _init_metrics_display(self) -> None:
-        """Set up Rich table, progress bar, and accumulators for the training display."""
-        # ponytail: fixed-size rolling window, not the full history — an unbounded table
-        # eventually taller than the terminal desyncs Rich's cursor-based redraw, corrupting
-        # the display whenever the user scrolls
-        self._table_rows: deque[tuple[str, ...]] = deque(maxlen=LIVE_TABLE_MAX_ROWS)
-        self._table = self._new_table()
-
-        self._progress = Progress(
-            TextColumn("[bold cyan]{task.description}"),
-            BarColumn(style="cyan", complete_style="bold cyan"),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            console=console,
-            transient=False,
-        )
-        self._epoch_task = self._progress.add_task("Training", total=self.epochs)
-
-        self._accumulated_loss = 0.0
-        self._accumulated_residual = 0.0
-        self._accumulated_boundary = 0.0
-        self._accumulated_grad_norm = 0.0
-        self._accumulated_time = 0.0
-
     def training_renderable(self) -> Panel:
         """Current metrics table + progress bar; rendered by Live or the HPO TUI."""
-        return Panel(Group(self._table, self._progress), border_style="cyan")
-
-    def _init_live_display(self) -> Live:
-        self._init_metrics_display()
-        return Live(
-            self.training_renderable(),
-            refresh_per_second=10,
-            console=console,
-            vertical_overflow="visible",
-        )
-
-    def _log_metric(
-        self,
-        epoch: int,
-        loss: float,
-        residual: float,
-        boundary: float,
-        val_kpi_median: float | None,
-        lr: float,
-        grad_norm: float,
-        epoch_time: float,
-    ) -> None:
-        self._accumulated_loss += loss
-        self._accumulated_residual += residual
-        self._accumulated_boundary += boundary
-        self._accumulated_grad_norm += grad_norm
-        self._accumulated_time += epoch_time
-
-        if (epoch + 1) % LOG_FREQUENCY == 0:
-            moving_avg_loss = self._accumulated_loss / LOG_FREQUENCY
-            moving_avg_residual = self._accumulated_residual / LOG_FREQUENCY
-            moving_avg_boundary = self._accumulated_boundary / LOG_FREQUENCY
-            moving_avg_grad_norm = self._accumulated_grad_norm / LOG_FREQUENCY
-            moving_avg_time = self._accumulated_time / LOG_FREQUENCY
-
-            self.training_log.append(
-                {
-                    "epoch": epoch + 1,
-                    "lr": lr,
-                    "moving_avg_loss": moving_avg_loss,
-                    "val_kpi_median": val_kpi_median,
-                    "residual": moving_avg_residual,
-                    "boundary": moving_avg_boundary,
-                    "grad_norm": moving_avg_grad_norm,
-                    "epoch_time": moving_avg_time,
-                }
-            )
-
-            row = _metrics_row(
-                epoch=epoch + 1,
-                total_epochs=self.epochs,
-                lr=lr,
-                grad_norm=moving_avg_grad_norm,
-                loss=moving_avg_loss,
-                val_kpi_median=val_kpi_median,
-                epoch_time=moving_avg_time,
-            )
-            self._table_rows.append(row)
-            if self.metrics_row_sink is not None:
-                self.metrics_row_sink(row)
-            # build fully, then swap: the TUI thread may render self._table mid-update
-            table = self._new_table()
-            for row in self._table_rows:
-                table.add_row(*row)
-            self._table = table
-
-            self._accumulated_loss = 0.0
-            self._accumulated_residual = 0.0
-            self._accumulated_boundary = 0.0
-            self._accumulated_grad_norm = 0.0
-            self._accumulated_time = 0.0
-        else:
-            count = (epoch + 1) % LOG_FREQUENCY
-            self.training_log.append(
-                {
-                    "epoch": epoch + 1,
-                    "lr": lr,
-                    "moving_avg_loss": self._accumulated_loss / count,
-                    "val_kpi_median": val_kpi_median,
-                    "residual": self._accumulated_residual / count,
-                    "boundary": self._accumulated_boundary / count,
-                    "grad_norm": self._accumulated_grad_norm / count,
-                    "epoch_time": self._accumulated_time / count,
-                }
-            )
-
-        self._progress.update(self._epoch_task, advance=1)
-        if self._live is not None:
-            self._live.update(self.training_renderable())
+        return self._metrics.renderable()
 
     def train(
         self,
@@ -895,11 +1039,11 @@ class NetworkManager:
         validation_callback: Callable[[int, float | None], None] | None = None,
         show_progress: bool = True,
     ) -> float:
-        self.artifact_stem = self._new_artifact_stem()
-        run_dir = self.run_dir()
+        self._files.artifact_stem = self._files.new_artifact_stem()
+        self.artifact_stem = self._files.artifact_stem
+        run_dir = self._files.run_dir()
         run_dir.mkdir(parents=True, exist_ok=True)
-        # Full per-run log file; DEBUG epoch lines land here but not on the
-        # Rich console handler (which stays at INFO next to the live table).
+
         file_handler = logging.FileHandler(run_dir / "train.log")
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
@@ -909,18 +1053,23 @@ class NetworkManager:
         logger.debug(f"run {self.artifact_stem} hyperparams: {self.config.to_dict()}")
 
         try:
-            # Metrics (table + training_log CSV) are always tracked; Live only owns the
-            # terminal in CLI mode. The HPO TUI renders training_renderable() itself.
+            self._metrics = _MetricsManager(total_epochs=self.epochs)
+            self._metrics.metrics_row_sink = self.metrics_row_sink
             self._live = None
             if show_progress:
-                live = self._init_live_display()
+                live = Live(
+                    self.training_renderable(),
+                    refresh_per_second=10,
+                    console=console,
+                    vertical_overflow="visible",
+                )
             else:
-                self._init_metrics_display()
                 live = nullcontext()
             val_kpi_median = None
             with live as active_live:
                 if show_progress:
                     self._live = active_live
+                    self._metrics._live = active_live
                 for epoch in range(self.epochs):
                     start_time = time.perf_counter()
                     loss, residual, boundary, grad_norm = self.train_epoch(epoch)
@@ -933,7 +1082,7 @@ class NetworkManager:
                         validation_callback(epoch + 1, val_kpi_median)
 
                     lr = float(self._lr_schedule(self.state.step))
-                    self._log_metric(
+                    self._metrics.log(
                         epoch, loss, residual, boundary, val_kpi_median, lr, grad_norm, epoch_time
                     )
 
@@ -946,8 +1095,11 @@ class NetworkManager:
             logger.debug(f"run {self.artifact_stem} final val_kpi_median={val_kpi_median:.3f}")
             with open(run_dir / "train.log", "a", encoding="utf-8") as log_f:
                 Console(file=log_f, width=100, color_system=None).print(
-                    Panel(self._table, border_style="cyan")
+                    Panel(self._metrics._table, border_style="cyan")
                 )
+
+            # Expose training_log for backward compat (to_disk, HPO, etc.)
+            self.training_log = self._metrics.rows
 
             if save_to_disk:
                 self.to_disk()
@@ -958,21 +1110,16 @@ class NetworkManager:
             logger.setLevel(previous_level)
 
     def lbfgs(self, steps: int) -> None:
-        """Polish AdamW-trained params with L-BFGS on one fixed batch.
-
-        Classic PINN two-stage optimization. Full-batch L-BFGS does not fit in
-        VRAM, so this uses a single fixed training batch — same memory
-        footprint as one train_step. ponytail: fixed-batch polish can overfit
-        those configs; the held-out KPI eval is the guard.
-        """
+        """Polish AdamW-trained params with L-BFGS on one fixed batch."""
         self.sampler.precompute_coordinate_samples()
         batch = self.train_set[: self.config.batch_size]
         inputs = self.sampler.sample_flux_input(plasma_configs=batch)
+        psi_fn = self._psi_fn
 
         def loss_fn(params: any) -> jnp.ndarray:
             total, _ = NetworkManager.compute_loss(
                 params,
-                self.state.apply_fn,
+                psi_fn,
                 inputs,
                 self.config.weight_boundary_condition,
                 self.config.huber_delta,
@@ -1000,37 +1147,28 @@ class NetworkManager:
         self.state = self.state.replace(params=params)
 
     def get_psi(self, R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig) -> jnp.ndarray:
-        """Evaluate magnetic flux psi at physical coordinates.
-
-        Convenience method for inference and visualization. Uses pre-compiled
-        psi function from initialization. Handles input normalization and output
-        denormalization internally.
-
-        Args:
-            R: Batch of major radial coordinates [m]
-            Z: Batch of vertical coordinates [m]
-            config: Plasma geometry and state parameters
-
-        Returns:
-            Array of flux values in Weber
-        """
+        """Evaluate magnetic flux psi at physical coordinates."""
         return self._psi_fn_jit(self.state.params, R, Z, config)
 
+    @staticmethod
+    def _new_table() -> Table:
+        """Training Metrics table skeleton; kept as a static method for HPO TUI compat."""
+        return _new_table()
+
     def make_psi_fn(self) -> Callable[[any, jnp.ndarray, jnp.ndarray, PlasmaConfig], jnp.ndarray]:
-        """Factory returning a psi function bound to this network instance.
+        """Factory returning the psi function for this field (single or composed)."""
+        return self._field.make_psi_fn()
 
-        This pattern is necessary due to JAX's functional paradigm, that requires stateless
-        pure functions. The closure captures network state (apply_fn), providing a
-        stateful callable interface while maintaining JIT compatibility.
 
-        Returns:
-            Callable[(params, R, Z, config) -> psi] for physics calculations.
-        """
-        return functools.partial(
-            apply_psi_fn,
-            self.model.apply,
-            soft_bc=self.config.soft_bc,
-        )
+def _new_table() -> Table:
+    table = Table(title="Training Metrics", show_header=True, header_style="bold cyan")
+    table.add_column("Epoch", justify="right", style="cyan")
+    table.add_column("LR", justify="right", style="yellow")
+    table.add_column("||∇L||", justify="right", style="magenta")
+    table.add_column("Loss", justify="right", style="magenta")
+    table.add_column("Val KPI", justify="right", style="green")
+    table.add_column("Time/Ep", justify="right")
+    return table
 
 
 def _metrics_row(
@@ -1042,11 +1180,7 @@ def _metrics_row(
     val_kpi_median: float | None,
     epoch_time: float,
 ) -> tuple[str, ...]:
-    """One Training Metrics table row; shared by the live display and show_run replay.
-
-    Loss alone (no residual/boundary breakdown) — both stay in training.csv for
-    post-hoc analysis, this table is just the terminal-width-constrained live view.
-    """
+    """One Training Metrics table row; shared by the live display and show_run replay."""
     return (
         f"{epoch}/{total_epochs}",
         f"{lr:.2e}",
@@ -1058,10 +1192,7 @@ def _metrics_row(
 
 
 def show_run(run: str) -> None:
-    """Re-render the Training Metrics table for a stored run from training.csv.
-
-    Accepts a run dir path, a flat benchmark slug, or a bare HPO trial stem.
-    """
+    """Re-render the Training Metrics table for a stored run from training.csv."""
     run_dir = Path(run)
     if not run_dir.is_dir():
         candidates = [
@@ -1077,13 +1208,10 @@ def show_run(run: str) -> None:
     with open(csv_path) as f:
         rows = list(csv.DictReader(f))
     total_epochs = int(rows[-1]["epoch"])
-    table = NetworkManager._new_table()
-    # New CSVs have val_kpi_median; fall back to val_loss for legacy files.
+    table = _new_table()
     val_col = "val_kpi_median" if "val_kpi_median" in rows[0] else "val_loss"
     for r in rows:
         epoch = int(r["epoch"])
-        # replay exactly what the live table showed: every LOG_FREQUENCY-th
-        # epoch (full moving average), plus the final partial row if any
         if epoch % LOG_FREQUENCY != 0 and epoch != total_epochs:
             continue
         table.add_row(
