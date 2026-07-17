@@ -11,7 +11,8 @@ src/
 │   └── schemas.py                # Pydantic request models (GeometryRequest, SampleRequest, ...)
 │
 ├── engine/
-│   ├── network.py              # FluxPINN model, Sampler, NetworkManager (train/infer/save/load)
+│   ├── network.py              # FluxPINN model, Sampler; NetworkManager facade (train/infer/save/load) + FoundationModel (frozen prior for multistage correction); private collaborators: _Field (psi-fn, single or composed psi1+scale·psi2), _MetricsManager (Rich table/progress/training_log), _FileStorageManager (run dir + artifact I/O incl. nested stage2/ layout). Loss seam: compute_loss/train_step take a psi_fn. NetworkManager(config, prior=FoundationModel(...), scale=...) builds a corrector; for_inference classmethod for lean querying.
+│   ├── residual_correction.py  # Corrector CLI + load_combined(name) → composed NetworkManager (FoundationModel prior). No manager classes — corrector is now a NetworkManager construction option.
 │   ├── physics.py              # GS operator, loss functions, B-field computation via AD
 │   ├── plasma.py               # Parametric boundary → 3D FusionPlasma; point-in-plasma test
 │   ├── model_evaluation.py     # Shared grids, Sobol residual KPIs, configurable Matplotlib montages
@@ -103,6 +104,7 @@ data_legacy/                     # Pre-consolidation dump (data/, networks/, tor
 | `ToroidalCoil3D` | geometry_config.py | Inner/outer/cap surface arrays |
 | `FluxInput` | network_config.py | Batched (B, N) R-Z + config PyTree |
 | `HyperParams` | network_config.py | All training hyperparameters |
-| `NetworkManager` | network.py | Stateful wrapper: model + state + sampler |
+| `NetworkManager` | network.py | Facade: model + state + sampler; accepts optional `FoundationModel` prior to act as a multistage corrector |
+| `FoundationModel` | network.py | Frozen dataclass: converged FluxPINN + params; used as prior for residual-correction stage 2 |
 | Pydantic req models | `src/api/schemas.py` | `GeometryRequest`, `SampleRequest`, `GridRequest`, `BFieldRequest`, `RenameRequest`, `BenchmarkRequest`, `CoilConfigIn` |
 | API response interfaces | `frontend/src/api.ts` | `SampleResponse`, `Grid2D`, `GeometryResponse`, `FieldLinesResponse`, `SurfaceGrid`, `BenchmarkEvent` (SSE union) |

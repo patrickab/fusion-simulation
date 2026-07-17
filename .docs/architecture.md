@@ -72,7 +72,7 @@ Vite dev server proxies `/api` → `127.0.0.1:8010` (matches `run-webapp.sh`). B
 ## Neural Network (`src/engine/network.py`)
 - **FluxPINN**: MLP with Swish activations. Input: 10 normalized scalars (r, z, r₀, a, κ, δ, p₀, F_axis, α, γ). Output: scalar ψ̂.
 - **Sampler**: Sobol quasi-random sequences for collocation points; 50% Sobol + 50% adaptive (focus on high-loss regions). Geometries resampled every 10 epochs.
-- **NetworkManager**: wraps model init, training loop, I/O. Saves `network.flax` + `config.json` + `training.csv` + `train.log` per run dir (`data/benchmarks/<commit>/<run>/`), tagged with git commit hash (parent dir).
+- **NetworkManager**: facade over private collaborators `_Field` (owns the psi-fn; single net or composed `psi1 + scale·psi2`), `_MetricsManager` (Rich table/progress/training_log rows), and `_FileStorageManager` (run dir + all artifact I/O, incl. nested `stage2/` layout). Accepts an optional `FoundationModel` frozen prior to act as a multistage corrector (`NetworkManager(config, prior=FoundationModel(...), scale=...)`); `for_inference` classmethod for lean querying. Loss seam: `compute_loss`/`train_step` take a `psi_fn`. Saves `network.flax` + `config.json` + `training.csv` + `train.log` per run dir.
 - **Optimizer**: AdamW with warmup cosine decay schedule.
 - **Replay**: `uv run python -m src.engine.network --show <commit/run>` re-renders the Rich Training Metrics table for a stored run from its `training.csv` (accepts a dir path or bare `pinn_<timestamp>` too).
 

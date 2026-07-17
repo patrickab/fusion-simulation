@@ -78,6 +78,9 @@ reports — not yet confirmed installed.
   todo.md are on the old TF32 scale and not comparable. The O-point tail
   shape survives the fix, but absolute targets in todo.md need rebasing.
 
+## Corrector unified into NetworkManager (2026-07-17)
+`ResidualCorrectionManager`, `CombinedManager`, and `make_correction_psi_fn` are deleted. Multistage residual correction is now a `NetworkManager` construction option: `NetworkManager(config, prior=FoundationModel(...), scale=...)` builds a corrector whose `_Field` composes `psi1 + scale·psi2`. `load_combined(name)` in `src/engine/residual_correction.py` returns a composed `NetworkManager` directly. The parallel manager hierarchy is gone; `residual_correction.py` is now only the corrector CLI plus `load_combined`.
+
 ## Open threads (each has a root-level handoff note)
 - **`todo.md` — near-floor HPO plan**, in priority order: (1) relative
   per-config residual in `evaluate_plasma_kpis` so the median measures fit

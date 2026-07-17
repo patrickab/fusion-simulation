@@ -111,7 +111,10 @@ def network_kpis(name: str) -> dict:
         run_dir = resolve_run_directory(name)
     except FileNotFoundError:
         raise HTTPException(404, f"Run dir not found: {name}") from None
-    kpis_path = run_dir / "kpis.json"
+    # Prefer the composed-field KPIs when a corrector exists, so the reported
+    # metrics match the field get_manager() renders for this run.
+    stage2_kpis = run_dir / "stage2" / "kpis.json"
+    kpis_path = stage2_kpis if stage2_kpis.exists() else run_dir / "kpis.json"
     if not kpis_path.exists():
         raise HTTPException(404, f"No KPIs stored for {name}")
     return json.loads(kpis_path.read_text())
