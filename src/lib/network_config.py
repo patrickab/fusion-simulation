@@ -49,6 +49,11 @@ class HyperParams(BaseModel):
     # as n_fourier_features: old config.json files without this field deserialize to False,
     # i.e. plain Dense, and saved params remain loadable).
     rwf: bool = False
+    # Network architecture: "mlp" = plain MLP (default, existing behaviour), "piratenet" =
+    # PirateNet residual blocks (arXiv 2402.00326, eq. 4.1-4.7). Default must stay "mlp"
+    # for checkpoint compat — "piratenet" changes the params tree (same constraint as
+    # n_fourier_features/rwf: old config.json without this field deserializes to "mlp").
+    arch: str = "mlp"
     sigma_residual_adaptive_sampling: float = 0.05
     batch_size: int = 64
     n_rz_inner_samples: int = 512
