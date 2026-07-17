@@ -358,6 +358,7 @@ class NetworkManager:
         )
         self.sampler: Sampler = Sampler(config, seed=self.seed)
         self._validation_sampler: Sampler | None = None
+        self._validation_kpi_configs: list | None = None
         self.state = self._init_state()
 
         self._psi_fn_jit = jax.jit(self.make_psi_fn())
@@ -420,10 +421,14 @@ class NetworkManager:
         if self.training_log:
             with open(artifact_log_path, "w") as f:
                 f.write(
-                    "epoch,lr,moving_avg_loss,val_loss,residual,boundary,grad_norm,epoch_time\n"
+                    "epoch,lr,moving_avg_loss,val_kpi_median,residual,boundary,grad_norm,epoch_time\n"
                 )
                 for entry in self.training_log:
-                    vl = f"{entry['val_loss']:.6f}" if entry["val_loss"] is not None else ""
+                    vl = (
+                        f"{entry['val_kpi_median']:.6f}"
+                        if entry["val_kpi_median"] is not None
+                        else ""
+                    )
                     f.write(
                         f"{entry['epoch']},{entry['lr']:.2e},{entry['moving_avg_loss']:.6f},"
                         f"{vl},{entry['residual']:.6f},{entry['boundary']:.6f},"
@@ -446,6 +451,7 @@ class NetworkManager:
         # model_evaluation imports NetworkManager from this module,
         # so a top-level import here would be circular.
         from src.engine.model_evaluation import (
+            DEFAULT_KPI_SAMPLE_SIZE,
             EVAL_RESOLUTION,
             KPI_CONFIG_COUNT,
             N_PLOTS,
@@ -456,7 +462,9 @@ class NetworkManager:
         )
 
         lower, upper = DomainBounds.get_bounds()
-        sobol = qmc.Sobol(d=len(lower), scramble=True, seed=BASE_SEED + 200)
+        # Same domain-Sobol stream as the eval CLI and validation configs (BASE_SEED + 123),
+        # so tracked KPI / kpis.json / CLI re-eval agree up to config count.
+        sobol = qmc.Sobol(d=len(lower), scramble=True, seed=BASE_SEED + 123)
         val_configs = jnp.array(
             qmc.scale(sobol.random(KPI_CONFIG_COUNT), np.asarray(lower), np.asarray(upper)),
             dtype=jnp.float32,
@@ -464,7 +472,7 @@ class NetworkManager:
         inputs = self.sampler.sample_flux_input(plasma_configs=val_configs)
         configs = [inputs.config[i] for i in range(KPI_CONFIG_COUNT)]
 
-        kpis = evaluate_plasma_kpis(self, configs, sample_size=4096)
+        kpis = evaluate_plasma_kpis(self, configs, sample_size=DEFAULT_KPI_SAMPLE_SIZE)
         grids = evaluate_plasma_grids(
             self, configs[:N_PLOTS], resolution=EVAL_RESOLUTION, quantities=("residual",)
         )
@@ -486,7 +494,7 @@ class NetworkManager:
         )
 
         # Store KPIs as valid JSON (indent=2 for terminal readability).
-        record = build_kpi_record(self, kpis, KPI_CONFIG_COUNT, 4096, 0.85)
+        record = build_kpi_record(self, kpis, KPI_CONFIG_COUNT, DEFAULT_KPI_SAMPLE_SIZE, 0.85)
         (run_dir / "kpis.json").write_text(json.dumps(record, indent=2) + "\n")
 
         logger.info(f"residual plot saved to {run_dir}")
@@ -605,29 +613,26 @@ class NetworkManager:
         configs = jnp.array(self._create_validation_configs(), dtype=jnp.float32)
         return self._ensure_validation_sampler().sample_flux_input(plasma_configs=configs)
 
-    def _calculate_validation_loss(self, val_configs: np.ndarray) -> float:
-        """Calculate validation loss using gradient-free eval_step."""
-        chunk_size = 128
-        total_loss = 0.0
-        n_chunks = 0
-        sampler = self._ensure_validation_sampler()
+    def _calculate_validation_kpi(self) -> float:
+        """Median |R_GS| over the manager's fixed validation configs at TRACKING_KPI_SAMPLE_SIZE.
 
-        for i in range(0, len(val_configs), chunk_size):
-            end = min(i + chunk_size, len(val_configs))
-            batch = jnp.array(val_configs[i:end], dtype=jnp.float32)
-            inputs = sampler.sample_flux_input(plasma_configs=batch)
-            loss, _, _, _ = self.eval_step(
-                self.state,
-                inputs,
-                self.config.weight_boundary_condition,
-                self.config.huber_delta,
-                self.config.weight_flux_scale,
-                self.config.soft_bc,
-            )
-            total_loss += float(loss)
-            n_chunks += 1
+        Replaces the old chunked eval_step composite-loss path: the training-time
+        validation metric is now the same quantity (median |R_GS|) as the post-training
+        kpis.json and the HPO ranking score, just at a smaller sample budget.
+        model_evaluation imports network, so this uses a lazy import (same pattern as
+        _benchmark_network).
+        """
+        # model_evaluation imports NetworkManager from this module — lazy import avoids
+        # the circular dependency at module load time.
+        from src.engine.model_evaluation import TRACKING_KPI_SAMPLE_SIZE, evaluate_plasma_kpis
 
-        return total_loss / n_chunks
+        if self._validation_kpi_configs is None:
+            configs = jnp.array(self._create_validation_configs(), dtype=jnp.float32)
+            inputs = self._ensure_validation_sampler().sample_flux_input(plasma_configs=configs)
+            self._validation_kpi_configs = list(inputs.config)
+        return evaluate_plasma_kpis(
+            self, self._validation_kpi_configs, sample_size=TRACKING_KPI_SAMPLE_SIZE
+        )["loss_median"]
 
     @staticmethod
     @partial(jax.jit, static_argnames=("soft_bc",))
@@ -706,7 +711,7 @@ class NetworkManager:
         table.add_column("LR", justify="right", style="yellow")
         table.add_column("||∇L||", justify="right", style="magenta")
         table.add_column("Loss", justify="right", style="magenta")
-        table.add_column("Val Loss", justify="right", style="green")
+        table.add_column("Val KPI", justify="right", style="green")
         table.add_column("Time/Ep", justify="right")
         return table
 
@@ -753,7 +758,7 @@ class NetworkManager:
         loss: float,
         residual: float,
         boundary: float,
-        val_loss: float | None,
+        val_kpi_median: float | None,
         lr: float,
         grad_norm: float,
         epoch_time: float,
@@ -776,7 +781,7 @@ class NetworkManager:
                     "epoch": epoch + 1,
                     "lr": lr,
                     "moving_avg_loss": moving_avg_loss,
-                    "val_loss": val_loss,
+                    "val_kpi_median": val_kpi_median,
                     "residual": moving_avg_residual,
                     "boundary": moving_avg_boundary,
                     "grad_norm": moving_avg_grad_norm,
@@ -790,7 +795,7 @@ class NetworkManager:
                 lr=lr,
                 grad_norm=moving_avg_grad_norm,
                 loss=moving_avg_loss,
-                val_loss=val_loss,
+                val_kpi_median=val_kpi_median,
                 epoch_time=moving_avg_time,
             )
             self._table_rows.append(row)
@@ -814,7 +819,7 @@ class NetworkManager:
                     "epoch": epoch + 1,
                     "lr": lr,
                     "moving_avg_loss": self._accumulated_loss / count,
-                    "val_loss": val_loss,
+                    "val_kpi_median": val_kpi_median,
                     "residual": self._accumulated_residual / count,
                     "boundary": self._accumulated_boundary / count,
                     "grad_norm": self._accumulated_grad_norm / count,
@@ -854,8 +859,7 @@ class NetworkManager:
             else:
                 self._init_metrics_display()
                 live = nullcontext()
-            val_configs = self._create_validation_configs()
-            val_loss = None
+            val_kpi_median = None
             with live as active_live:
                 if show_progress:
                     self._live = active_live
@@ -864,24 +868,24 @@ class NetworkManager:
                     loss, residual, boundary, grad_norm = self.train_epoch(epoch)
                     epoch_time = time.perf_counter() - start_time
 
-                    val_loss = None
+                    val_kpi_median = None
                     if (epoch + 1) % VALIDATION_FREQUENCY == 0:
-                        val_loss = self._calculate_validation_loss(val_configs)
+                        val_kpi_median = self._calculate_validation_kpi()
                     if validation_callback is not None:
-                        validation_callback(epoch + 1, val_loss)
+                        validation_callback(epoch + 1, val_kpi_median)
 
                     lr = float(self._lr_schedule(self.state.step))
                     self._log_metric(
-                        epoch, loss, residual, boundary, val_loss, lr, grad_norm, epoch_time
+                        epoch, loss, residual, boundary, val_kpi_median, lr, grad_norm, epoch_time
                     )
 
             if self.config.lbfgs_steps > 0:
                 self.lbfgs(self.config.lbfgs_steps)
-                val_loss = self._calculate_validation_loss(val_configs)
+                val_kpi_median = self._calculate_validation_kpi()
 
-            if val_loss is None:
-                val_loss = self._calculate_validation_loss(val_configs)
-            logger.debug(f"run {self.artifact_stem} final val_loss={val_loss:.3f}")
+            if val_kpi_median is None:
+                val_kpi_median = self._calculate_validation_kpi()
+            logger.debug(f"run {self.artifact_stem} final val_kpi_median={val_kpi_median:.3f}")
             with open(run_dir / "train.log", "a", encoding="utf-8") as log_f:
                 Console(file=log_f, width=100, color_system=None).print(
                     Panel(self._table, border_style="cyan")
@@ -889,7 +893,7 @@ class NetworkManager:
 
             if save_to_disk:
                 self.to_disk()
-            return val_loss
+            return val_kpi_median
         finally:
             logger.removeHandler(file_handler)
             file_handler.close()
@@ -977,7 +981,7 @@ def _metrics_row(
     lr: float,
     grad_norm: float,
     loss: float,
-    val_loss: float | None,
+    val_kpi_median: float | None,
     epoch_time: float,
 ) -> tuple[str, ...]:
     """One Training Metrics table row; shared by the live display and show_run replay.
@@ -990,7 +994,7 @@ def _metrics_row(
         f"{lr:.2e}",
         f"{grad_norm:.2e}",
         f"{loss:.2e}",
-        f"{val_loss:.2e}" if val_loss is not None else "-",
+        f"{val_kpi_median:.2e}" if val_kpi_median is not None else "-",
         f"{epoch_time:.2f}s",
     )
 
@@ -1016,6 +1020,8 @@ def show_run(run: str) -> None:
         rows = list(csv.DictReader(f))
     total_epochs = int(rows[-1]["epoch"])
     table = NetworkManager._new_table()
+    # New CSVs have val_kpi_median; fall back to val_loss for legacy files.
+    val_col = "val_kpi_median" if "val_kpi_median" in rows[0] else "val_loss"
     for r in rows:
         epoch = int(r["epoch"])
         # replay exactly what the live table showed: every LOG_FREQUENCY-th
@@ -1029,7 +1035,7 @@ def show_run(run: str) -> None:
                 lr=float(r["lr"]),
                 grad_norm=float(r["grad_norm"]),
                 loss=float(r["moving_avg_loss"]),
-                val_loss=float(r["val_loss"]) if r["val_loss"] else None,
+                val_kpi_median=float(r[val_col]) if r[val_col] else None,
                 epoch_time=float(r["epoch_time"]),
             )
         )

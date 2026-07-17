@@ -3,7 +3,9 @@
 Searches over network architecture (width x depth), learning rate schedule,
 weight decay, and adaptive-sampling sigma. Each trial trains a network and
 is ranked by a fused validation score: median + beta*p95 of |R_GS| over a
-held-out set. Hyperband pruning uses the cheaper per-epoch val_loss.
+held-out set. Hyperband pruning uses the per-epoch val_kpi_median (median
+|R_GS| at TRACKING_KPI_SAMPLE_SIZE=1,024 points) — the same quantity as the
+fused score's median term, just at a smaller budget.
 
   SearchSpaceConfig    StudyConfig
        │                   │
@@ -20,7 +22,7 @@ held-out set. Hyperband pruning uses the cheaper per-epoch val_loss.
     │                                                  │
     │  per trial:                                      │
     │    sample HyperParams ◄── SearchSpaceConfig      │
-    │    train NetworkManager ──► val_loss ────────────┼──► prune?
+    │    train NetworkManager ──► val_kpi_median ───────┼──► prune?
     │    evaluate |R_GS| stats                         │
     │    score = median + β·p95                        │
     └───────────────────────┬──────────────────────────┘
@@ -442,7 +444,10 @@ def objective(
 ) -> float:
     """Train one network and return its fused ranking score (median + beta*p95 of |R_GS|).
 
-    Per-epoch Hyperband pruning uses the running val_loss, not the fused score.
+    Per-epoch Hyperband pruning uses val_kpi_median (median |R_GS| at
+    TRACKING_KPI_SAMPLE_SIZE), not the composite training loss. This is the
+    same quantity as the fused score's median term — just at a smaller budget
+    — so pruning and ranking measure the same thing.
     """
     hp = build_hyperparams(trial, search_space)
     display_params = {
@@ -465,12 +470,13 @@ def objective(
     manager.metrics_row_sink = display.add_metrics_row
     last_epoch = 0
 
-    def report(epoch: int, val_loss: float | None) -> None:
+    def report(epoch: int, val_kpi_median: float | None) -> None:
+        # val_kpi_median is median |R_GS| at TRACKING_KPI_SAMPLE_SIZE from NetworkManager.
         nonlocal last_epoch
         last_epoch = epoch
-        display.update_epoch(epoch, val_loss)
-        if val_loss is not None:
-            trial.report(val_loss, epoch)
+        display.update_epoch(epoch, val_kpi_median)
+        if val_kpi_median is not None:
+            trial.report(val_kpi_median, epoch)
             if study.prune_trials and trial.should_prune():
                 raise optuna.TrialPruned
 

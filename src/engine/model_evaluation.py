@@ -19,7 +19,10 @@ from src.lib.geometry_config import PlasmaConfig
 from src.lib.network_config import HyperParams
 
 GridQuantity = Literal["flux", "residual"]
-DEFAULT_KPI_SAMPLE_SIZE = 16_384
+# calibrated: median ≤1.2% vs 16,384-pt reference, ranking unchanged
+# (docs/evaluation/kpi-accuracy-benchmark.md)
+DEFAULT_KPI_SAMPLE_SIZE = 4_096
+TRACKING_KPI_SAMPLE_SIZE = 1_024  # training-time tracking / HPO pruning budget
 # Plot count - kept small to ensure plots do not become too large
 N_PLOTS = 8
 
@@ -519,23 +522,36 @@ def plot_training_curves(
     loss: list[float] = []
     grad_norm: list[float] = []
     val_epochs: list[int] = []
-    val_loss: list[float] = []
+    val_kpi: list[float] = []
+    val_label: str | None = None
     with open(csv_path) as f:
         for row in csv.DictReader(f):
             epochs.append(int(row["epoch"]))
             lr.append(float(row["lr"]))
             loss.append(float(row["moving_avg_loss"]))
             grad_norm.append(float(row["grad_norm"]))
-            if row["val_loss"]:
+            # New CSVs have val_kpi_median; fall back to val_loss for legacy files.
+            if "val_kpi_median" in row:
+                val_col, label = "val_kpi_median", "val KPI (median |R_GS|)"
+            else:
+                val_col, label = "val_loss", "val loss"
+            if row[val_col]:
                 val_epochs.append(int(row["epoch"]))
-                val_loss.append(float(row["val_loss"]))
+                val_kpi.append(float(row[val_col]))
+                val_label = label
 
     fig, (ax_loss, ax_lr) = plt.subplots(2, 1, figsize=(8, 7), sharex=True, layout="constrained")
 
     ax_loss.plot(epochs, loss, color="#6cce5a", lw=1.2, label="train loss")
-    if val_loss:
+    if val_kpi:
         ax_loss.plot(
-            val_epochs, val_loss, color="#fde725", marker="o", markersize=3, lw=0, label="val loss"
+            val_epochs,
+            val_kpi,
+            color="#fde725",
+            marker="o",
+            markersize=3,
+            lw=0,
+            label=val_label or "val KPI (median |R_GS|)",
         )
     ax_loss.set_yscale("log")
     ax_loss.set_ylabel("loss")
