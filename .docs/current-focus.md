@@ -18,10 +18,15 @@ KPI tracking unified (2026-07-17): one batched+jitted eval core
 (`evaluate_residual_samples`) feeds training-time validation, kpis.json and HPO
 ranking; budgets calibrated by a 10-checkpoint × 200-config study
 (`docs/evaluation/kpi-accuracy-benchmark.md`, harness
-`scripts/kpi_accuracy_benchmark.py`): benchmark 4,096 pts × 100 configs
-(was 16,384 pts), training tracking 1,024 pts (`val_kpi_median` replaces the
-composite-loss `val_loss`). Ranking is protected by the fixed eval seed
-(common random numbers) — don't change the seed casually.
+`scripts/kpi_accuracy_benchmark.py`). The protocol is two globals in
+`src/lib/config.py`: `KPI_POINTS_PER_CONFIG = 4_096` (was 16,384) and
+`KPI_EVAL_CONFIGS = 100` (replaced `N_VALIDATION_SIZE=128` / HPO
+`n_validate=20`); all paths score the same `kpi_benchmark_configs` stream, the
+dedicated validation Sampler is gone (its boundary-theta draw leaked into the
+Fourier fit → ~2e-4 KPI offset for identical domain vectors), and
+`val_kpi_median` (full protocol, ~0.2 s cached) replaces the composite-loss
+`val_loss`. Ranking is protected by the fixed eval seed (common random
+numbers) — don't change the seed casually.
 
 ## Design decisions that shape the code
 1. **Hard Dirichlet BC**: `psi_fn` output × envelope `1 - ρ̃²`,

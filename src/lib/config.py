@@ -11,6 +11,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# Global KPI evaluation protocol
+# Calibrated in docs/evaluation/kpi-accuracy-benchmark.md.
+# Every metric path derives from these two constants: training-time validation
+# tracking, end-of-training kpis.json, eval CLI, HPO pruning/ranking, and the
+# re-eval script all sample the same |R_GS| budget.
+# ---------------------------------------------------------------------------
+KPI_POINTS_PER_CONFIG = 4_096  # |R_GS| sample points per reactor config
+KPI_EVAL_CONFIGS = 100  # reactor configs per evaluation
+
 
 @functools.lru_cache(maxsize=1)
 def current_commit() -> str:
