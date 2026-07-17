@@ -146,6 +146,10 @@ class FluxPINN(nn.Module):
     # Random Weight Factorization (Wang et al. arXiv 2210.01274). Default False
     # for checkpoint compat — enabling changes the params tree.
     rwf: bool = False
+    # Network architecture: "mlp" = plain MLP (default), "piratenet" = PirateNet
+    # residual blocks (arXiv 2402.00326, eq. 4.1-4.7). Default "mlp" for
+    # checkpoint compat — "piratenet" changes the params tree.
+    arch: str = "mlp"
 
     @nn.compact
     def __call__(
@@ -190,11 +194,36 @@ class FluxPINN(nn.Module):
             proj = 2.0 * jnp.pi * (x[..., :2] @ proj_matrix)
             x = jnp.concatenate([x, jnp.cos(proj), jnp.sin(proj)], axis=-1)
 
-        for dim in self.hidden_dims:
-            x = dense(dim)(x)
-            x = nn.swish(x)
+        if self.arch == "piratenet":
+            # PirateNet (arXiv 2402.00326, eq. 4.1-4.7).
+            # Two encoder branches + gated residual blocks with learnable skip weights.
+            # All alpha_l initialise to 0 so every block is a pure linear projection of
+            # the input embedding at init — the paper's core fix for PINN initialisation.
+            width = self.hidden_dims[0]
+            n_blocks = len(self.hidden_dims)
 
-        psi_hat = dense(1)(x)
+            u = nn.swish(dense(width)(x))  # eq. 4.1
+            v = nn.swish(dense(width)(x))  # eq. 4.2
+            h = dense(width)(x)  # linear projection; no activation (eq. 4.3, dim-match residual)
+
+            for l in range(n_blocks):  # noqa: E741
+                f = nn.swish(dense(width)(h))  # eq. 4.4a
+                z1 = f * u + (1.0 - f) * v  # eq. 4.4b
+                g = nn.swish(dense(width)(z1))  # eq. 4.5a
+                z2 = g * u + (1.0 - g) * v  # eq. 4.5b
+                q = nn.swish(dense(width)(z2))  # eq. 4.6
+                # Scalar skip weight: alpha=0 at init → identity through projected embedding
+                alpha = self.param(f"alpha_{l}", nn.initializers.zeros, ())
+                h = alpha * q + (1.0 - alpha) * h  # eq. 4.7
+
+            psi_hat = dense(1)(h)
+        else:
+            for dim in self.hidden_dims:
+                x = dense(dim)(x)
+                x = nn.swish(x)
+
+            psi_hat = dense(1)(x)
+
         return psi_hat
 
 
@@ -405,6 +434,7 @@ class NetworkManager:
             n_fourier_features=config.n_fourier_features,
             fourier_sigma=config.fourier_sigma,
             rwf=config.rwf,
+            arch=config.arch,
         )
         self.sampler: Sampler = Sampler(config, seed=self.seed)
         self._validation_kpi_configs: list | None = None
@@ -1118,6 +1148,20 @@ if __name__ == "__main__":
         "each dense kernel as W = V * exp(s) to improve PINN accuracy",
     )
     parser.add_argument(
+        "--arch",
+        choices=["mlp", "piratenet"],
+        default="mlp",
+        help="Network architecture: 'mlp' = plain MLP (default), 'piratenet' = PirateNet "
+        "residual blocks (arXiv 2402.00326)",
+    )
+    parser.add_argument(
+        "--hidden-dims",
+        type=str,
+        default=None,
+        help="Comma-separated hidden layer widths, e.g. 128,128,128,128; for piratenet each "
+        "entry is one residual block of that width (default: HyperParams default)",
+    )
+    parser.add_argument(
         "--show",
         metavar="RUN",
         default=None,
@@ -1139,6 +1183,7 @@ if __name__ == "__main__":
                 lbfgs_steps=args.lbfgs,
                 soft_bc=args.soft_bc,
                 rwf=args.rwf,
+                arch=args.arch,
             )
             if args.lr is not None:
                 config = config.replace(learning_rate_max=args.lr)
@@ -1148,6 +1193,10 @@ if __name__ == "__main__":
                 config = config.replace(
                     warmup_epochs=max(1, args.epochs // 6),
                     decay_epochs=args.epochs - max(1, args.epochs // 6),
+                )
+            if args.hidden_dims is not None:
+                config = config.replace(
+                    hidden_dims=tuple(int(d) for d in args.hidden_dims.split(","))
                 )
             manager = NetworkManager(config, test_mode=args.test, name=args.name)
             manager.train(save_to_disk=True)
