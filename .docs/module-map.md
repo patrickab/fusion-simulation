@@ -12,7 +12,7 @@ src/
 │
 ├── engine/
 │   ├── network.py              # FluxPINN model, Sampler; NetworkManager facade (train/infer/save/load) + FoundationModel (frozen prior for multistage correction); private collaborators: _Field (psi-fn, single or composed psi1+scale·psi2), _MetricsManager (Rich table/progress/training_log), _FileStorageManager (run dir + artifact I/O incl. nested stage2/ layout). Loss seam: compute_loss/train_step take a psi_fn. NetworkManager(config, prior=FoundationModel(...), scale=...) builds a corrector; for_inference classmethod for lean querying.
-│   ├── residual_correction.py  # Corrector CLI + load_combined(name) → composed NetworkManager (FoundationModel prior). No manager classes — corrector is now a NetworkManager construction option.
+│   ├── residual_correction.py  # Corrector CLI + shared plain/nested/HPO checkpoint loading → composed NetworkManager. No parallel manager classes.
 │   ├── physics.py              # GS operator, loss functions, B-field computation via AD
 │   ├── plasma.py               # Parametric boundary → 3D FusionPlasma; point-in-plasma test
 │   ├── model_evaluation.py     # Shared grids, Sobol residual KPIs, configurable Matplotlib montages

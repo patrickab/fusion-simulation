@@ -21,12 +21,13 @@ and saved under ``<stage1_run_dir>/stage2/`` with ``stage2_meta.json``.
 
 import argparse
 import json
+from pathlib import Path
 
 from src.engine.network import (
-    BASE_SEED,
     FoundationModel,
     NetworkManager,
 )
+from src.lib.config import KPI_EVAL_CONFIGS
 from src.lib.logger import get_logger
 from src.lib.network_config import HyperParams
 from src.streamlit.network_utils import resolve_run_directory
@@ -34,20 +35,29 @@ from src.streamlit.network_utils import resolve_run_directory
 logger = get_logger(name="ResidualCorrection")
 
 
-def load_combined(stage1_name: str) -> NetworkManager:
-    """Load a saved stage-1 checkpoint plus its stage-2 correction net.
+def load_foundation(
+    stage1: str | Path, *, soft_bc: bool | None = None, allow_nested: bool = False
+) -> tuple[FoundationModel, HyperParams, Path]:
+    """Load a plain checkpoint as a frozen foundation."""
+    stage1_dir = stage1 if isinstance(stage1, Path) else resolve_run_directory(stage1)
+    if (not allow_nested and (stage1_dir / "stage2" / "network.flax").exists()) or (
+        stage1_dir / "stage2_meta.json"
+    ).exists():
+        raise ValueError("A corrector checkpoint cannot be used as a stage-1 foundation")
+    hp = HyperParams.from_json(str(stage1_dir / "config.json"))
+    if soft_bc is not None and hp.soft_bc != soft_bc:
+        raise ValueError(
+            f"Foundation soft_bc={hp.soft_bc} does not match corrector soft_bc={soft_bc}"
+        )
+    manager = NetworkManager(hp)
+    params = manager.from_disk(stage1_dir / "network.flax")
+    return FoundationModel(model=manager.model, params=params), hp, stage1_dir
 
-    Returns a NetworkManager whose ``make_psi_fn()`` returns the composed field
-    ``psi_stage1(frozen) + scale * psi_stage2(params)``.
 
-    ``stage1_name`` is a ``commit/run`` slug accepted by
-    ``resolve_run_directory``; the stage-2 net is expected at
-    ``<run_dir>/stage2/`` (see ``NetworkManager.to_disk(stage1_run_dir=...)``).
-    Reads ``stage2_meta.json`` if present to recover the output scale
-    (defaults to 1.0 for checkpoints saved before this field existed).
-    """
-    stage1_dir = resolve_run_directory(stage1_name)
-    stage2_dir = stage1_dir / "stage2"
+def _load_composed(
+    stage1: str | Path, stage2_dir: Path, n_validation_size: int = KPI_EVAL_CONFIGS
+) -> NetworkManager:
+    """Load a frozen foundation plus a stage-2 directory."""
     if not (stage2_dir / "network.flax").exists():
         raise FileNotFoundError(f"no stage2 correction net found under {stage2_dir}")
 
@@ -56,27 +66,62 @@ def load_combined(stage1_name: str) -> NetworkManager:
         json.loads(meta_path.read_text()).get("scale", 1.0) if meta_path.exists() else 1.0
     )
 
-    hp1 = HyperParams.from_json(str(stage1_dir / "config.json"))
-    stage1 = NetworkManager(hp1)
-    stage1.state = stage1.state.replace(params=stage1.from_disk(stage1_dir / "network.flax"))
-
+    prior, hp1, stage1_dir = load_foundation(stage1, allow_nested=True)
     hp2 = HyperParams.from_json(str(stage2_dir / "config.json"))
-    prior = FoundationModel(model=stage1.model, params=stage1.state.params)
+    if hp1.soft_bc != hp2.soft_bc:
+        raise ValueError(
+            f"Foundation soft_bc={hp1.soft_bc} does not match corrector soft_bc={hp2.soft_bc}"
+        )
     # Build the composed manager and load stage-2 params from disk.
-    mgr = NetworkManager(hp2, prior=prior, scale=scale, seed=BASE_SEED)
+    mgr = NetworkManager(
+        hp2,
+        prior=prior,
+        scale=scale,
+        n_validation_size=n_validation_size,
+    )
     mgr.state = mgr.state.replace(params=mgr.from_disk(stage2_dir / "network.flax"))
-    mgr.artifact_stem = f"{stage1_name.split('/')[-1]}/stage2"
+    mgr.artifact_stem = f"{stage1_dir.name}/stage2"
     return mgr
 
 
-if __name__ == "__main__":
-    from src.engine.model_evaluation import (
-        build_kpi_record,
-        evaluate_plasma_kpis,
-        kpi_benchmark_configs,
-    )
-    from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG
+def load_checkpoint(
+    name: str | Path, *, n_validation_size: int = KPI_EVAL_CONFIGS
+) -> NetworkManager:
+    """Load a plain, nested-corrector, or retained HPO-corrector checkpoint."""
+    run_dir = name if isinstance(name, Path) else resolve_run_directory(name)
+    if (run_dir / "stage2" / "network.flax").exists():
+        return _load_composed(name, run_dir / "stage2", n_validation_size)
 
+    foundation_path = run_dir.parent / "foundation.json"
+    stage2_meta_path = run_dir / "stage2_meta.json"
+    if foundation_path.exists() or stage2_meta_path.exists():
+        if not foundation_path.exists() or not stage2_meta_path.exists():
+            raise ValueError(f"incomplete corrector metadata for {run_dir}")
+        stage1_name = json.loads(foundation_path.read_text()).get("stage1_run")
+        if not stage1_name:
+            raise ValueError(f"invalid foundation metadata in {foundation_path}")
+        local_foundation = run_dir.parent / "_foundation"
+        local_artifacts = [
+            (local_foundation / artifact).exists() for artifact in ("config.json", "network.flax")
+        ]
+        if any(local_artifacts) and not all(local_artifacts):
+            raise ValueError(f"incomplete bundled foundation in {local_foundation}")
+        manager = _load_composed(
+            local_foundation if all(local_artifacts) else stage1_name,
+            run_dir,
+            n_validation_size,
+        )
+        manager.artifact_stem = str(name)
+        return manager
+
+    hp = HyperParams.from_json(str(run_dir / "config.json"))
+    manager = NetworkManager(hp, n_validation_size=n_validation_size)
+    manager.state = manager.state.replace(params=manager.from_disk(run_dir / "network.flax"))
+    manager.artifact_stem = str(name)
+    return manager
+
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Train a stage-2 residual-correction PINN on top of a frozen stage-1 "
         "checkpoint and score the composed field with the standard KPI protocol."
@@ -132,14 +177,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # --- resolve stage-1 ---
-    stage1_dir = resolve_run_directory(args.stage1)
+    prior, hp1, stage1_dir = load_foundation(args.stage1)
     logger.info(f"stage-1 dir: {stage1_dir}")
-
-    hp1 = HyperParams.from_json(str(stage1_dir / "config.json"))
-    stage1_mgr = NetworkManager(hp1)
-    stage1_mgr.state = stage1_mgr.state.replace(
-        params=stage1_mgr.from_disk(stage1_dir / "network.flax")
-    )
     logger.info(
         f"stage-1 loaded: arch={hp1.arch} hidden_dims={hp1.hidden_dims} soft_bc={hp1.soft_bc}"
     )
@@ -165,40 +204,6 @@ if __name__ == "__main__":
     )
 
     # --- build composed manager and train ---
-    prior = FoundationModel(model=stage1_mgr.model, params=stage1_mgr.state.params)
-    stage2 = NetworkManager(hp2, prior=prior, scale=args.stage2_scale)
-    stage2.train(save_to_disk=False)
-
-    # --- save under <stage1_run_dir>/stage2/ ---
-    import flax.serialization
-
-    stage2_dir = stage1_dir / "stage2"
-    stage2_dir.mkdir(parents=True, exist_ok=True)
-    (stage2_dir / "network.flax").write_bytes(flax.serialization.to_bytes(stage2.state.params))
-    hp2.to_json(path=str(stage2_dir / "config.json"))
-    (stage2_dir / "stage2_meta.json").write_text(json.dumps({"scale": args.stage2_scale}) + "\n")
-    logger.info(f"stage-2 saved to {stage2_dir}")
-
-    # --- KPI eval on the composed field ---
-    configs = kpi_benchmark_configs(stage2, KPI_EVAL_CONFIGS)
-    kpis = evaluate_plasma_kpis(stage2, configs, sample_size=KPI_POINTS_PER_CONFIG)
-
-    logger.info(
-        f"composed KPIs — median={kpis['loss_median']:.4e} "
-        f"p95={kpis['loss_p95']:.4e} "
-        f"core_median={kpis['core_loss_median']:.4e} "
-        f"bnd_leak={kpis['boundary_leak_max']:.4e}"
-    )
-
-    stage2.artifact_stem = f"{args.stage1}/stage2"
-    record = build_kpi_record(
-        stage2,
-        kpis,
-        n_configs=KPI_EVAL_CONFIGS,
-        n_points=KPI_POINTS_PER_CONFIG,
-        core_rho=0.85,
-        network_name=f"{args.stage1}/stage2",
-    )
-    kpis_path = stage2_dir / "kpis.json"
-    kpis_path.write_text(json.dumps(record, indent=2) + "\n")
-    logger.info(f"kpis.json written to {kpis_path}")
+    stage2 = NetworkManager(hp2, prior=prior, scale=args.stage2_scale, stage1_run_dir=stage1_dir)
+    stage2.train()
+    logger.info(f"stage-2 benchmark saved to {stage1_dir / 'stage2'}")

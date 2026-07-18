@@ -17,7 +17,7 @@ from src.engine.physics import PsiFn, estimate_psi_axis, grad_shafranov_residual
 from src.engine.plasma import get_poloidal_points
 from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG
 from src.lib.geometry_config import PlasmaConfig
-from src.lib.network_config import DomainBounds, HyperParams
+from src.lib.network_config import DomainBounds
 
 GridQuantity = Literal["flux", "residual"]
 # Plot count - kept small to ensure plots do not become too large
@@ -632,7 +632,7 @@ if __name__ == "__main__":
     import argparse
     from datetime import datetime
 
-    from src.lib.network_config import HyperParams
+    from src.engine.residual_correction import load_checkpoint
     from src.streamlit.network_utils import get_available_networks, resolve_run_directory
 
     parser = argparse.ArgumentParser(description="Region-split |GS residual| KPIs per checkpoint")
@@ -676,15 +676,17 @@ if __name__ == "__main__":
         except FileNotFoundError:
             print(f"  skip {name}: run dir not found")
             continue
-        config_path = run_dir / "config.json"
-        flax_path = run_dir / "network.flax"
+        artifact_dir = (
+            run_dir / "stage2" if (run_dir / "stage2" / "network.flax").exists() else run_dir
+        )
+        evaluated_name = f"{name}/stage2" if artifact_dir != run_dir else name
+        config_path = artifact_dir / "config.json"
+        flax_path = artifact_dir / "network.flax"
         if not config_path.exists() or not flax_path.exists():
             print(f"  skip {name}: missing config or network.flax")
             continue
-        hp = HyperParams.from_json(str(config_path))
-        manager = NetworkManager(hp)
-        loaded = manager.from_disk(pinn_path=flax_path)
-        manager.state = manager.state.replace(params=loaded)
+        manager = load_checkpoint(name)
+        hp = manager.config
         configs = kpi_benchmark_configs(manager, args.n_configs)
         kpis = evaluate_plasma_kpis(
             manager, configs, sample_size=args.n_points, core_rho=args.core_rho
@@ -700,27 +702,34 @@ if __name__ == "__main__":
         # Overwritten each run (latest eval wins); the eval params are included
         # so the file is self-describing without needing config.json alongside.
         record = build_kpi_record(
-            manager, kpis, args.n_configs, args.n_points, args.core_rho, network_name=name
+            manager,
+            kpis,
+            args.n_configs,
+            args.n_points,
+            args.core_rho,
+            network_name=evaluated_name,
         )
-        (run_dir / "kpis.json").write_text(json.dumps(record, indent=2) + "\n")
+        (artifact_dir / "kpis.json").write_text(json.dumps(record, indent=2) + "\n")
 
         if args.no_plots:
             continue
-        csv_path = run_dir / "training.csv"
+        csv_path = artifact_dir / "training.csv"
         if csv_path.exists():
-            plot_training_curves(csv_path, run_dir / "training_curves.png", title=name)
+            plot_training_curves(
+                csv_path, artifact_dir / "training_curves.png", title=evaluated_name
+            )
         grids = evaluate_plasma_grids(
             manager,
             configs[: args.plot_n_configs],
             resolution=args.plot_resolution,
             quantities=(args.plot_quantity,),
         )
-        title = name
+        title = evaluated_name
         if args.plot_title:
             title = f"{args.plot_title}: {title}"
         plot_plasma_grid_montage(
             grids,
-            run_dir / f"{args.plot_quantity}.png",
+            artifact_dir / f"{args.plot_quantity}.png",
             quantity=args.plot_quantity,
             title=title,
             metadata=hp.to_dict(),
