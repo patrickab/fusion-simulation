@@ -230,7 +230,7 @@ class FluxPINN(nn.Module):
 # --- Sampler ---
 BASE_SEED = 42
 RESAMPLING_FREQUENCY = 10  # Resample training set every N epochs
-LOG_FREQUENCY = 10  # Log training metrics every N epochs
+LOG_FREQUENCY = 10  # Refresh the live table and flush metrics every N epochs
 N_VALIDATION_SIZE = KPI_EVAL_CONFIGS  # Number of validation plasma configs
 VALIDATION_FREQUENCY = 5 * LOG_FREQUENCY  # Evaluate validation set every N epochs
 EARLY_STOPPING_PATIENCE = 6  # Stop after this many non-improving validation rounds
@@ -536,6 +536,7 @@ class _MetricsManager:
         )
         self._epoch_task = self._progress.add_task("Training", total=total_epochs)
         self._acc_loss = self._acc_res = self._acc_bnd = self._acc_gn = self._acc_t = 0.0
+        self._acc_count = 0
         self._live: Live | None = None
         self.metrics_row_sink: Callable[[tuple[str, ...]], None] | None = None
 
@@ -558,17 +559,17 @@ class _MetricsManager:
         self._acc_bnd += boundary
         self._acc_gn += grad_norm
         self._acc_t += epoch_time
+        self._acc_count += 1
 
-        count = epoch % LOG_FREQUENCY + 1
-        if (epoch + 1) % LOG_FREQUENCY == 0:
+        if (epoch + 1) % LOG_FREQUENCY == 0 or val_kpis is not None:
             p05, p50, p95 = val_kpis or (None, None, None)
             persisted = {
                 "lr": lr,
-                "loss": self._acc_loss / count,
-                "residual": self._acc_res / count,
-                "boundary": self._acc_bnd / count,
-                "grad_norm": self._acc_gn / count,
-                "epoch_time_seconds": self._acc_t / count,
+                "loss": self._acc_loss / self._acc_count,
+                "residual": self._acc_res / self._acc_count,
+                "boundary": self._acc_bnd / self._acc_count,
+                "grad_norm": self._acc_gn / self._acc_count,
+                "epoch_time_seconds": self._acc_t / self._acc_count,
                 "val_kpi_p05": p05,
                 "val_kpi_p50": p50,
                 "val_kpi_p95": p95,
@@ -578,10 +579,10 @@ class _MetricsManager:
                 epoch=epoch + 1,
                 total_epochs=self._total_epochs,
                 lr=lr,
-                grad_norm=self._acc_gn / count,
-                loss=self._acc_loss / count,
+                grad_norm=persisted["grad_norm"],
+                loss=persisted["loss"],
                 val_kpis=val_kpis,
-                epoch_time=self._acc_t / count,
+                epoch_time=persisted["epoch_time_seconds"],
             )
             self._table_rows.append(display_row)
             if self.metrics_row_sink is not None:
@@ -591,6 +592,7 @@ class _MetricsManager:
                 table.add_row(*r)
             self._table = table
             self._acc_loss = self._acc_res = self._acc_bnd = self._acc_gn = self._acc_t = 0.0
+            self._acc_count = 0
         else:
             persisted = None
 
@@ -1195,7 +1197,7 @@ class NetworkManager:
                         epoch_time,
                     )
                     trained_epochs = epoch + 1
-                    if run_dir is not None and persisted is not None:
+                    if run_dir is not None and (persisted is not None or val_kpis is not None):
                         self._files.write_metrics(run_dir, self._metrics.rows)
                     if validation_callback is not None and not should_stop:
                         validation_callback(epoch + 1, val_kpis[1] if val_kpis else None)
@@ -1244,6 +1246,9 @@ class NetworkManager:
         except BaseException as exc:
             if run_dir is not None:
                 self.training_duration_seconds = time.perf_counter() - training_started
+                metrics = getattr(self, "_metrics", None)
+                if metrics is not None and metrics.rows:
+                    self._files.write_metrics(run_dir, metrics.rows)
                 self._files.write_run(
                     run_dir,
                     self,

@@ -8,12 +8,12 @@ from src.lib.run_artifacts import format_duration, write_json
 
 
 class RunArtifactTests(unittest.TestCase):
-    def test_metrics_manager_records_validation_percentiles_by_column(self) -> None:
+    def test_metrics_manager_appends_complete_logging_windows(self) -> None:
         metrics = _MetricsManager(total_epochs=10)
         for epoch in range(10):
             metrics.log(
                 epoch,
-                loss=1e-3,
+                loss=float(epoch + 1),
                 residual=2e-3,
                 boundary=0.0,
                 val_kpis=(1e-4, 2e-4, 3e-4) if epoch == 9 else None,
@@ -23,9 +23,27 @@ class RunArtifactTests(unittest.TestCase):
             )
 
         self.assertEqual(len(metrics.rows), 1)
+        self.assertEqual(metrics.rows[0]["loss"], 5.5)
         self.assertEqual(metrics.rows[0]["val_kpi_p05"], 1e-4)
         self.assertEqual(metrics.rows[0]["val_kpi_p50"], 2e-4)
         self.assertEqual(metrics.rows[0]["val_kpi_p95"], 3e-4)
+
+    def test_six_hundred_epochs_produce_sixty_cumulative_rows(self) -> None:
+        metrics = _MetricsManager(total_epochs=600)
+        for epoch in range(600):
+            metrics.log(
+                epoch,
+                loss=1.0,
+                residual=2.0,
+                boundary=3.0,
+                val_kpis=(1e-4, 2e-4, 3e-4) if (epoch + 1) % 50 == 0 else None,
+                lr=5e-4,
+                grad_norm=4e-2,
+                epoch_time=1.0,
+            )
+
+        self.assertEqual(len(metrics.rows), 60)
+        self.assertEqual(sum(row["val_kpi_p50"] is not None for row in metrics.rows), 12)
 
     def test_scientific_json_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
