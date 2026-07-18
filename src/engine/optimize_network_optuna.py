@@ -49,6 +49,7 @@ import sys
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
+from collections.abc import Callable
 from dataclasses import dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
@@ -797,6 +798,7 @@ def run_optimization(
     *,
     display: OptunaProgressDisplay,
     restart: bool = False,
+    trial_callback: Callable[[optuna.Study, optuna.trial.FrozenTrial], None] | None = None,
 ) -> list[tuple[HyperParams, float]]:
     """Run or resume a study and return its best configurations."""
     search_space = search_space or SearchSpaceConfig()
@@ -945,13 +947,16 @@ def run_optimization(
         warmstart_trials = sum(t.user_attrs.get("warmstart", False) for t in optuna_study.trials)
         display._prior_trials = prior_trials
         display._warmstart_trials = warmstart_trials
+        callbacks = [lambda current, _trial: _write_trials_csv(current, hpo_benchmark_dir)]
+        if trial_callback is not None:
+            callbacks.append(trial_callback)
         optuna_study.optimize(
             lambda trial: objective(
                 trial, search_space, study, display, hpo_benchmark_dir, foundation
             ),
             n_trials=max(0, study.n_trials - prior_trials),
             catch=(Exception,),
-            callbacks=[lambda current, _trial: _write_trials_csv(current, hpo_benchmark_dir)],
+            callbacks=callbacks,
         )
 
         complete = sorted(
