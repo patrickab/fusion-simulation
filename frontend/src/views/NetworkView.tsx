@@ -10,6 +10,7 @@ import {
   type GeometryResponse,
   type Grid2D,
   type HpoStudies,
+  type NetworkModels,
   type SampleResponse,
 } from '../api'
 import { useStore } from '../store'
@@ -85,6 +86,7 @@ export function NetworkView() {
   const sampleKey = network ? `sample:${network}:${dSeed}:${sampleSize}` : null
   const sample = useApi<SampleResponse>(sampleKey, () => api.sample(network!, dSeed, sampleSize))
   const config = useApi<Record<string, unknown>>(network ? `config:${network}` : null, () => api.config_file(network!))
+  const models = useApi<NetworkModels>(network ? `models:${network}` : null, () => api.models(network!))
 
   const refresh = () => {
     invalidate()
@@ -173,6 +175,26 @@ export function NetworkView() {
         {config.data && (
           <Section title="Training config">
             <JsonBlock obj={config.data} />
+          </Section>
+        )}
+        {models.data && (
+          <Section title="Models">
+            <div className="model-list">
+              <div className="model-row">
+                <span className="model-role">Foundation model</span>
+                <span className="mono model-name">{models.data.foundation.name}</span>
+              </div>
+              <div className="model-row">
+                <span className="model-role">Corrector</span>
+                {models.data.corrector ? (
+                  <span className="mono model-name">
+                    {models.data.corrector.name} <span className="model-detail">scale {models.data.corrector.scale}</span>
+                  </span>
+                ) : (
+                  <span className="model-detail">Not available</span>
+                )}
+              </div>
+            </div>
           </Section>
         )}
         <Section title="Sampling">
