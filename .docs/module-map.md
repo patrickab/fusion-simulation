@@ -3,27 +3,27 @@
 ```
 src/
 ├── api/                          # FastAPI service layer for the React frontend
-│   ├── main.py                   # FastAPI app + routes (/api/networks, /network/*, /geometry, /benchmark)
+│   ├── main.py                   # FastAPI app + routes, including model-stack metadata and artifact actions
 │   ├── state.py                  # In-process NetworkManager cache (replaces st.session_state)
-│   ├── network.py                # sample/flux/residual/bfield response builders
+│   ├── network.py                # sample/flux/residual and server-traced field-line response builders
 │   ├── geometry.py               # 2D boundary + 3D plasma/coil mesh builders (strided)
 │   ├── benchmark.py              # SSE benchmark stream (one row event per checkpoint)
 │   └── schemas.py                # Pydantic request models (GeometryRequest, SampleRequest, ...)
 │
 ├── engine/
-│   ├── network.py              # FluxPINN model, Sampler; NetworkManager facade (train/infer/save/load) + FoundationModel (frozen prior for multistage correction); private collaborators: _Field (psi-fn, single or composed psi1+scale·psi2), _MetricsManager (Rich table/progress/training_log), _FileStorageManager (run dir + artifact I/O incl. nested stage2/ layout). Loss seam: compute_loss/train_step take a psi_fn. NetworkManager(config, prior=FoundationModel(...), scale=...) builds a corrector; for_inference classmethod for lean querying.
+│   ├── network.py              # MLP/PirateNet FluxPINN (+ Fourier/RWF), Sampler, patience stopping, NetworkManager facade, frozen FoundationModel and composed stage-2 fields
 │   ├── residual_correction.py  # Corrector CLI + shared plain/nested/HPO checkpoint loading → composed NetworkManager. No parallel manager classes.
 │   ├── physics.py              # GS operator, loss functions, B-field computation via AD
 │   ├── plasma.py               # Parametric boundary → 3D FusionPlasma; point-in-plasma test
 │   ├── model_evaluation.py     # Shared grids, Sobol residual KPIs, configurable Matplotlib montages
-│   ├── benchmark_report.py    # LaTeX→PDF benchmark report generator (pandoc + pdflatex)
+│   ├── benchmark_report.py    # Ranked LaTeX benchmark report rendered directly with pdflatex
 │   ├── optimize_network_optuna.py  # Optuna HPO (primary, with validation-based pruning)
 │   └── optimize-network-hparams.py # BoTorch HPO (legacy)
 │
 ├── lib/
 │   ├── geometry_config.py      # All dataclasses: coords, plasma/coil geometry, PlasmaConfig
-│   ├── network_config.py       # HyperParams, DomainBounds, FluxInput (JAX pytrees)
-│   ├── config.py               # Filepaths (data/benchmarks, data/hpo), BaseModel mixin
+│   ├── network_config.py       # HyperParams (architecture/RWF/training knobs), DomainBounds, FluxInput
+│   ├── config.py               # Filepaths, global KPI protocol constants, git-commit identity, BaseModel
 │   ├── visualization.py        # PyVista 3D + Plotly 2D render functions
 │   ├── utils.py                # Coil → PolyData normalization, plasma → PolyData
 │   ├── linalg_utils.py         # Rotation matrices, cylindrical→Cartesian helpers
@@ -71,25 +71,28 @@ docs/
 ├── 02_pinn_engine.md           # GS equation, loss structure, BCs, profile modeling
 ├── 03_neural_architecture.md   # References for architecture choices
 ├── sources.md                  # Literature and external references
-├── training-process.md         # Prose walkthrough of the full training pipeline (setup→HPO)
-└── performance/                # One note per perf commit: change + runnable benchmark + measured ms/MiB
+├── evaluation/                 # KPI-budget calibration and evaluation protocol evidence
+├── hpo/                        # Current PirateNet foundation campaign plan
+└── performance/                # One note per perf change with runnable benchmark and measured cost
 
 AGENTS.md                       # Operational rules: uv run only, tmux windows for long jobs,
                                 # training/HPO entry-point flags, --reset-sqlite semantics
-model_selection_report/         # LaTeX report (R2 soft-BC baseline → N1/N3/N6 hard-BC) + its 4 checkpoints
-todo.md / plot-error.md / latex-benchmark.md   # Untracked handoff notes (see current-focus.md)
 run-webapp.sh                   # Launches uvicorn (8010) + vite dev (5173) together
+scripts/                        # KPI calibration/re-eval, legacy N6 preset, resumable PirateNet campaign
+tests/                          # unittest coverage for patience stopping + numerical refactor fixture
 ```
 
-## Data layout (gitignored)
+## Artifact and evidence layout
 
 ```
-data/                            # All live artifacts (gitignored)
-├── benchmarks/<timestamp>_<name>_<commit>/   # Flattened single-config checkpoint
-├── benchmarks/_archive/<slug>/                # Archived single-config checkpoint
-└── hpo/<timestamp>_<name>_<commit>/           # Optuna study: study.db, *.json + pinn_<ts>/ trials
-    └── _archive/<study_slug>/                  # Archived complete HPO study
-data_legacy/                     # Pre-consolidation dump (data/, networks/, toroidal_coils_3d/); gitignored, cruft
+data/
+├── benchmarks/<timestamp>_<name>_<commit>/   # Single-config checkpoint and benchmark artifacts
+├── benchmarks/model_selection_benchmark/     # Model-selection learnings and run log
+├── benchmarks/_archive/<slug>/               # Supported archive location
+├── hpo/<timestamp>_<name>_<commit>/          # Optuna study/campaign DB, ledgers and trial dirs
+│   └── _archive/<study_slug>/                 # Supported complete-study archive location
+└── kpi_accuracy/                              # Raw KPI calibration runs
+data_legacy/                                   # Ignored pre-consolidation artifact dump
 ```
 
 ## Key data contracts
@@ -104,7 +107,9 @@ data_legacy/                     # Pre-consolidation dump (data/, networks/, tor
 | `ToroidalCoil3D` | geometry_config.py | Inner/outer/cap surface arrays |
 | `FluxInput` | network_config.py | Batched (B, N) R-Z + config PyTree |
 | `HyperParams` | network_config.py | All training hyperparameters |
-| `NetworkManager` | network.py | Facade: model + state + sampler; accepts optional `FoundationModel` prior to act as a multistage corrector |
+| `FluxPINN` | network.py | Checkpoint-compatible MLP or PirateNet architecture, optionally Fourier-encoded/RWF |
+| `NetworkManager` | network.py | Training/inference/artifact facade; accepts an optional `FoundationModel` prior for correction |
 | `FoundationModel` | network.py | Frozen dataclass: converged FluxPINN + params; used as prior for residual-correction stage 2 |
-| Pydantic req models | `src/api/schemas.py` | `GeometryRequest`, `SampleRequest`, `GridRequest`, `BFieldRequest`, `RenameRequest`, `BenchmarkRequest`, `CoilConfigIn` |
-| API response interfaces | `frontend/src/api.ts` | `SampleResponse`, `Grid2D`, `GeometryResponse`, `FieldLinesResponse`, `SurfaceGrid`, `BenchmarkEvent` (SSE union) |
+| HPO configs | optimize_network_optuna.py | `SearchSpaceConfig` owns model axes; `StudyConfig` owns orchestration and checkpoint policy |
+| Pydantic req models | `src/api/schemas.py` | Geometry, sampling, grids, field lines, artifact actions and benchmark requests |
+| API response interfaces | `frontend/src/api.ts` | Samples, grids, model stack, geometry, field lines and benchmark SSE contracts |
