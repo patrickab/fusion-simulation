@@ -24,6 +24,7 @@ with; they are not recoverable from the run dir itself.
 import argparse
 import json
 import os
+import shutil
 import sys
 
 os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
@@ -46,10 +47,9 @@ from src.engine.model_evaluation import (
     kpi_benchmark_configs,
     plot_plasma_grid_montage,
 )
-from src.engine.network import NetworkManager
-from src.engine.optimize_network_optuna import _write_trials_json
+from src.engine.optimize_network_optuna import _write_objective_metadata, _write_trials_json
+from src.engine.residual_correction import load_checkpoint
 from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG
-from src.lib.network_config import HyperParams
 
 console = Console()
 
@@ -61,32 +61,6 @@ def _discover_study_name(storage: str) -> str | None:
     if not eligible:
         return None
     return max(eligible, key=lambda s: s.n_trials).study_name
-
-
-def _lock_is_live(run_dir: Path) -> bool:
-    """True if a .lock in run_dir holds a live PID (HPO may be writing)."""
-    lock = run_dir / ".lock"
-    if not lock.exists():
-        return False
-    try:
-        pid = int(lock.read_text().strip())
-    except (ValueError, OSError):
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-
-
-def _load_manager(checkpoint_dir: Path, n_validate: int) -> NetworkManager:
-    hp = HyperParams.from_json(str(checkpoint_dir / "config.json"))
-    manager = NetworkManager(hp, n_validation_size=n_validate)
-    loaded = manager.from_disk(pinn_path=str(checkpoint_dir / "network.flax"))
-    manager.state = manager.state.replace(params=loaded)
-    return manager
 
 
 def _network_name(checkpoint_dir: Path) -> str:
@@ -149,10 +123,6 @@ def main() -> int:
         console.print(f"[red]error:[/red] {db_path} not found")
         return 2
 
-    if not args.dry_run and _lock_is_live(run_dir):
-        console.print(f"[red]error:[/red] {run_dir} is locked by a live HPO process (.lock)")
-        return 3
-
     storage = f"sqlite:///{db_path}"
     study_name = args.study_name or _discover_study_name(storage)
     if study_name is None:
@@ -161,6 +131,24 @@ def main() -> int:
     console.print(f"study: [cyan]{study_name}[/cyan]  ({db_path})")
 
     study = optuna.load_study(study_name=study_name, storage=storage)
+    completed_trials = study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
+    unscorable = [
+        trial.number
+        for trial in completed_trials
+        if trial.user_attrs.get("warmstart", False)
+        or not trial.user_attrs.get("run")
+        or not (run_dir / trial.user_attrs.get("run", "") / "network.flax").exists()
+    ]
+    if unscorable and not args.dry_run:
+        console.print(
+            "[red]error:[/red] refusing a mixed-protocol update; completed trials "
+            f"cannot be re-evaluated: {unscorable}"
+        )
+        return 5
+    if completed_trials and not args.dry_run:
+        for stale_artifact in ("top_trials.json", "benchmark_report.pdf"):
+            (run_dir / stale_artifact).unlink(missing_ok=True)
+        shutil.rmtree(run_dir / "top_k", ignore_errors=True)
     rdb = RDBStorage(storage)
     study_id = rdb.get_study_id_from_name(study_name)
 
@@ -180,7 +168,7 @@ def main() -> int:
         "AND trial_id = (SELECT trial_id FROM trials WHERE study_id = :sid AND number = :num)"
     )
 
-    for t in study.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,)):
+    for t in completed_trials:
         stem = t.user_attrs.get("run")
         if stem is None:
             table.add_row(str(t.number), f"{t.value:.6e}", "-", "-", "-", "-", "no run attr")
@@ -200,7 +188,7 @@ def main() -> int:
             n_skipped += 1
             continue
 
-        manager = _load_manager(checkpoint_dir, args.n_validate)
+        manager = load_checkpoint(checkpoint_dir, n_validation_size=args.n_validate)
         median, p95 = evaluate_validation_loss_stats(manager, sample_size=args.n_points)
         fused = median + args.score_beta * p95
 
@@ -272,7 +260,14 @@ def main() -> int:
         # the in-memory `study` was loaded before any write and holds stale values.
         fresh = optuna.load_study(study_name=study_name, storage=storage)
         _write_trials_json(fresh, run_dir)
-        console.print("trials.json refreshed")
+        _write_objective_metadata(
+            run_dir,
+            score_beta=args.score_beta,
+            n_validate=args.n_validate,
+            points_per_config=args.n_points,
+            overwrite=True,
+        )
+        console.print("trials.json refreshed; stale rankings removed")
     return 0
 
 

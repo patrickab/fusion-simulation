@@ -518,6 +518,7 @@ class _MetricsManager:
         val_kpi_median: float | None,
         lr: float,
         grad_norm: float,
+        optimizer_step: int,
         epoch_time: float,
     ) -> None:
         self._acc_loss += loss
@@ -526,28 +527,29 @@ class _MetricsManager:
         self._acc_gn += grad_norm
         self._acc_t += epoch_time
 
+        count = epoch % LOG_FREQUENCY + 1
+        row = {
+            "epoch": epoch + 1,
+            "optimizer_step": optimizer_step,
+            "lr": lr,
+            "moving_avg_loss": self._acc_loss / count,
+            "residual": self._acc_res / count,
+            "boundary": self._acc_bnd / count,
+            "grad_norm": self._acc_gn / count,
+            "epoch_time": self._acc_t / count,
+            "val_kpi_median": val_kpi_median,
+        }
+        self.rows.append(row)
+
         if (epoch + 1) % LOG_FREQUENCY == 0:
-            avg = LOG_FREQUENCY
-            self.rows.append(
-                {
-                    "epoch": epoch + 1,
-                    "lr": lr,
-                    "moving_avg_loss": self._acc_loss / avg,
-                    "val_kpi_median": val_kpi_median,
-                    "residual": self._acc_res / avg,
-                    "boundary": self._acc_bnd / avg,
-                    "grad_norm": self._acc_gn / avg,
-                    "epoch_time": self._acc_t / avg,
-                }
-            )
             row = _metrics_row(
                 epoch=epoch + 1,
                 total_epochs=self._total_epochs,
                 lr=lr,
-                grad_norm=self._acc_gn / avg,
-                loss=self._acc_loss / avg,
+                grad_norm=self._acc_gn / count,
+                loss=self._acc_loss / count,
                 val_kpi_median=val_kpi_median,
-                epoch_time=self._acc_t / avg,
+                epoch_time=self._acc_t / count,
             )
             self._table_rows.append(row)
             if self.metrics_row_sink is not None:
@@ -557,20 +559,6 @@ class _MetricsManager:
                 table.add_row(*r)
             self._table = table
             self._acc_loss = self._acc_res = self._acc_bnd = self._acc_gn = self._acc_t = 0.0
-        else:
-            count = (epoch + 1) % LOG_FREQUENCY
-            self.rows.append(
-                {
-                    "epoch": epoch + 1,
-                    "lr": lr,
-                    "moving_avg_loss": self._acc_loss / count,
-                    "val_kpi_median": val_kpi_median,
-                    "residual": self._acc_res / count,
-                    "boundary": self._acc_bnd / count,
-                    "grad_norm": self._acc_gn / count,
-                    "epoch_time": self._acc_t / count,
-                }
-            )
 
         self._progress.update(self._epoch_task, advance=1)
         if self._live is not None:
@@ -590,16 +578,16 @@ class _FileStorageManager:
         name: str,
         output_dir: Path | None,
         *,
-        is_corrector: bool = False,
         stage1_run_dir: Path | None = None,
     ) -> None:
         self.name = name
         self.output_dir = output_dir
-        self._is_corrector = is_corrector
         self._stage1_run_dir = stage1_run_dir
         self.artifact_stem: str | None = None
 
     def new_artifact_stem(self) -> str:
+        if self._stage1_run_dir is not None:
+            return f"{self._stage1_run_dir.name}/stage2"
         timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         if self.output_dir:
             return f"pinn_{timestamp}"
@@ -608,7 +596,7 @@ class _FileStorageManager:
     def run_dir(self) -> Path:
         if self.artifact_stem is None:
             self.artifact_stem = self.new_artifact_stem()
-        if self._is_corrector and self._stage1_run_dir is not None:
+        if self._stage1_run_dir is not None:
             return self._stage1_run_dir / "stage2"
         base = self.output_dir or Filepaths.BENCHMARKS
         return base / self.artifact_stem
@@ -640,14 +628,18 @@ class _FileStorageManager:
             return
         with open(run_dir / "training.csv", "w") as f:
             f.write(
-                "epoch,lr,moving_avg_loss,val_kpi_median,residual,boundary,grad_norm,epoch_time\n"
+                "epoch,optimizer_step,lr,moving_avg_loss,val_kpi_median,"
+                "residual,boundary,grad_norm,epoch_time\n"
             )
             for entry in rows:
-                vl = f"{entry['val_kpi_median']:.6f}" if entry["val_kpi_median"] is not None else ""
+                val = (
+                    f"{entry['val_kpi_median']:.6f}" if entry["val_kpi_median"] is not None else ""
+                )
                 f.write(
-                    f"{entry['epoch']},{entry['lr']:.2e},{entry['moving_avg_loss']:.6f},"
-                    f"{vl},{entry['residual']:.6f},{entry['boundary']:.6f},"
-                    f"{entry['grad_norm']:.6f},{entry['epoch_time']:.4f}\n"
+                    f"{entry['epoch']},{entry['optimizer_step']},{entry['lr']:.2e},"
+                    f"{entry['moving_avg_loss']:.6f},{val},{entry['residual']:.6f},"
+                    f"{entry['boundary']:.6f},{entry['grad_norm']:.6f},"
+                    f"{entry['epoch_time']:.4f}\n"
                 )
 
     def write_stage2_meta(self, run_dir: Path, scale: float) -> None:
@@ -718,6 +710,7 @@ class NetworkManager:
         *,
         prior: FoundationModel | None = None,
         scale: float = 1.0,
+        stage1_run_dir: Path | None = None,
     ) -> None:
         self.config = config
         self.seed = seed
@@ -750,13 +743,14 @@ class NetworkManager:
         self._psi_fn = self._field.make_psi_fn()
         self._psi_fn_jit = jax.jit(self._psi_fn)
 
-        # Corrector: if stage1_run_dir is not supplied at to_disk time it must be set externally.
+        if stage1_run_dir is not None and prior is None:
+            raise ValueError("stage1_run_dir is only valid for a corrector")
         self._prior = prior
         self._scale = scale
         self._files = _FileStorageManager(
             name=name,
             output_dir=output_dir,
-            is_corrector=prior is not None,
+            stage1_run_dir=stage1_run_dir,
         )
 
         self.train_set = self.sampler._get_sobol_sample(
@@ -812,19 +806,15 @@ class NetworkManager:
     # Persistence
     # ------------------------------------------------------------------
 
-    def to_disk(self, stage1_run_dir: Path | None = None) -> str:
+    def to_disk(self) -> str:
         """Save params, config, training CSV, and benchmark artifacts.
 
-        For a corrector pass ``stage1_run_dir`` to nest the stage-2 artifacts
-        under ``<stage1_run_dir>/stage2/``.  Also writes ``stage2_meta.json``.
+        Correctors configured with ``stage1_run_dir`` are nested under
+        ``<stage1_run_dir>/stage2/`` and include ``stage2_meta.json``.
         """
         if self._files.artifact_stem is None:
             self._files.artifact_stem = self._files.new_artifact_stem()
         self.artifact_stem = self._files.artifact_stem
-
-        if stage1_run_dir is not None:
-            self._files._is_corrector = True
-            self._files._stage1_run_dir = stage1_run_dir
 
         run_dir = self._files.run_dir()
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -967,7 +957,12 @@ class NetworkManager:
         weight_flux_scale: float,
         soft_bc: bool,
     ) -> tuple[
-        train_state.TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray
+        train_state.TrainState,
+        jnp.ndarray,
+        jnp.ndarray,
+        jnp.ndarray,
+        jnp.ndarray,
+        jnp.ndarray,
     ]:
         """Single training step; closed over self._psi_fn so plain/corrector share one kernel."""
         psi_fn = self._psi_fn
@@ -990,24 +985,37 @@ class NetworkManager:
             state.params
         )
         grad_norm = optax.tree_utils.tree_norm(grads)
-        return state.apply_gradients(grads=grads), loss, l_res, l_dir, l_per_cfg, grad_norm
+        return (
+            state.apply_gradients(grads=grads),
+            loss,
+            l_res,
+            l_dir,
+            l_per_cfg,
+            grad_norm,
+        )
 
     def train_epoch(self, epoch: int) -> tuple[float, float, float, float]:
-        """Run one training epoch.
-
-        Returns:
-            Tuple of (total_loss, residual_loss, boundary_loss, grad_norm).
-        """
-        loss, l_res, l_dir, b_grad_norm = 0.0, 0.0, 0.0, 0.0
+        """Run one training epoch and aggregate every minibatch."""
         self.sampler.precompute_coordinate_samples()
 
-        all_losses = []
+        losses = []
+        residuals = []
+        boundaries = []
+        batch_sizes = []
+        per_config_losses = []
         grad_norms = []
 
         for i in range(0, len(self.train_set), self.config.batch_size):
             train_batch = self.train_set[i : i + self.config.batch_size]
             inputs = self.sampler.sample_flux_input(plasma_configs=train_batch)
-            self.state, loss, l_res, l_dir, per_config_loss, b_grad_norm = self._train_step_jit(
+            (
+                self.state,
+                loss,
+                l_res,
+                l_dir,
+                per_config_loss,
+                grad_norm,
+            ) = self._train_step_jit(
                 self.state,
                 inputs,
                 self.config.weight_boundary_condition,
@@ -1015,19 +1023,31 @@ class NetworkManager:
                 self.config.weight_flux_scale,
                 self.config.soft_bc,
             )
-            all_losses.append(per_config_loss)
-            grad_norms.append(b_grad_norm)
-
-        avg_grad_norm = float(jnp.mean(jnp.array(grad_norms)))
+            losses.append(loss)
+            residuals.append(l_res)
+            boundaries.append(l_dir)
+            batch_sizes.append(len(train_batch))
+            per_config_losses.append(per_config_loss)
+            grad_norms.append(grad_norm)
 
         if epoch % RESAMPLING_FREQUENCY == 0 and epoch > 0:
             self.train_set = self.sampler.resample_train_set(
                 train_set=self.train_set,
                 epoch=epoch,
-                per_config_losses=all_losses,
+                per_config_losses=per_config_losses,
             )
 
-        return float(loss), float(l_res), float(l_dir), avg_grad_norm
+        weights = jnp.asarray(batch_sizes)
+
+        def weighted_mean(values: list[jnp.ndarray]) -> float:
+            return float(jnp.average(jnp.asarray(values), weights=weights))
+
+        return (
+            weighted_mean(losses),
+            weighted_mean(residuals),
+            weighted_mean(boundaries),
+            weighted_mean(grad_norms),
+        )
 
     def training_renderable(self) -> Panel:
         """Current metrics table + progress bar; rendered by Live or the HPO TUI."""
@@ -1091,7 +1111,15 @@ class NetworkManager:
 
                     lr = float(self._lr_schedule(self.state.step))
                     self._metrics.log(
-                        epoch, loss, residual, boundary, val_kpi_median, lr, grad_norm, epoch_time
+                        epoch,
+                        loss,
+                        residual,
+                        boundary,
+                        val_kpi_median,
+                        lr,
+                        grad_norm,
+                        int(self.state.step),
+                        epoch_time,
                     )
 
             if self.config.lbfgs_steps > 0:

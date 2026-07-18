@@ -60,8 +60,9 @@ from optuna.pruners import HyperbandPruner, NopPruner
 from optuna.samplers import TPESampler
 
 from src.engine.model_evaluation import evaluate_validation_loss_stats
-from src.engine.network import NetworkManager
-from src.lib.config import KPI_EVAL_CONFIGS, Filepaths, current_commit
+from src.engine.network import FoundationModel, NetworkManager
+from src.engine.residual_correction import load_foundation
+from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG, Filepaths, current_commit
 from src.lib.network_config import HyperParams
 from src.lib.optuna_tui import HpoApp, OptunaProgressDisplay, logger, resolve_reset_choice
 
@@ -123,7 +124,7 @@ class SearchSpaceConfig:
         - list   = discrete choices
         - Range  = continuous
 
-    Field names mirror HyperParams.
+    Fields mirror HyperParams except for the corrector's stage2_scale.
     """
 
     hidden_dims: tuple[int, ...] | list[tuple[int, ...]] = field(
@@ -145,13 +146,14 @@ class SearchSpaceConfig:
     huber_delta: float = 0.0
     n_fourier_features: int = 0
     lbfgs_steps: int = 0
+    stage2_scale: float | list[float] | Range = 0.01
 
     def get_static_params(self) -> dict[str, Any]:
         """Fields pinned to a single value -- fed straight into HyperParams(**...)."""
         return {
             f.name: getattr(self, f.name)
             for f in fields(self)
-            if not isinstance(getattr(self, f.name), list | Range)
+            if f.name != "stage2_scale" and not isinstance(getattr(self, f.name), list | Range)
         }
 
     def get_suggestable_params(self) -> dict[str, list | Range]:
@@ -159,7 +161,7 @@ class SearchSpaceConfig:
         return {
             f.name: getattr(self, f.name)
             for f in fields(self)
-            if isinstance(getattr(self, f.name), list | Range)
+            if f.name != "stage2_scale" and isinstance(getattr(self, f.name), list | Range)
         }
 
     def budget_mismatch(self, hparams: HyperParams) -> dict[str, Any]:
@@ -186,14 +188,14 @@ class StudyConfig:
 
     study_name: str = "arch_wide_or_deep_2400ep"
     n_trials: int = 20
-    top_k: int = 5
+    top_k: int = 3
     n_startup_trials: int = 10
     n_validate: int = KPI_EVAL_CONFIGS
     min_epochs: int = _DEFAULT_TOTAL_EPOCHS // 8
     total_epochs: int = _DEFAULT_TOTAL_EPOCHS
     prune_trials: bool = True
-    # "none": no checkpoints/benchmark dirs (--test). "top_k": only trials that rank in
-    # the current top_k get saved (post-hoc). "all": every trial saves during training.
+    # "none": no checkpoints/benchmark dirs (--test). "top_k": completed trials save
+    # post-hoc. "all": every trial saves during training and retains its train.log.
     checkpoint_policy: Literal["none", "top_k", "all"] = "top_k"
     # Retrain (at this study's budget) or skip warmstart configs with a mismatched budget.
     # Resolved in main(); lives on `study` so it survives the HpoApp path unchanged.
@@ -206,6 +208,49 @@ class StudyConfig:
     # Disabled in --test: a smoke test's tiny budget is incomparable, and injected
     # trials would consume the small n_trials budget.
     warmstart: bool = True
+    # Frozen stage-1 checkpoint used by every trial in a corrector study.
+    stage1_run: str | None = None
+
+
+def _record_foundation(study_path: Path, stage1_run: str | None, source: Path | None) -> None:
+    """Persist the foundation identity and a self-contained checkpoint copy."""
+    path = study_path / "foundation.json"
+    if path.exists():
+        saved = json.loads(path.read_text()).get("stage1_run")
+        if saved != stage1_run:
+            raise ValueError(
+                f"Study foundation is {saved!r}, but this run requested {stage1_run!r}"
+            )
+    if source is not None:
+        destination = study_path / "_foundation"
+        destination.mkdir(exist_ok=True)
+        if source.resolve() != destination.resolve():
+            for artifact in ("config.json", "network.flax"):
+                shutil.copy2(source / artifact, destination / artifact)
+    if not path.exists() and stage1_run is not None:
+        path.write_text(json.dumps({"stage1_run": stage1_run}, indent=2) + "\n")
+
+
+def _write_objective_metadata(
+    study_path: Path,
+    *,
+    score_beta: float,
+    n_validate: int,
+    points_per_config: int,
+    overwrite: bool = False,
+) -> None:
+    """Persist the protocol needed to interpret every objective value."""
+    path = study_path / "objective.json"
+    metadata = {
+        "formula": "loss_median + score_beta * loss_p95",
+        "score_beta": score_beta,
+        "n_validate": n_validate,
+        "points_per_config": points_per_config,
+        "evaluator_commit": current_commit(),
+    }
+    if path.exists() and not overwrite and json.loads(path.read_text()) != metadata:
+        raise ValueError(f"Study objective protocol does not match {path}")
+    path.write_text(json.dumps(metadata, indent=2) + "\n")
 
 
 def study_dir(study_name: str, commit: str | None = None) -> Path:
@@ -420,7 +465,11 @@ def _inject_historical_trials(
         )
 
 
-def check_capacity(search_space: SearchSpaceConfig, study: StudyConfig) -> None:
+def check_capacity(
+    search_space: SearchSpaceConfig,
+    study: StudyConfig,
+    foundation: FoundationModel | None = None,
+) -> None:
     """Verify the search space's most resource-demanding config trains without crashing."""
     suggestable = search_space.get_suggestable_params()
     picked = {
@@ -430,7 +479,7 @@ def check_capacity(search_space: SearchSpaceConfig, study: StudyConfig) -> None:
         for name, spec in suggestable.items()
     }
     hp = HyperParams(**search_space.get_static_params(), **picked)
-    manager = NetworkManager(hp, n_validation_size=study.n_validate)
+    manager = NetworkManager(hp, n_validation_size=study.n_validate, prior=foundation)
     manager.train_epoch(0)
     jax.clear_caches()
     logger.info(f"Capacity check passed: {len(hp.hidden_dims)}x{hp.hidden_dims[0]}")
@@ -442,6 +491,7 @@ def objective(
     study: StudyConfig,
     display: OptunaProgressDisplay,
     hpo_benchmark_dir: Path,
+    foundation: FoundationModel | None = None,
 ) -> float:
     """Train one network and return its fused ranking score (median + beta*p95 of |R_GS|).
 
@@ -450,6 +500,15 @@ def objective(
     training loss.  Pruning and ranking therefore measure the same quantity.
     """
     hp = build_hyperparams(trial, search_space)
+    stage2_scale = 1.0
+    if foundation is not None:
+        scale_spec = search_space.stage2_scale
+        stage2_scale = (
+            _suggest(trial, "stage2_scale", scale_spec)
+            if isinstance(scale_spec, list | Range)
+            else scale_spec
+        )
+        trial.set_user_attr("stage2_scale", stage2_scale)
     display_params = {
         "depth": len(hp.hidden_dims),
         "width": hp.hidden_dims[0],
@@ -457,12 +516,15 @@ def objective(
         "lr_min": hp.learning_rate_min,
         "wd": hp.weight_decay,
         "sig": hp.sigma_residual_adaptive_sampling,
+        "eps": stage2_scale if foundation is not None else None,
     }
     manager = NetworkManager(
         hp,
         n_validation_size=study.n_validate,
         test_mode=study.checkpoint_policy == "none",
         output_dir=hpo_benchmark_dir,
+        prior=foundation,
+        scale=stage2_scale,
     )
     total_epochs = hp.warmup_epochs + hp.decay_epochs
     display.start_trial(trial.number + 1, display_params, total_epochs)
@@ -493,15 +555,7 @@ def objective(
         val_median, val_p95 = evaluate_validation_loss_stats(manager)
         val_score = val_median + study.score_beta * val_p95
         if study.checkpoint_policy == "top_k":
-            completed = sorted(
-                t.value
-                for t in trial.study.get_trials(states=(optuna.trial.TrialState.COMPLETE,))
-                if t.value is not None
-            )
-            if len(completed) < study.top_k or val_score < completed[study.top_k - 1]:
-                trial.set_user_attr("checkpoint", manager.to_disk())
-        elif study.checkpoint_policy == "all":  # train() already saved; stem is the name
-            trial.set_user_attr("checkpoint", manager.artifact_stem)
+            manager.to_disk()
         display.update(
             trial.number + 1,
             display_params,
@@ -534,7 +588,12 @@ def _write_trials_json(study: optuna.Study, hpo_benchmark_dir: Path) -> None:
     (hpo_benchmark_dir / "trials.json").write_text(
         json.dumps(
             [
-                {"trial": t.number, "state": t.state.name, "value": t.value, **t.user_attrs}
+                {
+                    "trial": t.number,
+                    "state": t.state.name,
+                    "value": t.value,
+                    **{key: value for key, value in t.user_attrs.items() if key != "checkpoint"},
+                }
                 for t in study.get_trials(deepcopy=False)
                 if t.state != optuna.trial.TrialState.FAIL
             ],
@@ -544,8 +603,20 @@ def _write_trials_json(study: optuna.Study, hpo_benchmark_dir: Path) -> None:
 
 
 def _save_top_configs(
-    results: list[tuple[HyperParams, float]], study: optuna.Study, hpo_benchmark_dir: Path
+    results: list[tuple[HyperParams, float]],
+    study: optuna.Study,
+    hpo_benchmark_dir: Path,
 ) -> None:
+    ranked_trials = sorted(
+        (
+            trial
+            for trial in study.trials
+            if trial.state == optuna.trial.TrialState.COMPLETE
+            and trial.value is not None
+            and not trial.user_attrs.get("warmstart", False)
+        ),
+        key=lambda trial: trial.value,
+    )[: len(results)]
     output_file = hpo_benchmark_dir / "top_trials.json"
     output_file.write_text(
         json.dumps(
@@ -558,7 +629,16 @@ def _save_top_configs(
                 "n_pruned": sum(t.state == optuna.trial.TrialState.PRUNED for t in study.trials),
                 "best_loss": results[0][1] if results else None,
                 "top_k": [
-                    {"rank": rank, "loss": loss, "config": hp.to_dict()}
+                    {
+                        "rank": rank,
+                        "loss": loss,
+                        "config": hp.to_dict(),
+                        **(
+                            {"stage2_scale": ranked_trials[rank - 1].user_attrs["stage2_scale"]}
+                            if "stage2_scale" in ranked_trials[rank - 1].user_attrs
+                            else {}
+                        ),
+                    }
                     for rank, (hp, loss) in enumerate(results, 1)
                 ],
             },
@@ -568,24 +648,61 @@ def _save_top_configs(
     logger.info(f"Top configurations saved to {output_file}")
 
 
-def _generate_benchmark_report(study: optuna.Study, hpo_benchmark_dir: Path) -> None:
-    """Render the LaTeX benchmark PDF for completed trials with a saved run directory.
+def _bundle_top_artifacts(trials: list[optuna.trial.FrozenTrial], hpo_benchmark_dir: Path) -> None:
+    """Copy lightweight artifacts for the ranked trials into top_k/."""
+    bundle_dir = hpo_benchmark_dir / "top_k"
+    shutil.rmtree(bundle_dir, ignore_errors=True)
+    bundle_dir.mkdir()
+    manifest = []
+    study_dir = hpo_benchmark_dir.resolve()
+    for rank, trial in enumerate(trials, 1):
+        run = trial.user_attrs.get("run")
+        if run is None:
+            continue
+        source = (hpo_benchmark_dir / run).resolve()
+        if source.parent != study_dir:
+            raise ValueError(f"Trial {trial.number} has invalid run path {run!r}")
+        if not (source / "network.flax").exists():
+            continue
+        destination = bundle_dir / f"{rank:02d}_{run}"
+        destination.mkdir()
+        artifacts = []
+        for artifact in source.iterdir():
+            if artifact.is_file() and artifact.name != "network.flax":
+                shutil.copy2(artifact, destination / artifact.name)
+                artifacts.append(artifact.name)
+        manifest.append(
+            {
+                "rank": rank,
+                "trial": trial.number,
+                "value": trial.value,
+                "source": run,
+                "artifacts": sorted(artifacts),
+            }
+        )
+    (bundle_dir / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+
+
+def _generate_benchmark_report(
+    trials: list[optuna.trial.FrozenTrial], hpo_benchmark_dir: Path
+) -> None:
+    """Render the LaTeX benchmark PDF for the ranked trials.
 
     Failures do not propagate -- a broken report must not fail a finished study.
     """
+    output_path = hpo_benchmark_dir / "benchmark_report.pdf"
+    output_path.unlink(missing_ok=True)
     run_dirs = [
         hpo_benchmark_dir / t.user_attrs["run"]
-        for t in study.trials
-        if t.state == optuna.trial.TrialState.COMPLETE
-        and "checkpoint" in t.user_attrs
-        and (hpo_benchmark_dir / t.user_attrs.get("run", "") / "network.flax").exists()
+        for t in trials
+        if (hpo_benchmark_dir / t.user_attrs.get("run", "") / "network.flax").exists()
     ]
     if not run_dirs:
         return
     try:
         from src.engine.benchmark_report import generate_report
 
-        generate_report(run_dirs, output_path=hpo_benchmark_dir / "benchmark_report.pdf")
+        generate_report(run_dirs, output_path=output_path)
     except Exception as e:
         logger.warning(f"Benchmark report generation failed: {e}")
 
@@ -600,12 +717,35 @@ def run_optimization(
     """Run or resume a study and return its best configurations."""
     search_space = search_space or SearchSpaceConfig()
     study = study or StudyConfig()
+    if study.stage1_run is not None and study.warmstart:
+        raise ValueError("Corrector studies require StudyConfig(warmstart=False)")
     # Freeze the commit once for the whole run: a commit made mid-study would
     # otherwise move study.db / optuna.log / trials.json to a different path
     # and split the study across two commit dirs.
     commit = current_commit()
     hpo_benchmark_dir = study_dir(study.study_name, commit)
-    file_handler = logging.FileHandler(hpo_benchmark_dir / "optuna.log")
+    if not restart:
+        _write_objective_metadata(
+            hpo_benchmark_dir,
+            score_beta=study.score_beta,
+            n_validate=study.n_validate,
+            points_per_config=KPI_POINTS_PER_CONFIG,
+        )
+    foundation = None
+    foundation_source = None
+    if study.stage1_run is not None:
+        local_foundation = hpo_benchmark_dir / "_foundation"
+        local_complete = all(
+            (local_foundation / artifact).exists() for artifact in ("config.json", "network.flax")
+        )
+        foundation, _, foundation_source = load_foundation(
+            local_foundation if local_complete else study.stage1_run,
+            soft_bc=search_space.soft_bc,
+        )
+    _record_foundation(hpo_benchmark_dir, study.stage1_run, foundation_source)
+    file_handler = logging.FileHandler(
+        hpo_benchmark_dir / "optuna.log", mode="w" if restart else "a"
+    )
     file_handler.setFormatter(
         logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
     )
@@ -624,35 +764,25 @@ def run_optimization(
         search_space, retrain=study.retrain, score_beta=study.score_beta
     )
     candidates += _get_experiment_db_configs(legacy_ledger, None, study.score_beta)
-    check_capacity(search_space, study)
+    check_capacity(search_space, study, foundation)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     storage_path = hpo_benchmark_dir / "study.db"
-    if restart and storage_path.exists():
-        storage_path.unlink()
-
-    # Concurrent create_study calls on one sqlite file race optuna's
-    # check-then-insert and corrupt the db with duplicate study rows
-    #
-    # Crashed TUIs stay open by design, so a relaunch while one is alive is the common case.
-    # Guard with an atomically-acquired lock (O_EXCL: no check-then-write gap).
-    lock = hpo_benchmark_dir / ".lock"
-    try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    except FileExistsError:
-        pid = lock.read_text().strip()
-        if pid.isdigit() and Path(f"/proc/{pid}").exists():
-            raise RuntimeError(
-                f"Study '{study.study_name}' is already running (pid {pid}). "
-                "Concurrent runs corrupt the study db -- quit the other process "
-                "first (crashed TUIs stay open; press q there)."
-            ) from None
-        # Lock file names a pid that's no longer alive -- stale lock from a
-        # crashed process, safe to reclaim.
-        lock.unlink(missing_ok=True)
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-    with os.fdopen(fd, "w") as f:
-        f.write(str(os.getpid()))
+    if restart:
+        storage_path.unlink(missing_ok=True)
+        for run_dir in hpo_benchmark_dir.glob("pinn_*"):
+            if run_dir.is_dir():
+                shutil.rmtree(run_dir)
+        for artifact in ("trials.json", "top_trials.json", "benchmark_report.pdf"):
+            (hpo_benchmark_dir / artifact).unlink(missing_ok=True)
+        shutil.rmtree(hpo_benchmark_dir / "top_k", ignore_errors=True)
+        _write_objective_metadata(
+            hpo_benchmark_dir,
+            score_beta=study.score_beta,
+            n_validate=study.n_validate,
+            points_per_config=KPI_POINTS_PER_CONFIG,
+            overwrite=True,
+        )
 
     try:
         optuna_study = optuna.create_study(
@@ -731,7 +861,9 @@ def run_optimization(
         display._prior_trials = prior_trials
         display._warmstart_trials = warmstart_trials
         optuna_study.optimize(
-            lambda trial: objective(trial, search_space, study, display, hpo_benchmark_dir),
+            lambda trial: objective(
+                trial, search_space, study, display, hpo_benchmark_dir, foundation
+            ),
             n_trials=max(0, study.n_trials - prior_trials),
             catch=(Exception,),
         )
@@ -740,7 +872,9 @@ def run_optimization(
             (
                 t
                 for t in optuna_study.trials
-                if t.state == optuna.trial.TrialState.COMPLETE and t.value is not None
+                if t.state == optuna.trial.TrialState.COMPLETE
+                and t.value is not None
+                and not t.user_attrs.get("warmstart", False)
             ),
             key=lambda trial: trial.value,
         )[: study.top_k]
@@ -753,16 +887,13 @@ def run_optimization(
             )
         _save_top_configs(results, optuna_study, hpo_benchmark_dir)
         _write_trials_json(optuna_study, hpo_benchmark_dir)
-        _generate_benchmark_report(optuna_study, hpo_benchmark_dir)
+        if study.checkpoint_policy != "none":
+            _bundle_top_artifacts(complete, hpo_benchmark_dir)
+            _generate_benchmark_report(complete, hpo_benchmark_dir)
         return results
     except KeyboardInterrupt:
-        # Discard the study dir so the next launch starts fresh. Warmstart
-        # trials come from the benchmark db (not this dir), so nothing is lost.
-        shutil.rmtree(hpo_benchmark_dir)
-        logger.info("Interrupted by user -- removed study directory")
+        logger.info("Interrupted by user -- completed trial artifacts preserved")
         raise
-    finally:
-        lock.unlink(missing_ok=True)
 
 
 def resolve_retrain_choice(search_space: SearchSpaceConfig) -> bool:

@@ -100,7 +100,9 @@ def get_hpo_studies(archived: bool = False) -> dict[str, list[str]]:
         return {}
     return {
         study.name: sorted(
-            run.name for run in study.iterdir() if run.is_dir() and (run / "network.flax").exists()
+            run.name
+            for run in study.iterdir()
+            if run.is_dir() and not run.name.startswith("_") and (run / "network.flax").exists()
         )
         for study in sorted(p for p in root.iterdir() if p.is_dir() and p.name != "_archive")
     }

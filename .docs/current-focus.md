@@ -43,8 +43,8 @@ numbers) — don't change the seed casually.
 4. **Defaults** (`src/lib/network_config.py`): `huber_delta=1.0`,
    `n_fourier_features=64`, `lbfgs_steps=0`.
 5. **HPO parity**: Optuna builds `HyperParams` from `SearchSpaceConfig` and
-   calls `NetworkManager.train` (no duplicated loop); dedicated validation
-   sampler; Textual TUI, non-tty → plain Rich Live. Trials ranked by fused
+   calls `NetworkManager.train` (no duplicated loop); validation uses the fixed
+   shared KPI stream; Textual TUI, non-tty → plain Rich Live. Trials ranked by fused
    `median + β·p95` of held-out |R_GS|; study end emits `benchmark_report.pdf`
    (`src/engine/benchmark_report.py`, direct pdflatex — pandoc dropped because
    it silently ate `\clearpage`).
@@ -78,32 +78,8 @@ reports — not yet confirmed installed.
   todo.md are on the old TF32 scale and not comparable. The O-point tail
   shape survives the fix, but absolute targets in todo.md need rebasing.
 
-## Architecture search results (2026-07-17)
-
-Overnight architectural sweep (PirateNet + RWF, 600-epoch budget, commit 22741a7):
-
-| Variant | Median |R_GS| | vs baseline |
-|---|---|---|
-| 2×128 plain MLP (baseline, nff=64, lr=2e-3, 600ep) | 0.00548 | — |
-| + RWF only | 0.00383 | −30% |
-| + PirateNet 2×128, nff=64 | 0.00193 | −65% |
-| + PirateNet 2×128, nff=0 (ablation winner) | 0.00192 | −65% |
-| + PirateNet 2×128, nff=0, 1200ep | ~0.0012 | −78% |
-| + PirateNet 2×128, nff=0, lr=1e-3, 2400ep | 0.00112 | −80% |
-| HPO record (5×200 MLP, nff=0, tuned lr, 2400ep) | 3.06e-4 | — |
-
-Key decisions:
-- **nff=0 wins for PirateNet**: Fourier features hurt (+185% median). PirateNet's α=0 init is already linear; rich FF basis adds noise not signal.
-- **lr=1e-3 required at 2400 epochs**: lr=2e-3 caused spikes at epochs 650, 1150 (training divergence). Consistent with HPO record lr_max=1.28e-3.
-- **2×256 OOM'd**: batch_size=32 fits 2×128 (9.1 GB) but 2×256 at batch 32 still fails. Capacity scaling is GPU-constrained without gradient accumulation.
-- **Multistage corrector (stage-2, σ=2, ε=0.01)**: delivered −37% at matched budget on earlier 1200-ep checkpoint. ε=0.01 critical — ε=1.0 destroyed the converged field. σ=6 offered no gain. In progress on 2026-07-17 2400-ep champion.
-- **PirateNet mechanism**: α=0 init per block → identity map at step 0; α grows adaptively as nonlinearity is needed. Avoids MLP spectral-bias pathology. Reference: arXiv:2402.00326.
-- **RWF mechanism**: W = diag(exp(s)) · V, coupled init so effective kernel = Glorot draw at init. Improves conditioning of the loss landscape. Reference: arXiv:2210.01274.
-
-Remaining gap to HPO record: ~3.7× (0.00112 vs 3.06e-4). The HPO record used a tuned architecture (5×200 MLP, much larger capacity). PirateNet hasn't been HPO-tuned; running HPO with arch=piratenet + RWF + nff=0 is the natural next step.
-
 ## Corrector unified into NetworkManager (2026-07-17)
-`ResidualCorrectionManager`, `CombinedManager`, and `make_correction_psi_fn` are deleted. Multistage residual correction is now a `NetworkManager` construction option: `NetworkManager(config, prior=FoundationModel(...), scale=...)` builds a corrector whose `_Field` composes `psi1 + scale·psi2`. `load_combined(name)` in `src/engine/residual_correction.py` returns a composed `NetworkManager` directly. The parallel manager hierarchy is gone; `residual_correction.py` is now only the corrector CLI plus `load_combined`.
+`ResidualCorrectionManager`, `CombinedManager`, and `make_correction_psi_fn` are deleted. Multistage residual correction is now a `NetworkManager` construction option: `NetworkManager(config, prior=FoundationModel(...), scale=...)` builds a corrector whose `_Field` composes `psi1 + scale·psi2`. `load_checkpoint(name)` in `src/engine/residual_correction.py` reconstructs plain and composed checkpoints through one path. The parallel manager hierarchy is gone.
 
 ## Open threads (each has a root-level handoff note)
 - **`todo.md` — near-floor HPO plan**, in priority order: (1) relative

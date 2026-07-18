@@ -118,7 +118,17 @@ def network_models(name: str) -> dict:
     if (corrector_dir / "network.flax").exists():
         scale = json.loads(meta_path.read_text()).get("scale", 1.0) if meta_path.exists() else 1.0
         corrector = {"name": f"{name}/stage2", "scale": scale}
-    return {"foundation": {"name": name}, "corrector": corrector}
+        foundation_name = name
+    else:
+        foundation_path = run_dir.parent / "foundation.json"
+        meta_path = run_dir / "stage2_meta.json"
+        if foundation_path.exists() and meta_path.exists():
+            foundation_name = json.loads(foundation_path.read_text())["stage1_run"]
+            scale = json.loads(meta_path.read_text()).get("scale", 1.0)
+            corrector = {"name": name, "scale": scale}
+        else:
+            foundation_name = name
+    return {"foundation": {"name": foundation_name}, "corrector": corrector}
 
 
 @app.get("/api/network/{name:path}/kpis")
