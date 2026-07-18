@@ -28,6 +28,11 @@ and `val_kpi_median` (full protocol, 0.64 s cached) replaces the
 composite-loss `val_loss`. Ranking is protected by the fixed eval seed (common random
 numbers) — don't change the seed casually.
 
+Shared training now has patience stopping: a three-round rolling validation mean must improve by
+at least 1% within six consecutive validation rounds. Plateaued runs restore the best validation
+checkpoint; Optuna records them as completed/rankable trials, with stop metadata in trial attrs and
+`training_summary.json` rather than treating convergence as a failure.
+
 ## Design decisions that shape the code
 1. **Hard Dirichlet BC**: `psi_fn` output × envelope `1 - ρ̃²`,
    `ρ̃ = boundary_normalized_radius(R,Z,boundary)` (`src/engine/plasma.py`).

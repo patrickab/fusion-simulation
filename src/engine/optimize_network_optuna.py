@@ -60,7 +60,13 @@ from optuna.pruners import HyperbandPruner, NopPruner
 from optuna.samplers import TPESampler
 
 from src.engine.model_evaluation import evaluate_validation_loss_stats
-from src.engine.network import FoundationModel, NetworkManager
+from src.engine.network import (
+    EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT,
+    EARLY_STOPPING_PATIENCE,
+    EARLY_STOPPING_ROLLING_WINDOW,
+    FoundationModel,
+    NetworkManager,
+)
 from src.engine.residual_correction import load_foundation
 from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG, Filepaths, current_commit
 from src.lib.network_config import HyperParams
@@ -246,6 +252,11 @@ def _write_objective_metadata(
         "score_beta": score_beta,
         "n_validate": n_validate,
         "points_per_config": points_per_config,
+        "early_stopping": {
+            "patience": EARLY_STOPPING_PATIENCE,
+            "min_relative_improvement": EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT,
+            "rolling_window": EARLY_STOPPING_ROLLING_WINDOW,
+        },
         "evaluator_commit": current_commit(),
     }
     if path.exists() and not overwrite and json.loads(path.read_text()) != metadata:
@@ -548,6 +559,10 @@ def objective(
             validation_callback=report,
             show_progress=False,
         )
+        summary = manager.training_summary or {}
+        trial.set_user_attr("stop_reason", summary.get("stop_reason", "unknown"))
+        trial.set_user_attr("trained_epochs", summary.get("trained_epochs", total_epochs))
+        trial.set_user_attr("best_validation_epoch", summary.get("best_validation_epoch"))
         # Ranking metric: fused median + beta*p95 of |R_GS| over validation
         # configs (see evaluate_validation_loss_stats/score). Median alone ignores
         # worst-case error; max is a high-variance single-point estimator.
@@ -561,7 +576,7 @@ def objective(
             display_params,
             val_score,
             "done",
-            total_epochs,
+            summary.get("trained_epochs", total_epochs),
             median=val_median,
             p95=val_p95,
         )
