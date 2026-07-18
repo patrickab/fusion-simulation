@@ -76,8 +76,8 @@ docs/
 ├── hpo/                        # Current PirateNet foundation campaign plan
 └── performance/                # One note per perf change with runnable benchmark and measured cost
 
-AGENTS.md                       # Operational rules: uv run only, tmux windows for long jobs,
-                                # training/HPO entry-point flags, --reset-sqlite semantics
+AGENTS.md                       # Dev basics: uv-only, module entry points + --test smoke tests
+                                # (HPO/tmux/benchmark conventions live in the vibe-hpo skill)
 run-webapp.sh                   # Launches uvicorn (8010) + vite dev (5173) together
 scripts/                        # KPI calibration/re-eval, legacy N6 preset, resumable PirateNet campaign
 tests/                          # unittest coverage for patience stopping + numerical refactor fixture
