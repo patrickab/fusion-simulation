@@ -86,6 +86,11 @@ body {
   letter-spacing: 0.12em; text-transform: uppercase; color: var(--faint);
 }
 .row { display: flex; align-items: center; gap: 8px; }
+.model-list { display: grid; gap: 8px; }
+.model-row { display: grid; gap: 2px; min-width: 0; }
+.model-role { font-size: 11px; color: var(--muted); }
+.model-name { overflow-wrap: anywhere; }
+.model-detail { color: var(--faint); }
 
 /* ---- controls ---- */
 .ctl { display: block; margin: 10px 0; }

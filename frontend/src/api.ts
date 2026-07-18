@@ -41,6 +41,11 @@ export interface SampleResponse {
 export type GridQuantity = 'flux' | 'residual'
 export type HpoStudies = Record<string, string[]>
 
+export interface NetworkModels {
+  foundation: { name: string }
+  corrector: { name: string; scale: number } | null
+}
+
 export interface Grid2D {
   theta: number[]
   rho: number[]
@@ -107,6 +112,7 @@ export const api = {
     fetch(`/api/hpo?archived=${archived}`).then((r) => toJson<HpoStudies>(r)),
   config_file: (name: string) =>
     fetch(`/api/network/${enc(name)}/config`).then((r) => toJson<Record<string, unknown>>(r)),
+  models: (name: string) => fetch(`/api/network/${enc(name)}/models`).then((r) => toJson<NetworkModels>(r)),
   kpis: (name: string) => fetch(`/api/network/${enc(name)}/kpis`).then((r) => toJson<Kpis>(r)),
   archive: (name: string) => fetch(`/api/network/${enc(name)}/archive`, { method: 'POST' }).then((r) => toJson(r)),
   rename: (name: string, newName: string) =>

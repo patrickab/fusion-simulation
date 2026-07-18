@@ -104,6 +104,23 @@ def network_config(name: str) -> dict:
     return json.loads(config_path.read_text())
 
 
+@app.get("/api/network/{name:path}/models")
+def network_models(name: str) -> dict:
+    """Describe the foundation and optional stage-2 corrector for a run."""
+    try:
+        run_dir = resolve_run_directory(name)
+    except FileNotFoundError:
+        raise HTTPException(404, f"Run dir not found: {name}") from None
+
+    corrector_dir = run_dir / "stage2"
+    corrector = None
+    meta_path = corrector_dir / "stage2_meta.json"
+    if (corrector_dir / "network.flax").exists():
+        scale = json.loads(meta_path.read_text()).get("scale", 1.0) if meta_path.exists() else 1.0
+        corrector = {"name": f"{name}/stage2", "scale": scale}
+    return {"foundation": {"name": name}, "corrector": corrector}
+
+
 @app.get("/api/network/{name:path}/kpis")
 def network_kpis(name: str) -> dict:
     """Stored post-training KPIs (kpis.json) — never recomputed at request time."""
