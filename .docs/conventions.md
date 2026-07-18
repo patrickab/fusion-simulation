@@ -29,7 +29,7 @@
 |---|---|
 | `react` 19 + `react-dom` | UI runtime |
 | `three` + `@react-three/fiber` + `@react-three/drei` | WebGL 3D (react-three-fiber) |
-| `plotly.js-cartesian-dist-min` + `react-plotly.js` | 2D heatmaps/scatters (trimmed bundle) |
+| `plotly.js` + `react-plotly.js` | Custom partial bundle for scatter, carpet and contourcarpet traces |
 | `zustand` | Client state store |
 | `shiki` | JSON syntax highlighting |
 | `vite` 8 + `@vitejs/plugin-react` | Dev server + build |
@@ -41,11 +41,12 @@
 - Python functions use snake_case; pure JAX functions designed for `jit`/`vmap`
 - Streamlit pages use hyphen-separated filenames (e.g., `network-visualisation.py`)
 - Frontend React components use PascalCase; TS modules use camelCase (`api.ts`, `fieldlines.ts`)
-- FastAPI routes: `/api/<resource>/<name>/<action>` (e.g. `/api/network/{name}/bfield`)
+- FastAPI routes: `/api/<resource>/<name>/<action>` (e.g. `/api/network/{name}/fieldlines`)
 - Single-config checkpoints: `data/benchmarks/<YYYY_MM_DD_HH_MM_SS>_<name>_<commit>/`; HPO studies use the same study-slug format and retain `pinn_<timestamp>` trial dirs inside.
+- Checkpoint-compatible architecture toggles are lowercase serialized values: `arch="mlp"|"piratenet"`, `rwf=true|false`; defaults stay on the legacy parameter-tree shape.
 
 ## Linting / Formatting
-- **Python**: Ruff with rule sets E, F, I (isort), B, C4, TCH, SIM, ANN, ARG, RUF. Line length 100. First-party: `src`. Run: `ruff check . && ruff format .`
+- **Python**: Ruff with rule sets E, F, I (isort), B, C4, TCH, SIM, ANN, ARG, RUF. Line length 100. First-party: `src`. Run through uv: `uv run ruff check .` and `uv run ruff format --check .`.
 - **Frontend**: `oxlint src` (lint) + `tsc -b` (typecheck). Vite build: `npm --prefix frontend run build`
 - Run both before considering Python/frontend work done.
 
@@ -60,7 +61,7 @@
 - `useApi(key, fn)` cached fetch keyed by request signature; `invalidate(prefix)` clears stale entries
 - 3D scene is dark, unlit, Z-up→Y-up group; `OrbitControls` with damped idle drift
 - Field-line tracing done server-side (VTK RK45 via PyVista over the 48³ B-grid); client only assembles shipped polylines into a `LineSegments` buffer
-- Heatmap color scales fixed (not per-batch) to match `src/lib/visualization.py` reference
+- Residual heatmap color scales are fixed across checkpoints; flux ranges remain data-driven
 - Dark-only UI: neutral palette, cyan reserved for data/wireframes
 
 ## Commit Style
@@ -70,4 +71,6 @@ Conventional Commits with scope: `perf(physics):`, `feat(artifacts):`, `refactor
 `uv run`/`uv sync` only, never bare `python`/`pip`; module entry points (`uv run python -m src.engine.network`). Long jobs (training/HPO) always in a tmux window named `claude: <name>`, never bare nohup. Optuna launches in tmux need `--reset-sqlite`/`--resume-sqlite` or they hang on an interactive prompt. Perf work documents each change in `docs/performance/` with a runnable benchmark snippet and measured train-step ms + XLA temp memory (`train_step.lower(...).compile().memory_analysis()`).
 
 ## Testing
-No automated test suite present. Physics correctness validated by GS residual magnitude; UI behavior validated by Playwright screenshot checks (see `.claude/settings.local.json` allow-list) and visual inspection.
+- `tests/test_early_stopping.py` uses `unittest` for `_PatienceStopper`; run with `uv run python -m unittest discover -s tests`.
+- `tests/fixtures/refactor_golden.json` preserves single/composed checkpoint KPI and point references for numerical refactor checks.
+- Broader physics correctness is still validated by deterministic GS-residual KPIs and stored benchmark comparisons; frontend validation remains lint/typecheck/build plus visual inspection.
