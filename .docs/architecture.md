@@ -72,7 +72,7 @@ Vite dev server proxies `/api` → `127.0.0.1:8010` (matches `run-webapp.sh`). B
 ## Neural Network (`src/engine/network.py`)
 - **FluxPINN**: MLP with Swish activations. Input: 10 normalized scalars (r, z, r₀, a, κ, δ, p₀, F_axis, α, γ). Output: scalar ψ̂.
 - **Sampler**: Sobol quasi-random sequences for collocation points; 50% Sobol + 50% adaptive (focus on high-loss regions). Geometries resampled every 10 epochs.
-- **NetworkManager**: facade over private collaborators `_Field` (owns the psi-fn; single net or composed `psi1 + scale·psi2`), `_MetricsManager` (Rich table/progress/training_log rows), and `_FileStorageManager` (run dir + all artifact I/O, incl. nested `stage2/` layout). Accepts an optional `FoundationModel` frozen prior to act as a multistage corrector (`NetworkManager(config, prior=FoundationModel(...), scale=...)`); `for_inference` classmethod for lean querying. Loss seam: `compute_loss`/`train_step` take a `psi_fn`. `training.csv` retains epoch-wide loss components, optimizer step, and periodic validation median; `kpis.json` is the complete post-training benchmark record. Saves `network.flax` + `config.json` + `training.csv` + `train.log` per run dir.
+- **NetworkManager**: facade over private collaborators `_Field` (owns the psi-fn; single net or composed `psi1 + scale·psi2`), `_MetricsManager` (Rich table/progress/training_log rows), and `_FileStorageManager` (run dir + all artifact I/O, incl. nested `stage2/` layout). Accepts an optional `FoundationModel` frozen prior to act as a multistage corrector (`NetworkManager(config, prior=FoundationModel(...), scale=...)`); `for_inference` classmethod for lean querying. Loss seam: `compute_loss`/`train_step` take a `psi_fn`. Training stops after six validation rounds without a 1% improvement in the rolling validation mean, restores the best validation-round parameters, and records the outcome in `training_summary.json`; module constants configure patience, threshold, and window. `training.csv` retains epoch-wide loss components, optimizer step, and periodic validation median; `kpis.json` remains the complete final-checkpoint benchmark record. Saves `network.flax` + `config.json` + `training.csv` + `training_summary.json` + `train.log` per run dir.
 - **Optimizer**: AdamW with warmup cosine decay schedule.
 - **Replay**: `uv run python -m src.engine.network --show <commit/run>` re-renders the Rich Training Metrics table for a stored run from its `training.csv` (accepts a dir path or bare `pinn_<timestamp>` too).
 
@@ -96,8 +96,10 @@ Single-config benchmark artifacts live directly under `data/benchmarks/<timestam
 ## HPO (`src/engine/optimize_network_optuna.py`, `src/engine/optimize-network-hparams.py`)
 - **Optuna** (primary): thin TPE/pruning adapter over `NetworkManager.train`; `SearchSpaceConfig`
   owns search bounds and fixed study settings. Standard and HPO training share one epoch,
-  validation, L-BFGS, and saving path. Validation scores the fixed `kpi_benchmark_configs`
-  stream (config construction only — it never advances training Sobol state). HPO runs in a
+  validation, patience stopping, L-BFGS, and saving path. Validation scores the fixed `kpi_benchmark_configs`
+  stream (config construction only — it never advances training Sobol state). A patience stop is
+  a normally completed, rankable Optuna trial (not `FAIL`); its stop metadata is retained in trial
+  user attributes/`trials.json`, while real exceptions remain failed trials. HPO runs in a
   Textual TUI (`HpoApp`): Tab toggles between the
   study-level Rich dashboard and a sequential per-trial log (one styled network.py
   Training Metrics table per finished trial under its header). Non-tty stdout

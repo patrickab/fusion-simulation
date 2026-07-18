@@ -234,9 +234,43 @@ RESAMPLING_FREQUENCY = 10  # Resample training set every N epochs
 LOG_FREQUENCY = 10  # Log training metrics every N epochs
 N_VALIDATION_SIZE = KPI_EVAL_CONFIGS  # Number of validation plasma configs
 VALIDATION_FREQUENCY = 5 * LOG_FREQUENCY  # Evaluate validation set every N epochs
+EARLY_STOPPING_PATIENCE = 6  # Stop after this many non-improving validation rounds
+EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT = 0.01
+EARLY_STOPPING_ROLLING_WINDOW = 3
 # Cap rows shown in the live table; unbounded growth desyncs Rich's redraw
 # once it overflows the terminal, corrupting scrollback.
 LIVE_TABLE_MAX_ROWS = 15
+
+
+class _PatienceStopper:
+    """Track meaningful improvements in a rolling-average validation metric."""
+
+    def __init__(self, patience: int, min_relative_improvement: float, window: int) -> None:
+        if patience < 1 or window < 1 or min_relative_improvement < 0:
+            raise ValueError(
+                "Early-stopping patience/window must be positive and min delta non-negative"
+            )
+        self.patience = patience
+        self.min_relative_improvement = min_relative_improvement
+        self.values: deque[float] = deque(maxlen=window)
+        self.best_value = float("inf")
+        self.best_epoch: int | None = None
+        self.rounds_without_improvement = 0
+
+    def update(self, epoch: int, value: float) -> tuple[bool, bool]:
+        self.values.append(value)
+        if len(self.values) < self.values.maxlen:
+            return False, False
+
+        rolling_average = sum(self.values) / len(self.values)
+        improved = rolling_average <= self.best_value * (1.0 - self.min_relative_improvement)
+        if improved:
+            self.best_value = rolling_average
+            self.best_epoch = epoch
+            self.rounds_without_improvement = 0
+        else:
+            self.rounds_without_improvement += 1
+        return self.rounds_without_improvement >= self.patience, improved
 
 
 class Sampler:
@@ -645,6 +679,9 @@ class _FileStorageManager:
     def write_stage2_meta(self, run_dir: Path, scale: float) -> None:
         (run_dir / "stage2_meta.json").write_text(json.dumps({"scale": scale}) + "\n")
 
+    def write_training_summary(self, run_dir: Path, summary: dict) -> None:
+        (run_dir / "training_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+
     def benchmark(self, manager: "NetworkManager", test_mode: bool) -> None:
         """Save residual montage, grids, and kpis.json for this run."""
         if test_mode:
@@ -759,6 +796,7 @@ class NetworkManager:
             upper_bounds=self.sampler._domain_upper_bounds,
         )
         self.training_log: list[dict] = []
+        self.training_summary: dict | None = None
         self.artifact_stem: str | None = None
 
         # Instance-level jitted train_step — closed over self._psi_fn so both the plain
@@ -822,6 +860,8 @@ class NetworkManager:
         self._files.write_params(run_dir, self.state.params)
         self._files.write_config(run_dir, self.config)
         self._files.write_training_csv(run_dir, self.training_log)
+        if self.training_summary is not None:
+            self._files.write_training_summary(run_dir, self.training_summary)
 
         if self._prior is not None:
             self._files.write_stage2_meta(run_dir, self._scale)
@@ -1094,6 +1134,14 @@ class NetworkManager:
             else:
                 live = nullcontext()
             val_kpi_median = None
+            stopper = _PatienceStopper(
+                EARLY_STOPPING_PATIENCE,
+                EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT,
+                EARLY_STOPPING_ROLLING_WINDOW,
+            )
+            best_params = None
+            trained_epochs = 0
+            stop_reason = "epoch_budget"
             with live as active_live:
                 if show_progress:
                     self._live = active_live
@@ -1104,9 +1152,13 @@ class NetworkManager:
                     epoch_time = time.perf_counter() - start_time
 
                     val_kpi_median = None
+                    should_stop = False
                     if (epoch + 1) % VALIDATION_FREQUENCY == 0:
                         val_kpi_median = self._calculate_validation_kpi()
-                    if validation_callback is not None:
+                        should_stop, improved = stopper.update(epoch + 1, val_kpi_median)
+                        if improved:
+                            best_params = self.state.params
+                    if validation_callback is not None and not should_stop:
                         validation_callback(epoch + 1, val_kpi_median)
 
                     lr = float(self._lr_schedule(self.state.step))
@@ -1121,16 +1173,43 @@ class NetworkManager:
                         int(self.state.step),
                         epoch_time,
                     )
+                    trained_epochs = epoch + 1
+                    if should_stop:
+                        stop_reason = "early_stopping"
+                        if best_params is not None:
+                            self.state = self.state.replace(params=best_params)
+                        logger.info(
+                            f"early stopping at epoch {trained_epochs}: no >= "
+                            f"{EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT:.1%} rolling-average "
+                            f"validation improvement for {EARLY_STOPPING_PATIENCE} rounds"
+                        )
+                        break
 
-            if self.config.lbfgs_steps > 0:
+            if stop_reason != "early_stopping" and self.config.lbfgs_steps > 0:
                 self.lbfgs(self.config.lbfgs_steps)
                 val_kpi_median = self._calculate_validation_kpi()
 
-            if val_kpi_median is None:
+            if stop_reason == "early_stopping" or val_kpi_median is None:
                 val_kpi_median = self._calculate_validation_kpi()
 
             # Expose training_log for backward compat (to_disk, HPO, etc.)
             self.training_log = self._metrics.rows
+            self.training_summary = {
+                "stop_reason": stop_reason,
+                "trained_epochs": trained_epochs,
+                "planned_epochs": self.epochs,
+                "final_val_kpi_median": val_kpi_median,
+                "best_smoothed_val_kpi_median": (
+                    stopper.best_value if stopper.best_epoch is not None else None
+                ),
+                "best_validation_epoch": stopper.best_epoch,
+                "validation_frequency": VALIDATION_FREQUENCY,
+                "early_stopping_patience": EARLY_STOPPING_PATIENCE,
+                "early_stopping_min_relative_improvement": (
+                    EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT
+                ),
+                "early_stopping_rolling_window": EARLY_STOPPING_ROLLING_WINDOW,
+            }
 
             if save_to_disk:
                 logger.debug(f"run {self.artifact_stem} final val_kpi_median={val_kpi_median:.3f}")
