@@ -18,10 +18,14 @@ HPO_PREFIX = "hpo"
 
 
 def _scan_run_dirs(base: Path) -> list[Path]:
-    """Return direct child run dirs containing network.flax."""
+    """Return direct child run dirs containing complete consolidated artifacts."""
     if not base.exists():
         return []
-    return [p for p in base.iterdir() if p.is_dir() and (p / "network.flax").exists()]
+    return [
+        p
+        for p in base.iterdir()
+        if p.is_dir() and (p / "run.json").exists() and (p / "network.flax").exists()
+    ]
 
 
 def network_name(run_dir: Path) -> str:
@@ -78,7 +82,7 @@ def hpo_network_name(study: str, run: str) -> str:
 
 
 def get_available_networks(view_mode: str = "All") -> list[str]:
-    """List single-config networks, with All retaining legacy HPO coverage."""
+    """List single-config and retained HPO networks."""
     names: list[str] = []
     if view_mode in ["Single-Configs", "New Benchmarks", "All"]:
         for run_dir in _scan_run_dirs(Filepaths.BENCHMARKS):
@@ -102,7 +106,10 @@ def get_hpo_studies(archived: bool = False) -> dict[str, list[str]]:
         study.name: sorted(
             run.name
             for run in study.iterdir()
-            if run.is_dir() and not run.name.startswith("_") and (run / "network.flax").exists()
+            if run.is_dir()
+            and not run.name.startswith("_")
+            and (run / "run.json").exists()
+            and (run / "network.flax").exists()
         )
         for study in sorted(p for p in root.iterdir() if p.is_dir() and p.name != "_archive")
     }

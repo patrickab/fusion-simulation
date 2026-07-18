@@ -20,6 +20,7 @@ from src.api.schemas import (
 )
 from src.lib.config import Filepaths
 from src.lib.geometry_config import ToroidalCoilConfig
+from src.lib.run_artifacts import load_config, load_kpis, load_run
 from src.streamlit.network_utils import (
     get_available_networks,
     get_hpo_studies,
@@ -84,6 +85,8 @@ def list_benchmarks() -> dict[str, dict[str, list[str]]]:
     tree: dict[str, dict[str, list[str]]] = {}
     runs = sorted(p for p in Filepaths.BENCHMARKS.iterdir() if p.is_dir() and p.name != "_archive")
     for run in runs:
+        if not (run / "run.json").exists():
+            continue
         try:
             _, _, commit = parse_slug(run.name)
         except ValueError:
@@ -98,10 +101,9 @@ def network_config(name: str) -> dict:
         run_dir = resolve_run_directory(name)
     except FileNotFoundError:
         raise HTTPException(404, f"Run dir not found: {name}") from None
-    config_path = run_dir / "config.json"
-    if not config_path.exists():
+    if not (run_dir / "run.json").exists():
         raise HTTPException(404, f"No config found for {name}")
-    return json.loads(config_path.read_text())
+    return load_config(run_dir)
 
 
 @app.get("/api/network/{name:path}/models")
@@ -114,17 +116,16 @@ def network_models(name: str) -> dict:
 
     corrector_dir = run_dir / "stage2"
     corrector = None
-    meta_path = corrector_dir / "stage2_meta.json"
     if (corrector_dir / "network.flax").exists():
-        scale = json.loads(meta_path.read_text()).get("scale", 1.0) if meta_path.exists() else 1.0
+        scale = load_run(corrector_dir).get("result", {}).get("stage2_scale", 1.0)
         corrector = {"name": f"{name}/stage2", "scale": scale}
         foundation_name = name
     else:
         foundation_path = run_dir.parent / "foundation.json"
-        meta_path = run_dir / "stage2_meta.json"
-        if foundation_path.exists() and meta_path.exists():
+        run = load_run(run_dir)
+        scale = run.get("result", {}).get("stage2_scale")
+        if foundation_path.exists() and scale is not None:
             foundation_name = json.loads(foundation_path.read_text())["stage1_run"]
-            scale = json.loads(meta_path.read_text()).get("scale", 1.0)
             corrector = {"name": name, "scale": scale}
         else:
             foundation_name = name
@@ -133,18 +134,18 @@ def network_models(name: str) -> dict:
 
 @app.get("/api/network/{name:path}/kpis")
 def network_kpis(name: str) -> dict:
-    """Stored post-training KPIs (kpis.json) — never recomputed at request time."""
+    """Stored post-training KPIs from run.json; never recomputed at request time."""
     try:
         run_dir = resolve_run_directory(name)
     except FileNotFoundError:
         raise HTTPException(404, f"Run dir not found: {name}") from None
     # Prefer the composed-field KPIs when a corrector exists, so the reported
     # metrics match the field get_manager() renders for this run.
-    stage2_kpis = run_dir / "stage2" / "kpis.json"
-    kpis_path = stage2_kpis if stage2_kpis.exists() else run_dir / "kpis.json"
-    if not kpis_path.exists():
+    artifact_dir = run_dir / "stage2" if (run_dir / "stage2" / "network.flax").exists() else run_dir
+    kpis = load_kpis(artifact_dir)
+    if not kpis:
         raise HTTPException(404, f"No KPIs stored for {name}")
-    return json.loads(kpis_path.read_text())
+    return kpis
 
 
 @app.post("/api/network/{name:path}/archive")

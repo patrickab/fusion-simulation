@@ -1,7 +1,7 @@
 // Typed client for the FastAPI backend (src/api/main.py) + a tiny cached-fetch hook.
 import { useEffect, useState } from 'react'
 
-/** Stored kpis.json record: KPI numbers plus metadata (date, network, loss label, ...). */
+/** Post-training KPI values projected from the run.json result. */
 export type Kpis = Record<string, number | string>
 
 /** Numeric KPI entries in display order, metadata keys dropped. */

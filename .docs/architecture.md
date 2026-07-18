@@ -30,7 +30,7 @@ Thin HTTP wrapper exposing the `src/engine` + `src/lib` core to the React fronte
 - `main.py` — `FastAPI` app + CORS; endpoints under `/api`:
    - `GET  /api/networks` — list flattened single-config checkpoints (view_mode filter)
    - `GET  /api/hpo` — HPO study slugs and their retained trial slugs (live or archived)
-  - `GET  /api/network/{name}/{config|models|kpis}` — HyperParams JSON, foundation/corrector metadata, or stored post-training `kpis.json` (KPIs are never recomputed at request time)
+   - `GET  /api/network/{name}/{config|models|kpis}` — HyperParams JSON, foundation/corrector metadata, or stored `run.json` KPIs (never recomputed at request time)
   - `POST /api/network/{name}/{archive|rename|sample|flux|residual|fieldlines}`
   - `DELETE /api/network/{name}`
   - `POST /api/geometry` — 2D boundary + 3D plasma/coil meshes (downsampled via `mesh_stride`)
@@ -72,9 +72,9 @@ Vite dev server proxies `/api` → `127.0.0.1:8010` (matches `run-webapp.sh`). B
 ## Neural Network (`src/engine/network.py`)
 - **FluxPINN**: shared 10-scalar normalized input (r, z, r₀, a, κ, δ, p₀, F_axis, α, γ) and scalar ψ̂ output. `arch="mlp"` is the checkpoint-compatible Swish MLP; `arch="piratenet"` uses two encoded branches, gated residual blocks, and zero-initialized learned skip weights. Both can opt into random Fourier spatial features and Random Weight Factorization (`rwf`).
 - **Sampler**: Sobol quasi-random sequences for collocation points; 50% Sobol + 50% adaptive (focus on high-loss regions). Geometries resampled every 10 epochs.
-- **NetworkManager**: facade over private collaborators `_Field` (owns the psi-fn; single net or composed `psi1 + scale·psi2`), `_MetricsManager` (Rich table/progress/training_log rows), and `_FileStorageManager` (run dir + all artifact I/O, incl. nested `stage2/` layout). Accepts an optional `FoundationModel` frozen prior to act as a multistage corrector (`NetworkManager(config, prior=FoundationModel(...), scale=...)`); `for_inference` classmethod for lean querying. Loss seam: `compute_loss`/`train_step` take a `psi_fn`. Training stops after six validation rounds without a 1% improvement in the rolling validation mean, restores the best validation-round parameters, and records the outcome in `training_summary.json`; module constants configure patience, threshold, and window. `training.csv` retains epoch-wide loss components, optimizer step, and periodic validation median; `kpis.json` remains the complete final-checkpoint benchmark record. Saves `network.flax` + `config.json` + `training.csv` + `training_summary.json` + `train.log` per run dir.
+- **NetworkManager**: facade over `_Field` (single or composed psi), `_MetricsManager` (Rich table and completed metric windows), and `_FileStorageManager` (run artifacts, including nested `stage2/`). Training stops after six validation rounds without a 1% improvement in rolling validation p50 and restores the best parameters. Retained runs contain `run.json` (commit, duration, device, seed, config, outcome and KPIs), column-oriented `metrics.json`, `network.flax`, and plots. Rich and `metrics.json` record validation p05/p50/p95; early stopping and pruning use p50.
 - **Optimizer**: AdamW with warmup cosine decay schedule.
-- **Replay**: `uv run python -m src.engine.network --show <commit/run>` re-renders the Rich Training Metrics table for a stored run from its `training.csv` (accepts a dir path or bare `pinn_<timestamp>` too).
+- **Replay**: `uv run python -m src.engine.network --show <commit/run>` re-renders the Rich Training Metrics table from `metrics.json`.
 
 ## Geometry (`src/lib/geometry_config.py`, `src/engine/plasma.py`, `src/toroidal_geometry.py`)
 - Parametric plasma boundary: R(θ) = R₀ + a·cos(θ + δ·sin θ), Z(θ) = κ·a·sin θ
@@ -89,9 +89,9 @@ Used by the Streamlit UI and referenced for fixed heatmap scales by the React fr
 - **Field lines**: PyVista `streamlines_from_source` seeded along the midplane.
 
 ## Shared Evaluation Grids (`src/engine/model_evaluation.py`)
-`evaluate_plasma_grids()` is the common data path for frontend Plotly fields and offline Matplotlib montages. `resolution` is the poloidal sample count and radial resolution is half as large; both renderers therefore evaluate identical plasma-aligned coordinates and display-ready flux/linear-residual values. `evaluate_residual_samples()` is the batched, jitted KPI core: per-point `|R_GS|` of shape (n_configs, sample_size) on a deterministic, area-uniform sqrt-rho Sobol sample, vmapped over configs with a chunked inner point map and ψ computed once per point (reused for the axis estimate). `evaluate_plasma_kpis()` wraps it into whole-plasma/core distribution summaries, edge p95, and boundary leakage. The protocol is defined globally by `KPI_POINTS_PER_CONFIG = 8_192` and `KPI_EVAL_CONFIGS = 200` in `src/lib/config.py`, calibrated in `docs/evaluation/kpi-accuracy-benchmark.md`; every path (training-time `val_kpi_median` tracking + HPO pruning, kpis.json, CLI eval, HPO ranking, `scripts/reevaluate_hpo_kpis.py`) scores the same `kpi_benchmark_configs` stream (`BASE_SEED+123`), so their medians are bit-identical (the old composite-loss `val_loss` survives only in legacy CSVs). The same KPI mapping is shown in both frontend benchmark views and `plot_plasma_grid_montage()` output.
+`evaluate_plasma_grids()` is the common data path for frontend Plotly fields and offline Matplotlib montages. `evaluate_residual_samples()` is the batched, jitted KPI core on a deterministic area-uniform Sobol sample, with point and configuration chunking. `evaluate_plasma_kpis()` produces whole-plasma/core summaries, edge p95, and boundary leakage. Training validation, HPO pruning/ranking, final `run.json` KPIs, CLI evaluation, and reevaluation all score the same fixed 200 x 8,192 `kpi_benchmark_configs` stream.
 
-Single-config benchmark artifacts live directly under `data/benchmarks/<timestamp>_<name>_<commit>/`; retained run dirs hold `network.flax`, `config.json`, `training.csv`, `kpis.json`, and plots, while runs saved during training also hold `train.log`. Invariant: **a run dir exists iff its checkpoint was kept**; `--test`, pruned, failed, and aborted runs delete their own dir on exit. Optuna retains every completed local trial as a direct `pinn_<ts>/` run; `top_k` controls only ranking outputs, the benchmark report, and lightweight artifact copies under `top_k/` (no duplicate `network.flax`). Studies live under `data/hpo/<timestamp>_<study_name>_<commit>/` with logs, ledgers, `objective.json`, and trial dirs. HPO trials resolve as `hpo/<study_slug>/<trial_slug>`. Archived single configs move to `data/benchmarks/_archive/<slug>/`; archiving an HPO study moves its complete directory to `data/hpo/_archive/<study_slug>/`. All data paths derive from `Filepaths.DATA`.
+Single-config benchmark artifacts live under `data/benchmarks/<timestamp>_<name>_<commit>/`; retained run dirs hold `run.json`, `metrics.json`, `network.flax`, and plots. Runtime readers support only this consolidated format; old experiments must be rerun rather than migrated. Optuna studies retain SQLite plus `trials.csv`; completed trials use direct `pinn_<ts>/` directories and resolve as `hpo/<study_slug>/<trial_slug>`. Archive locations and directory naming remain unchanged.
 
 ## HPO (`src/engine/optimize_network_optuna.py`, `src/engine/optimize-network-hparams.py`)
 - **Optuna** (primary): thin TPE/pruning adapter over `NetworkManager.train`; `SearchSpaceConfig`
@@ -99,7 +99,7 @@ Single-config benchmark artifacts live directly under `data/benchmarks/<timestam
   validation, patience stopping, L-BFGS, and saving path. Validation scores the fixed `kpi_benchmark_configs`
   stream (config construction only — it never advances training Sobol state). A patience stop is
   a normally completed, rankable Optuna trial (not `FAIL`); its stop metadata is retained in trial
-  user attributes/`trials.json`, while real exceptions remain failed trials. HPO runs in a
+  user attributes/`trials.csv`, while real exceptions remain failed trials. HPO runs in a
   Textual TUI (`HpoApp`): Tab toggles between the
   study-level Rich dashboard and a sequential per-trial log (one styled network.py
   Training Metrics table per finished trial under its header). Non-tty stdout

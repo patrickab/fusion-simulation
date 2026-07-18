@@ -24,10 +24,8 @@ class HyperParams(BaseModel):
     # core median in grid 2 (2026-07-11) at the cost of a noisier boundary
     # shell (edge_p95/bnd_leak both ~2-3x higher) — tolerated per the
     # core-first selection rule, and is the CLI default for new training runs
-    # (src/engine/network.py --fourier-features). The dataclass default must
-    # stay 0 though: any saved checkpoint whose .json predates this field (or
-    # any HyperParams() built without one) falls back to this value, and a
-    # mismatched nff makes flax reject the checkpoint's params shape outright.
+    # (src/engine/network.py --fourier-features). Keep the dataclass default at
+    # zero so programmatic HyperParams() remains the plain-MLP baseline.
     n_fourier_features: int = 0
     fourier_sigma: float = 2.0
     # L-BFGS polish steps on a fixed batch after AdamW; 0 = off. Grid 2 showed
@@ -44,15 +42,10 @@ class HyperParams(BaseModel):
     # Train like legacy bb503b0: raw ψ output + Dirichlet/Neumann penalties (no envelope).
     soft_bc: bool = False
     # Random Weight Factorization (Wang et al. arXiv 2210.01274): reparametrize each
-    # dense kernel as W = diag(exp(s)) · V to improve PINN accuracy. Default must stay
-    # False for checkpoint compat — enabling it changes the params tree (same constraint
-    # as n_fourier_features: old config.json files without this field deserialize to False,
-    # i.e. plain Dense, and saved params remain loadable).
+    # dense kernel as W = diag(exp(s)) · V to improve PINN accuracy.
     rwf: bool = False
     # Network architecture: "mlp" = plain MLP (default, existing behaviour), "piratenet" =
-    # PirateNet residual blocks (arXiv 2402.00326, eq. 4.1-4.7). Default must stay "mlp"
-    # for checkpoint compat — "piratenet" changes the params tree (same constraint as
-    # n_fourier_features/rwf: old config.json without this field deserializes to "mlp").
+    # PirateNet residual blocks (arXiv 2402.00326, eq. 4.1-4.7).
     arch: str = "mlp"
     sigma_residual_adaptive_sampling: float = 0.05
     batch_size: int = 64

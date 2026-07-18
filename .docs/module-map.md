@@ -24,6 +24,7 @@ src/
 │   ├── geometry_config.py      # All dataclasses: coords, plasma/coil geometry, PlasmaConfig
 │   ├── network_config.py       # HyperParams (architecture/RWF/training knobs), DomainBounds, FluxInput
 │   ├── config.py               # Filepaths, global KPI protocol constants, git-commit identity, BaseModel
+│   ├── run_artifacts.py         # Consolidated run.json/metrics.json serialization and projections
 │   ├── visualization.py        # PyVista 3D + Plotly 2D render functions
 │   ├── utils.py                # Coil → PolyData normalization, plasma → PolyData
 │   ├── linalg_utils.py         # Rotation matrices, cylindrical→Cartesian helpers
@@ -86,11 +87,11 @@ tests/                          # unittest coverage for patience stopping + nume
 
 ```
 data/
-├── benchmarks/<timestamp>_<name>_<commit>/   # Single-config checkpoint and benchmark artifacts
+├── benchmarks/<timestamp>_<name>_<commit>/   # run.json, metrics.json, checkpoint and plots
 ├── benchmarks/model_selection_benchmark/     # Model-selection learnings and run log
 ├── benchmarks/_archive/<slug>/               # Supported archive location
 ├── hpo/<timestamp>_<name>_<commit>/          # Optuna study/campaign DB, ledgers and trial dirs
-│   └── _archive/<study_slug>/                 # Supported complete-study archive location
+│   └── _archive/<study_slug>/                 # SQLite, trials.csv and retained trial runs
 └── kpi_accuracy/                              # Raw KPI calibration runs
 data_legacy/                                   # Ignored pre-consolidation artifact dump
 ```

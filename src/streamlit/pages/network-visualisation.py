@@ -1,4 +1,3 @@
-import json
 import shutil
 
 import jax.numpy as jnp
@@ -9,6 +8,7 @@ from src.engine.network import NetworkManager
 from src.engine.plasma import calculate_fusion_plasma
 from src.lib.config import Filepaths
 from src.lib.network_config import HyperParams
+from src.lib.run_artifacts import load_config
 from src.lib.visualization import (
     initialize_plotter,
     plot_flux_heatmap,
@@ -43,8 +43,7 @@ def _get_networks() -> list[str]:
 def sync_selected_network() -> None:
     """Load selected checkpoint once and reseed shared samples."""
     run_dir = resolve_run_directory(st.session_state.selected_pinn)
-    config_path = run_dir / "config.json"
-    new_config = HyperParams.from_json(config_path)
+    new_config = HyperParams.from_dict(load_config(run_dir))
 
     # Re-instantiate only if the JIT-sensitive architecture changes
     if (
@@ -279,10 +278,8 @@ def render_sidebar() -> None:
         st.divider()
 
         pinn_path = resolve_run_directory(st.session_state.selected_pinn)
-        config_path = pinn_path / "config.json"
-        if config_path.exists():
-            with open(config_path) as f:
-                st.json(json.load(f))
+        if (pinn_path / "run.json").exists():
+            st.json(load_config(pinn_path))
 
 
 def render_metrics() -> None:

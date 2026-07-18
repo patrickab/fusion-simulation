@@ -1,8 +1,8 @@
 """LaTeX benchmark report generator for PINN HPO runs.
 
 Builds an in-memory LaTeX document from a set of trained-network run
-directories (each holding config.json, kpis.json, residual.png), renders it
-to PDF via a direct ``pdflatex`` call, and writes only the resulting PDF.
+directories (each holding run.json and residual.png), renders it to PDF via a
+direct ``pdflatex`` call, and writes only the resulting PDF.
 
 Per config (sorted ascending by Optuna objective): a compact settings grid,
 KPI table, and 4x2 residual montage, each on its own page. A ranked summary
@@ -13,12 +13,15 @@ it strips raw ``\\clearpage`` commands, so we call pdflatex directly on the
 complete LaTeX document we already build in memory.
 """
 
+import csv
 from dataclasses import dataclass
 from datetime import datetime
 import json
 import logging
 from pathlib import Path
 import subprocess
+
+from src.lib.run_artifacts import load_config, load_kpis
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +73,7 @@ def generate_report(
 
     summaries = _collect(paths)
     if not summaries:
-        raise RuntimeError("No valid run directories found (none had config.json).")
+        raise RuntimeError("No valid run directories found (none had run configuration).")
     summaries.sort(key=lambda s: s.objective)
 
     latex = _build_document(summaries)
@@ -93,12 +96,11 @@ def _collect(paths: list[Path]) -> list[_RunSummary]:
     objectives = _objectives_from_ledger(paths)
     summaries: list[_RunSummary] = []
     for run_dir in paths:
-        cfg_path = run_dir / "config.json"
-        if not cfg_path.exists():
-            logger.warning(f"Skipping {run_dir.name}: missing config.json")
+        if not (run_dir / "run.json").exists():
+            logger.warning(f"Skipping {run_dir.name}: missing run configuration")
             continue
-        config = json.loads(cfg_path.read_text())
-        kpis = _load_json(run_dir / "kpis.json")
+        config = load_config(run_dir)
+        kpis = load_kpis(run_dir)
         stem = run_dir.name
         objective = objectives.get(stem, float(kpis.get("loss_median", float("inf"))))
         summaries.append(
@@ -114,7 +116,7 @@ def _collect(paths: list[Path]) -> list[_RunSummary]:
 
 
 def _objectives_from_ledger(paths: list[Path]) -> dict[str, float]:
-    """Read Optuna objectives from a trials.json ledger in the shared parent.
+    """Read Optuna objectives from a trials.csv ledger in the shared parent.
 
     A COMPLETE trial's `value` is the validation-loss median used for ranking.
     Falls back to {} if no ledger is found (manual benchmark paths).
@@ -122,18 +124,19 @@ def _objectives_from_ledger(paths: list[Path]) -> dict[str, float]:
     parents = {p.parent for p in paths}
     if len(parents) != 1:
         return {}
-    ledger_path = next(iter(parents)) / "trials.json"
+    ledger_path = next(iter(parents)) / "trials.csv"
     if not ledger_path.exists():
         return {}
     try:
-        ledger = json.loads(ledger_path.read_text())
-    except json.JSONDecodeError:
+        with open(ledger_path, newline="") as file:
+            ledger = list(csv.DictReader(file))
+    except (OSError, csv.Error):
         logger.warning(f"Could not parse {ledger_path}")
         return {}
     return {
-        t["run"]: float(t["value"])
+        t["run"]: float(t["objective"])
         for t in ledger
-        if t.get("state") == "COMPLETE" and t.get("value") is not None and "run" in t
+        if t.get("state") == "COMPLETE" and t.get("objective") and t.get("run")
     }
 
 
@@ -229,8 +232,8 @@ def _summary_table(summaries: list[_RunSummary]) -> str:
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
     lines.append(
-        r"\par\smallskip\textit{Configurations ranked by Optuna objective "
-        r"(validation median $|R_{GS}|$).}\par"
+        r"\par\smallskip\textit{Configurations ranked by fused Optuna objective "
+        r"(median plus weighted p95 $|R_{GS}|$).}\par"
     )
     lines.append(r"\end{center}")
     return "\n".join(lines) + "\n"
@@ -313,7 +316,7 @@ def _settings_table(config: dict) -> str:
 
 def _kpi_table(kpis: dict) -> str:
     if not kpis:
-        return r"\subsection*{KPIs}\textit{(kpis.json missing)}"
+        return r"\subsection*{KPIs}\textit{(KPIs missing)}"
     lines = [
         r"\subsection*{KPIs}",
         r"\begin{center}",
@@ -330,15 +333,6 @@ def _kpi_table(kpis: dict) -> str:
         )
     lines.append(r"\bottomrule")
     lines.append(r"\end{tabular}")
-    n_cfg = kpis.get("n_configs", "?")
-    n_pts = kpis.get("n_points", "?")
-    core = kpis.get("core_rho", "?")
-    loss = _escape(str(kpis.get("loss", "?")))
-    lines.append(r"\par\smallskip")
-    lines.append(
-        rf"\textit{{Evaluated on {n_cfg} configs, {n_pts} points, "
-        rf"core $\rho<{core}$, loss={loss}.}}\par"
-    )
     lines.append(r"\end{center}")
     return "\n".join(lines)
 

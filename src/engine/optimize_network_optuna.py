@@ -30,7 +30,7 @@ budget (docs/evaluation/kpi-accuracy-benchmark.md).
                             │
     ┌───────────────────────▼──────────────────────────┐
     │  data/hpo/<timestamp>_<name>_<commit>/           │
-    │    study.db  trials.json  top_trials.json        │
+    │    study.db  trials.csv  top_trials.json         │
     │    benchmark_report.pdf  top-k checkpoints       │
     └──────────────────────────────────────────────────┘
 
@@ -40,6 +40,7 @@ Live dashboard otherwise. Configuration: SearchSpaceConfig, StudyConfig.
 
 import argparse
 import ast
+import csv
 import json
 import logging
 import os
@@ -71,6 +72,13 @@ from src.engine.residual_correction import load_foundation
 from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG, Filepaths, current_commit
 from src.lib.network_config import HyperParams
 from src.lib.optuna_tui import HpoApp, OptunaProgressDisplay, logger, resolve_reset_choice
+from src.lib.run_artifacts import (
+    format_duration,
+    load_config,
+    load_kpis,
+    load_run,
+    update_run_result,
+)
 
 HPO_ROOT = Filepaths.DATA / "hpo"
 
@@ -82,30 +90,14 @@ _ARCHITECTURES = [
     (200,) * 5,  # incumbent
 ]
 
-WARMSTART_CONFIG_PATHS: list[Path] = [
-    #    Filepaths.BENCHMARKS
-    #    / "model_selection_benchmark"
-    #    / "pinn_2026_07_13_01_18_41_hard-bc-unoptimized"
-    #    / "config.json",
-    #    Filepaths.BENCHMARKS
-    #    / "model_selection_benchmark"
-    #    / "pinn_2026_07_13_06_59_27_hard-bc-tuned-schedule"
-    #    / "config.json",
-    #    Filepaths.BENCHMARKS
-    #    / "model_selection_benchmark"
-    #    / "pinn_2026_07_13_08_32_59_hard-bc-final"
-    #    / "config.json",
-]
+WARMSTART_CONFIG_PATHS: list[Path] = []
 
 
 # Benchmark run dir whose Optuna study.db warms up a fresh study. Its completed
-# trials are read back from each trial's run dir (config.json + kpis.json) and
+# trials are read back from each trial's run.json and
 # injected as historical evidence for TPE -- no retraining. None disables it.
 # The study name is auto-discovered (the non-legacy study with the most trials).
-WARMSTART_EXPERIMENT_DB: Path | None = (
-    # None
-    Path("data/hpo/2026_07_16_00_16_02_arch_wide_or_deep_2400ep_4a25aff/")
-)
+WARMSTART_EXPERIMENT_DB: Path | None = None
 
 # Budget fields change what the loss *means* (sampling/training amount), so a mismatch
 # invalidates a warmstart candidate (with total epochs, see budget_mismatch); nothing else does.
@@ -152,6 +144,8 @@ class SearchSpaceConfig:
     huber_delta: float = 0.0
     n_fourier_features: int = 0
     lbfgs_steps: int = 0
+    rwf: bool = False
+    arch: str = "mlp"
     stage2_scale: float | list[float] | Range = 0.01
 
     def get_static_params(self) -> dict[str, Any]:
@@ -231,7 +225,7 @@ def _record_foundation(study_path: Path, stage1_run: str | None, source: Path | 
         destination = study_path / "_foundation"
         destination.mkdir(exist_ok=True)
         if source.resolve() != destination.resolve():
-            for artifact in ("config.json", "network.flax"):
+            for artifact in ("run.json", "network.flax"):
                 shutil.copy2(source / artifact, destination / artifact)
     if not path.exists() and stage1_run is not None:
         path.write_text(json.dumps({"stage1_run": stage1_run}, indent=2) + "\n")
@@ -289,7 +283,7 @@ def _now() -> str:
 def load_configs(paths: list[Path] = WARMSTART_CONFIG_PATHS) -> list[tuple[Path, HyperParams]]:
     # Fail-fast by design: a wrong/missing WARMSTART_CONFIG_PATHS entry SHALL crash --
     # the caller supplies correct paths; a silently skipped warmstart config is worse.
-    return [(path, HyperParams.from_json(str(path))) for path in paths]
+    return [(path, HyperParams.from_dict(load_config(path.parent))) for path in paths]
 
 
 def load_experiment_db(db_dir: Path | None = WARMSTART_EXPERIMENT_DB) -> optuna.Study | None:
@@ -354,7 +348,7 @@ def optuna_warmstart(
                 continue  # skip: never enters the ledger, never informs TPE
             hp = _reevaluate_config(path, hp, mismatched)
 
-        kpis = json.loads((path.parent / "kpis.json").read_text())
+        kpis = load_kpis(path.parent)
         loss = kpis["loss_median"] + score_beta * kpis["loss_p95"]
 
         db.add_trial(
@@ -380,14 +374,14 @@ def _get_experiment_db_configs(
     for t in db.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,)):
         if t.value is None:
             continue
-        if "config" in t.user_attrs:
-            candidates.append((HyperParams.from_dict(t.user_attrs["config"]), t.value, None, None))
-        elif db_dir is not None and "run" in t.user_attrs:
+        if db_dir is not None and "run" in t.user_attrs:
             run_dir = db_dir / t.user_attrs["run"]
-            hp = HyperParams.from_json(str(run_dir / "config.json"))
-            kpis = json.loads((run_dir / "kpis.json").read_text())
+            hp = HyperParams.from_dict(load_config(run_dir))
+            kpis = load_kpis(run_dir)
             fused = kpis["loss_median"] + score_beta * kpis["loss_p95"]
             candidates.append((hp, fused, kpis["loss_median"], kpis["loss_p95"]))
+        elif "config" in t.user_attrs:
+            candidates.append((HyperParams.from_dict(t.user_attrs["config"]), t.value, None, None))
     return candidates
 
 
@@ -511,6 +505,8 @@ def objective(
     training loss.  Pruning and ranking therefore measure the same quantity.
     """
     hp = build_hyperparams(trial, search_space)
+    trial.set_user_attr("config", hp.to_dict())
+    trial.set_user_attr("training_seed", 42)
     stage2_scale = 1.0
     if foundation is not None:
         scale_spec = search_space.stage2_scale
@@ -569,8 +565,18 @@ def objective(
         # Stats are computed once and shown to the user alongside the fused score.
         val_median, val_p95 = evaluate_validation_loss_stats(manager)
         val_score = val_median + study.score_beta * val_p95
+        trial.set_user_attr("loss_median", val_median)
+        trial.set_user_attr("loss_p95", val_p95)
         if study.checkpoint_policy == "top_k":
             manager.to_disk()
+        if (
+            manager.artifact_stem is not None
+            and (hpo_benchmark_dir / manager.artifact_stem / "run.json").exists()
+        ):
+            update_run_result(
+                hpo_benchmark_dir / manager.artifact_stem,
+                objective_value=val_score,
+            )
         display.update(
             trial.number + 1,
             display_params,
@@ -582,39 +588,102 @@ def objective(
         )
         return val_score
     except optuna.TrialPruned:
+        trial.set_user_attr("trained_epochs", last_epoch)
+        trial.set_user_attr("stop_reason", "pruned")
         display.update(trial.number + 1, display_params, None, "pruned", last_epoch)
         raise
-    except Exception:
+    except Exception as exc:
+        trial.set_user_attr("trained_epochs", last_epoch)
+        trial.set_user_attr("stop_reason", "failed")
+        trial.set_user_attr("failure_type", type(exc).__name__)
+        trial.set_user_attr("failure_message", str(exc))
         display.update(trial.number + 1, display_params, None, "failed", last_epoch)
         raise
     finally:
         if manager.artifact_stem is not None:
             trial.set_user_attr("run", manager.artifact_stem)
-        # Only this trial's own run dir is touched; failed trials are also
-        # dropped from trials.json (study.db keeps them for the sampler).
+        # Only this trial's own run directory is touched.
         manager.discard_unsaved_run()
-        _write_trials_json(trial.study, hpo_benchmark_dir)
         jax.clear_caches()
 
 
-def _write_trials_json(study: optuna.Study, hpo_benchmark_dir: Path) -> None:
-    """Ledger of which runs/checkpoints belong to this study. Rewritten after every
-    trial so an aborted study still leaves an on-disk record."""
-    (hpo_benchmark_dir / "trials.json").write_text(
-        json.dumps(
-            [
-                {
-                    "trial": t.number,
-                    "state": t.state.name,
-                    "value": t.value,
-                    **{key: value for key, value in t.user_attrs.items() if key != "checkpoint"},
-                }
-                for t in study.get_trials(deepcopy=False)
-                if t.state != optuna.trial.TrialState.FAIL
-            ],
-            indent=2,
-        )
-    )
+def _write_trials_csv(study: optuna.Study, hpo_benchmark_dir: Path) -> None:
+    """Atomically export finalized study trials in a compact comparison table."""
+    terminal_states = {
+        optuna.trial.TrialState.COMPLETE,
+        optuna.trial.TrialState.PRUNED,
+        optuna.trial.TrialState.FAIL,
+    }
+    trials = [trial for trial in study.get_trials(deepcopy=False) if trial.state in terminal_states]
+    param_names = sorted({name for trial in trials for name in trial.params})
+    fields = [
+        "trial",
+        "state",
+        "objective",
+        "loss_median",
+        "loss_p95",
+        "trained_epochs",
+        "stop_reason",
+        "duration",
+        "seed",
+        "warmstart",
+        "run",
+        "source_study",
+        "source_trial",
+        "source_run",
+        "failure_type",
+        "failure_message",
+        *[f"param_{name}" for name in param_names],
+    ]
+    path = hpo_benchmark_dir / "trials.csv"
+    temporary = path.with_suffix(".csv.tmp")
+    with open(temporary, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        for trial in trials:
+            attrs = trial.user_attrs
+            run_name = attrs.get("run", "")
+            run_dir = hpo_benchmark_dir / run_name if run_name else None
+            run = (
+                load_run(run_dir) if run_dir is not None and (run_dir / "run.json").exists() else {}
+            )
+            result = run.get("result", {})
+            kpis = result.get("kpis", {})
+            row = {
+                "trial": trial.number,
+                "state": trial.state.name,
+                "objective": _csv_float(trial.value),
+                "loss_median": _csv_float(kpis.get("loss_median", attrs.get("loss_median"))),
+                "loss_p95": _csv_float(kpis.get("loss_p95", attrs.get("loss_p95"))),
+                "trained_epochs": attrs.get("trained_epochs", result.get("trained_epochs", "")),
+                "stop_reason": attrs.get("stop_reason", result.get("stop_reason", "")),
+                "duration": format_duration(trial.duration.total_seconds())
+                if trial.duration is not None
+                else "",
+                "seed": attrs.get("training_seed", run.get("seed", "")),
+                "warmstart": attrs.get("warmstart", False),
+                "run": run_name,
+                "source_study": attrs.get("source_study", ""),
+                "source_trial": attrs.get("source_trial", ""),
+                "source_run": attrs.get("source_run", ""),
+                "failure_type": attrs.get("failure_type", ""),
+                "failure_message": attrs.get("failure_message", ""),
+                **{f"param_{name}": _csv_value(trial.params.get(name)) for name in param_names},
+            }
+            writer.writerow(row)
+    temporary.replace(path)
+
+
+def _csv_float(value: object) -> str:
+    return f"{float(value):.4e}" if value is not None else ""
+
+
+def _csv_value(value: object) -> object:
+    if isinstance(value, float):
+        return _csv_float(value)
+    if isinstance(value, list | tuple | dict):
+        return json.dumps(value, separators=(",", ":"))
+    return "" if value is None else value
 
 
 def _save_top_configs(
@@ -735,7 +804,7 @@ def run_optimization(
     if study.stage1_run is not None and study.warmstart:
         raise ValueError("Corrector studies require StudyConfig(warmstart=False)")
     # Freeze the commit once for the whole run: a commit made mid-study would
-    # otherwise move study.db / optuna.log / trials.json to a different path
+    # otherwise move study.db / optuna.log / trials.csv to a different path
     # and split the study across two commit dirs.
     commit = current_commit()
     hpo_benchmark_dir = study_dir(study.study_name, commit)
@@ -751,7 +820,7 @@ def run_optimization(
     if study.stage1_run is not None:
         local_foundation = hpo_benchmark_dir / "_foundation"
         local_complete = all(
-            (local_foundation / artifact).exists() for artifact in ("config.json", "network.flax")
+            (local_foundation / artifact).exists() for artifact in ("run.json", "network.flax")
         )
         foundation, _, foundation_source = load_foundation(
             local_foundation if local_complete else study.stage1_run,
@@ -767,7 +836,7 @@ def run_optimization(
     logger.addHandler(file_handler)
     # Warmstart candidates from two sources, both optional:
     #   * the benchmark db -- raw trials read back from each run dir's
-    #     config.json + kpis.json, fused score recomputed.
+    #     run.json config + KPIs, fused score recomputed.
     #   * the legacy WARMSTART_CONFIG_PATHS ledger -- trials carry their own
     #     config + pre-fused value; optuna_warmstart() may retrain budget-stale
     #     configs, so it runs before check_capacity.
@@ -788,7 +857,7 @@ def run_optimization(
         for run_dir in hpo_benchmark_dir.glob("pinn_*"):
             if run_dir.is_dir():
                 shutil.rmtree(run_dir)
-        for artifact in ("trials.json", "top_trials.json", "benchmark_report.pdf"):
+        for artifact in ("trials.csv", "top_trials.json", "benchmark_report.pdf"):
             (hpo_benchmark_dir / artifact).unlink(missing_ok=True)
         shutil.rmtree(hpo_benchmark_dir / "top_k", ignore_errors=True)
         _write_objective_metadata(
@@ -833,7 +902,8 @@ def run_optimization(
             and not t.user_attrs.get("warmstart", False)
             for t in optuna_study.trials
         )
-        if not restart and not has_real_results and optuna_study.trials:
+        has_warmstart = any(t.user_attrs.get("warmstart", False) for t in optuna_study.trials)
+        if not restart and not has_real_results and not has_warmstart and optuna_study.trials:
             logger.info("Study has no completed trials -- discarding for a fresh start")
             del optuna_study
             storage_path.unlink()
@@ -881,6 +951,7 @@ def run_optimization(
             ),
             n_trials=max(0, study.n_trials - prior_trials),
             catch=(Exception,),
+            callbacks=[lambda current, _trial: _write_trials_csv(current, hpo_benchmark_dir)],
         )
 
         complete = sorted(
@@ -901,7 +972,7 @@ def run_optimization(
                 f"lr={hp.learning_rate_max:.2e}"
             )
         _save_top_configs(results, optuna_study, hpo_benchmark_dir)
-        _write_trials_json(optuna_study, hpo_benchmark_dir)
+        _write_trials_csv(optuna_study, hpo_benchmark_dir)
         if study.checkpoint_policy != "none":
             _bundle_top_artifacts(complete, hpo_benchmark_dir)
             _generate_benchmark_report(complete, hpo_benchmark_dir)
@@ -1022,7 +1093,7 @@ def main() -> None:
 
     # TUI whenever a terminal exists; piped/nohup output gets the plain Live dashboard,
     # which degrades to sequential text on non-ttys. All logging/benchmark artifacts
-    # (study.db, optuna.log, trials.json, train.log, checkpoints) are identical either way.
+    # (study.db, optuna.log, trials.csv, checkpoints) are identical either way.
     if sys.stdout.isatty():
         app = HpoApp(search_space, study, restart=reset)
         app.run()

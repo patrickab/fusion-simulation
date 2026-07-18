@@ -16,7 +16,7 @@ The composed NetworkManager is built as::
     stage2 = NetworkManager(stage2_cfg, prior=prior, scale=args.stage2_scale)
     stage2.train()
 
-and saved under ``<stage1_run_dir>/stage2/`` with ``stage2_meta.json``.
+and saved under ``<stage1_run_dir>/stage2/`` with its scale in ``run.json``.
 """
 
 import argparse
@@ -30,6 +30,7 @@ from src.engine.network import (
 from src.lib.config import KPI_EVAL_CONFIGS
 from src.lib.logger import get_logger
 from src.lib.network_config import HyperParams
+from src.lib.run_artifacts import load_config, load_run
 from src.streamlit.network_utils import resolve_run_directory
 
 logger = get_logger(name="ResidualCorrection")
@@ -40,11 +41,9 @@ def load_foundation(
 ) -> tuple[FoundationModel, HyperParams, Path]:
     """Load a plain checkpoint as a frozen foundation."""
     stage1_dir = stage1 if isinstance(stage1, Path) else resolve_run_directory(stage1)
-    if (not allow_nested and (stage1_dir / "stage2" / "network.flax").exists()) or (
-        stage1_dir / "stage2_meta.json"
-    ).exists():
+    if not allow_nested and (stage1_dir / "stage2" / "network.flax").exists():
         raise ValueError("A corrector checkpoint cannot be used as a stage-1 foundation")
-    hp = HyperParams.from_json(str(stage1_dir / "config.json"))
+    hp = HyperParams.from_dict(load_config(stage1_dir))
     if soft_bc is not None and hp.soft_bc != soft_bc:
         raise ValueError(
             f"Foundation soft_bc={hp.soft_bc} does not match corrector soft_bc={soft_bc}"
@@ -61,13 +60,10 @@ def _load_composed(
     if not (stage2_dir / "network.flax").exists():
         raise FileNotFoundError(f"no stage2 correction net found under {stage2_dir}")
 
-    meta_path = stage2_dir / "stage2_meta.json"
-    scale: float = (
-        json.loads(meta_path.read_text()).get("scale", 1.0) if meta_path.exists() else 1.0
-    )
+    scale = float(load_run(stage2_dir).get("result", {}).get("stage2_scale", 1.0))
 
     prior, hp1, stage1_dir = load_foundation(stage1, allow_nested=True)
-    hp2 = HyperParams.from_json(str(stage2_dir / "config.json"))
+    hp2 = HyperParams.from_dict(load_config(stage2_dir))
     if hp1.soft_bc != hp2.soft_bc:
         raise ValueError(
             f"Foundation soft_bc={hp1.soft_bc} does not match corrector soft_bc={hp2.soft_bc}"
@@ -93,16 +89,18 @@ def load_checkpoint(
         return _load_composed(name, run_dir / "stage2", n_validation_size)
 
     foundation_path = run_dir.parent / "foundation.json"
-    stage2_meta_path = run_dir / "stage2_meta.json"
-    if foundation_path.exists() or stage2_meta_path.exists():
-        if not foundation_path.exists() or not stage2_meta_path.exists():
+    stage2_run = load_run(run_dir)
+    has_stage2_metadata = "stage2_scale" in stage2_run.get("result", {})
+    if foundation_path.exists() or has_stage2_metadata:
+        if not foundation_path.exists() or not has_stage2_metadata:
             raise ValueError(f"incomplete corrector metadata for {run_dir}")
         stage1_name = json.loads(foundation_path.read_text()).get("stage1_run")
         if not stage1_name:
             raise ValueError(f"invalid foundation metadata in {foundation_path}")
         local_foundation = run_dir.parent / "_foundation"
         local_artifacts = [
-            (local_foundation / artifact).exists() for artifact in ("config.json", "network.flax")
+            (local_foundation / "run.json").exists(),
+            (local_foundation / "network.flax").exists(),
         ]
         if any(local_artifacts) and not all(local_artifacts):
             raise ValueError(f"incomplete bundled foundation in {local_foundation}")
@@ -114,7 +112,7 @@ def load_checkpoint(
         manager.artifact_stem = str(name)
         return manager
 
-    hp = HyperParams.from_json(str(run_dir / "config.json"))
+    hp = HyperParams.from_dict(load_config(run_dir))
     manager = NetworkManager(hp, n_validation_size=n_validation_size)
     manager.state = manager.state.replace(params=manager.from_disk(run_dir / "network.flax"))
     manager.artifact_stem = str(name)

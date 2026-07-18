@@ -24,9 +24,14 @@ The staged campaign is:
 4. Run seven full-budget LR/adaptive-sampling anchors around the selected architecture.
 5. Run clean 12-trial broad and 12-trial narrowed Optuna studies, then confirmation seeds 43/44.
 
-The campaign driver records manual runs in `campaign.json`, keeps intermediate checkpoints for
-the short screens, resumes its own SQLite studies, and writes a frozen foundation bundle only if
-the confirmation rule passes.
+The initial batch-32 screen at peak LR `1e-3` suffered a persistent optimizer regression after
+epoch 430 and was stopped after epoch 600. Controlled screens now use peak LR `5e-4` and prefer
+batch 32 when stable and within 10% of batch 64.
+
+Retained checkpoints now consolidate config, outcome, resources, and KPIs in `run.json`; training
+trajectories use column-oriented `metrics.json` with validation p05/p50/p95. Runtime readers no
+longer support the superseded split files; old experiments will be rerun when needed. Studies
+export `trials.csv` from SQLite.
 
 ## Evaluation Contract
 
@@ -63,5 +68,3 @@ the confirmation rule passes.
   July databases.
 - End-of-study PDF generation requires `pdflatex`; availability on the remote GPU box is still
   unconfirmed.
-
-
