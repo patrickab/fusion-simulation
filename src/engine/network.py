@@ -6,6 +6,7 @@ from datetime import datetime
 import functools
 from functools import partial
 import json
+import math
 from pathlib import Path
 import re
 import shutil
@@ -18,11 +19,15 @@ from flax.training import train_state
 import jax
 import jax.numpy as jnp
 import optax
+import plotext
+from rich.align import Align
 from rich.console import Console, Group
 from rich.live import Live
+from rich.measure import Measurement
 from rich.panel import Panel
 from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
 from rich.table import Table
+from rich.text import Text
 from scipy.stats import qmc
 
 from src.engine.physics import pinn_loss_function
@@ -239,6 +244,7 @@ EARLY_STOPPING_ROLLING_WINDOW = 3
 # Cap rows shown in the live table; unbounded growth desyncs Rich's redraw
 # once it overflows the terminal, corrupting scrollback.
 LIVE_TABLE_MAX_ROWS = 15
+CHART_HEIGHT = 18  # terminal rows for the side-by-side validation / lr+||∇L|| charts
 
 
 class _PatienceStopper:
@@ -514,8 +520,127 @@ class _Field:
 
 
 # ---------------------------------------------------------------------------
-# _MetricsManager — Rich display + per-epoch accumulation
+# Terminal charts (plotext rendered as Rich text) + _MetricsManager
 # ---------------------------------------------------------------------------
+
+
+class _PlotextChart:
+    """A plotext figure as a Rich renderable.
+
+    Rebuilt only when the data length or terminal width changes — Rich Live
+    re-renders at 10 Hz, so the built ANSI text is cached between epochs.
+    """
+
+    def __init__(self, draw: Callable[[list[dict]], None], rows: list[dict], height: int) -> None:
+        self._draw = draw
+        self._rows = rows
+        self._height = height
+        self._cache: tuple[tuple[int, int], Text] | None = None
+
+    def __rich_console__(self, console: Console, options: any) -> any:
+        key = (options.max_width, len(self._rows))
+        if self._cache is None or self._cache[0] != key:
+            try:
+                plotext.clf()
+                plotext.plotsize(options.max_width - 2, self._height)
+                plotext.theme("pro")  # transparent bg, default fg: inherits terminal colors
+                self._draw(self._rows)
+                built = Text.from_ansi(plotext.build())
+            except Exception as exc:  # a chart bug must never kill a training run
+                built = Text(f"chart unavailable: {exc!r}", style="dim")
+            self._cache = (key, built)
+        yield self._cache[1]
+
+    def __rich_measure__(self, console: Console, options: any) -> Measurement:
+        # Charts stretch to whatever width they're given (lets a grid split evenly).
+        return Measurement(20, options.max_width)
+
+
+def _charts_renderable(rows: list[dict]) -> any:
+    """Validation and lr/||∇L|| charts side by side; lr chart alone before first validation."""
+    if not rows:
+        return None
+    lr_chart = _PlotextChart(_draw_lr_grad_chart, rows, CHART_HEIGHT)
+    if not any(r["val_kpi_p50"] is not None for r in rows):
+        return lr_chart
+    grid = Table.grid(expand=True)
+    grid.add_column(ratio=1)
+    grid.add_column(ratio=1)
+    grid.add_row(_PlotextChart(_draw_validation_chart, rows, CHART_HEIGHT), lr_chart)
+    return grid
+
+
+def _log_series(x: list, y: list) -> tuple[list, list]:
+    """Drop points with y <= 0 — plotext's log scale raises on them (e.g. warmup lr=0)."""
+    pairs = [(a, b) for a, b in zip(x, y, strict=False) if b is not None and b > 0]
+    return [p[0] for p in pairs], [p[1] for p in pairs]
+
+
+def _log_ticks(values: list[float]) -> tuple[list[float], list[str]]:
+    """1-2-5 log-decade ticks covering the data range, labeled in scientific notation."""
+    lo, hi = min(values), max(values)
+    ticks, labels = [], []
+    for k in range(math.floor(math.log10(lo)), math.ceil(math.log10(hi)) + 1):
+        for m in (1, 2, 5):
+            if lo <= m * 10.0**k <= hi:
+                ticks.append(m * 10.0**k)
+                labels.append(f"{m}e{k}")
+    thin = max(1, math.ceil(len(ticks) / 6))
+    return ticks[::thin], labels[::thin]
+
+
+def _linear_ticks(values: list[float]) -> tuple[list[float], list[str]]:
+    """Round-number ticks (1-2-5 steps) for a linear axis."""
+    lo, hi = min(values), max(values)
+    span = (hi - lo) or 1.0
+    step = 10.0 ** math.floor(math.log10(span / 5))
+    for mult in (1, 2, 5, 10):
+        if span / (step * mult) <= 5:
+            step *= mult
+            break
+    ticks = [t * step for t in range(math.ceil(lo / step), math.floor(hi / step) + 1)]
+    return ticks, [f"{t:g}" for t in ticks]
+
+
+def _draw_validation_chart(rows: list[dict]) -> None:
+    """Validation |R_GS| p05/p50/p95 vs epoch, log y. Colors match the table's Val KPI column."""
+    val_rows = [r for r in rows if r["val_kpi_p50"] is not None]
+    all_epochs, all_vals = [], []
+    for key, label, color in (
+        ("val_kpi_p95", "p95", "gray"),
+        ("val_kpi_p50", "p50", "green"),
+        ("val_kpi_p05", "p05", "gray"),
+    ):
+        epochs, series = _log_series([r["epoch"] for r in val_rows], [r.get(key) for r in val_rows])
+        if epochs:
+            plotext.plot(epochs, series, marker="braille", color=color, label=label)
+            all_epochs += epochs
+            all_vals += series
+    plotext.yscale("log")
+    if all_vals:
+        plotext.yticks(*_log_ticks(all_vals))
+        plotext.xticks(*_linear_ticks(all_epochs))
+    plotext.title("validation |R_GS|")
+    plotext.xlabel("epoch")
+
+
+def _draw_lr_grad_chart(rows: list[dict]) -> None:
+    """lr (left axis) and ||∇L|| (right axis) vs epoch, both log y."""
+    epochs = [r["epoch"] for r in rows]
+    lr_x, lr_y = _log_series(epochs, [r["lr"] for r in rows])
+    gn_x, gn_y = _log_series(epochs, [r["grad_norm"] for r in rows])
+    if lr_x:
+        plotext.plot(lr_x, lr_y, marker="braille", color="yellow", label="lr")
+        plotext.yticks(*_log_ticks(lr_y))
+    if gn_x:
+        plotext.plot(gn_x, gn_y, marker="braille", color="magenta", label="||∇L||", yside="right")
+        plotext.yticks(*_log_ticks(gn_y), yside="right")
+    plotext.yscale("log")
+    plotext.yscale("log", yside="right")
+    if epochs:
+        plotext.xticks(*_linear_ticks(epochs))
+    plotext.title("lr (left) · ||∇L|| (right)")
+    plotext.xlabel("epoch")
 
 
 class _MetricsManager:
@@ -525,7 +650,7 @@ class _MetricsManager:
         self._total_epochs = total_epochs
         self.rows: list[dict] = []
         self._table_rows: deque[tuple[str, ...]] = deque(maxlen=LIVE_TABLE_MAX_ROWS)
-        self._table = _new_table()
+        self._table = _new_table(with_title=False)
         self._progress = Progress(
             TextColumn("[bold cyan]{task.description}"),
             BarColumn(style="cyan", complete_style="bold cyan"),
@@ -541,7 +666,14 @@ class _MetricsManager:
         self.metrics_row_sink: Callable[[tuple[str, ...]], None] | None = None
 
     def renderable(self) -> Panel:
-        return Panel(Group(self._table, self._progress), border_style="cyan")
+        parts: list[any] = [
+            Align.center(Text("Training Metrics", style="italic")),
+            Align.center(self._progress),
+            Align.center(self._table),
+        ]
+        if (charts := _charts_renderable(self.rows)) is not None:
+            parts.append(charts)
+        return Panel(Group(*parts), border_style="cyan")
 
     def log(
         self,
@@ -1312,8 +1444,14 @@ class NetworkManager:
         return self._field.make_psi_fn()
 
 
-def _new_table() -> Table:
-    table = Table(title="Training Metrics", show_header=True, header_style="bold cyan")
+def _new_table(with_title: bool = True) -> Table:
+    # The live panel and --show replay render their own centered heading; the HPO
+    # TUI's sequential per-trial log still wants the title on the table itself.
+    table = Table(
+        title="Training Metrics" if with_title else None,
+        show_header=True,
+        header_style="bold cyan",
+    )
     table.add_column("Epoch", justify="right", style="cyan")
     table.add_column("LR", justify="right", style="yellow")
     table.add_column("||∇L||", justify="right", style="magenta")
@@ -1368,28 +1506,39 @@ def show_run(run: str) -> None:
     total_epochs = int(run_record.get("result", {}).get("trained_epochs", 0))
     if not total_epochs:
         total_epochs = len(metrics["lr"]) * distance
-    table = _new_table()
-    for index, lr in enumerate(metrics["lr"]):
-        epoch = (index + 1) * distance
-        val_kpis = (
-            metrics["val_kpi_p05"][index],
-            metrics["val_kpi_p50"][index],
-            metrics["val_kpi_p95"][index],
-        )
-        if all(value is None for value in val_kpis):
-            val_kpis = None
+    rows = [
+        {
+            "epoch": (index + 1) * distance,
+            "lr": lr,
+            "grad_norm": metrics["grad_norm"][index],
+            "val_kpi_p05": metrics["val_kpi_p05"][index],
+            "val_kpi_p50": metrics["val_kpi_p50"][index],
+            "val_kpi_p95": metrics["val_kpi_p95"][index],
+        }
+        for index, lr in enumerate(metrics["lr"])
+    ]
+    table = _new_table(with_title=False)
+    for index, row in enumerate(rows):
         table.add_row(
             *_metrics_row(
-                epoch=epoch,
+                epoch=row["epoch"],
                 total_epochs=total_epochs,
-                lr=lr,
-                grad_norm=metrics["grad_norm"][index],
+                lr=row["lr"],
+                grad_norm=row["grad_norm"],
                 loss=metrics["loss"][index],
-                val_kpis=val_kpis,
+                val_kpis=(row["val_kpi_p05"], row["val_kpi_p50"], row["val_kpi_p95"])
+                if row["val_kpi_p50"] is not None
+                else None,
                 epoch_time=metrics["epoch_time_seconds"][index],
             )
         )
-    console.print(Panel(table, border_style="cyan"))
+    parts: list[any] = [
+        Align.center(Text("Training Metrics", style="italic")),
+        Align.center(table),
+    ]
+    if (charts := _charts_renderable(rows)) is not None:
+        parts.append(charts)
+    console.print(Panel(Group(*parts), border_style="cyan"))
 
 
 if __name__ == "__main__":
