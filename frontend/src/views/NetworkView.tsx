@@ -326,7 +326,7 @@ function SamplingTab({ sample }: { sample: ReturnType<typeof useApi<SampleRespon
   )
 }
 
-/** Post-training KPIs from the run's stored kpis.json — nothing recomputed. */
+/** Post-training KPIs from the run.json result; nothing recomputed. */
 function KpiStats({ network }: { network: string }) {
   const kpis = useApi(`kpis:${network}`, () => api.kpis(network))
   if (!kpis.data) return null

@@ -5,7 +5,7 @@ Values are RE-SCORED using KPI_POINTS_PER_CONFIG x KPI_EVAL_CONFIGS
 original setting (e.g. old studies used n_validate=20) pass --n-validate and
 --score-beta explicitly.  Flattened single-config benchmark dirs are re-evaluated
 with ``uv run python -m src.engine.model_evaluation <slugs>`` instead — this
-script handles the study.db / trials.json side of HPO bundles only.
+script handles the study.db / trials.csv side of HPO bundles only.
 
 Usage:
     uv run python scripts/reevaluate_hpo_kpis.py <run_dir>
@@ -22,7 +22,6 @@ with; they are not recoverable from the run dir itself.
 """
 
 import argparse
-import json
 import os
 import shutil
 import sys
@@ -47,9 +46,10 @@ from src.engine.model_evaluation import (
     kpi_benchmark_configs,
     plot_plasma_grid_montage,
 )
-from src.engine.optimize_network_optuna import _write_objective_metadata, _write_trials_json
+from src.engine.optimize_network_optuna import _write_objective_metadata, _write_trials_csv
 from src.engine.residual_correction import load_checkpoint
 from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG
+from src.lib.run_artifacts import kpi_values, update_run_result
 
 console = Console()
 
@@ -64,13 +64,7 @@ def _discover_study_name(storage: str) -> str | None:
 
 
 def _network_name(checkpoint_dir: Path) -> str:
-    """Preserve the existing kpis.json `network` field if present."""
-    kpi_path = checkpoint_dir / "kpis.json"
-    if kpi_path.exists():
-        try:
-            return json.loads(kpi_path.read_text()).get("network", checkpoint_dir.name)
-        except (ValueError, OSError):
-            pass
+    """Name recorded in generated plot metadata."""
     return checkpoint_dir.name
 
 
@@ -98,13 +92,13 @@ def main() -> int:
         "--kpi-n-configs",
         type=int,
         default=KPI_EVAL_CONFIGS,
-        help="Config count for the kpis.json benchmark suite.",
+        help="Config count for the run KPI benchmark suite.",
     )
     parser.add_argument(
         "--kpi-n-points",
         type=int,
         default=KPI_POINTS_PER_CONFIG,
-        help="Sample size for the kpis.json benchmark suite.",
+        help="Sample size for the run KPI benchmark suite.",
     )
     parser.add_argument("--core-rho", type=float, default=0.85)
     parser.add_argument("--no-plots", action="store_true", help="Skip residual.png regeneration.")
@@ -158,7 +152,7 @@ def main() -> int:
     table.add_column("new fused", style="green")
     table.add_column("median")
     table.add_column("p95")
-    table.add_column("kpis.json", style="magenta")
+    table.add_column("run.json", style="magenta")
     table.add_column("status")
 
     n_updated = n_skipped = 0
@@ -192,7 +186,7 @@ def main() -> int:
         median, p95 = evaluate_validation_loss_stats(manager, sample_size=args.n_points)
         fused = median + args.score_beta * p95
 
-        # Benchmark KPI suite for kpis.json (shared stream via kpi_benchmark_configs).
+        # Benchmark KPI suite stored in run.json.
         configs = kpi_benchmark_configs(manager, args.kpi_n_configs)
         kpis = evaluate_plasma_kpis(
             manager, configs, sample_size=args.kpi_n_points, core_rho=args.core_rho
@@ -208,7 +202,7 @@ def main() -> int:
                 args.core_rho,
                 network_name=_network_name(checkpoint_dir),
             )
-            (checkpoint_dir / "kpis.json").write_text(json.dumps(record, indent=2) + "\n")
+            update_run_result(checkpoint_dir, kpis=kpi_values(record), objective_value=fused)
             kpi_status = "rewritten"
 
             if not args.no_plots:
@@ -259,7 +253,7 @@ def main() -> int:
         # Reload so the trial cache reflects the SQL UPDATEs just performed;
         # the in-memory `study` was loaded before any write and holds stale values.
         fresh = optuna.load_study(study_name=study_name, storage=storage)
-        _write_trials_json(fresh, run_dir)
+        _write_trials_csv(fresh, run_dir)
         _write_objective_metadata(
             run_dir,
             score_beta=args.score_beta,
@@ -267,7 +261,7 @@ def main() -> int:
             points_per_config=args.n_points,
             overwrite=True,
         )
-        console.print("trials.json refreshed; stale rankings removed")
+        console.print("trials.csv refreshed; stale rankings removed")
     return 0
 
 

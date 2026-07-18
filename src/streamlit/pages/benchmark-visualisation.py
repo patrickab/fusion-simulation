@@ -1,8 +1,7 @@
-import json
-
 from src.engine.network import NetworkManager
 from src.lib.geometry_config import PlasmaConfig
 from src.lib.network_config import HyperParams
+from src.lib.run_artifacts import load_config
 from src.lib.visualization import (
     plot_flux_heatmap,
     plot_gs_residual_heatmap,
@@ -25,15 +24,13 @@ PLOT_GRID_RESOLUTION = 80
 
 def render_benchmark_row(network_name: str, configs: list[PlasmaConfig], mode: str) -> None:
     run_dir = resolve_run_directory(network_name)
-    config_path = run_dir / "config.json"
 
-    if not config_path.exists():
+    if not (run_dir / "run.json").exists():
         st.error(f"Missing config for {network_name}")
         return
 
-    network_config = HyperParams.from_json(config_path)
-    with open(config_path) as f:
-        config_dict = json.load(f)
+    config_dict = load_config(run_dir)
+    network_config = HyperParams.from_dict(config_dict)
 
     display_name = network_name
 
@@ -69,9 +66,9 @@ def init_session_state(networks: list[str]) -> None:
     if "manager" not in st.session_state:
         config = HyperParams()
         if networks:
-            config_path = resolve_run_directory(networks[0]) / "config.json"
-            if config_path.exists():
-                config = HyperParams.from_json(config_path)
+            run_dir = resolve_run_directory(networks[0])
+            if (run_dir / "run.json").exists():
+                config = HyperParams.from_dict(load_config(run_dir))
         st.session_state.manager = NetworkManager(config)
 
     st.session_state.setdefault("seed", 0)

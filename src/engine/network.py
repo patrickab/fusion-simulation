@@ -1,13 +1,11 @@
 import argparse
 from collections import deque
 from contextlib import nullcontext, suppress
-import csv
 from dataclasses import dataclass
 from datetime import datetime
 import functools
 from functools import partial
 import json
-import logging
 from pathlib import Path
 import re
 import shutil
@@ -41,6 +39,7 @@ from src.lib.geometry_config import (
 )
 from src.lib.logger import get_logger
 from src.lib.network_config import DomainBounds, FluxInput, HyperParams
+from src.lib.run_artifacts import format_duration, gpu_name, kpi_values, load_run, write_json
 
 console = Console()
 logger = get_logger(
@@ -520,11 +519,11 @@ class _Field:
 
 
 class _MetricsManager:
-    """Owns the Rich training table, progress bar, accumulators, and training_log rows."""
+    """Owns the Rich training table, progress bar, and completed metric windows."""
 
     def __init__(self, total_epochs: int) -> None:
         self._total_epochs = total_epochs
-        self.rows: list[dict] = []  # persisted log entries (written to training.csv)
+        self.rows: list[dict] = []
         self._table_rows: deque[tuple[str, ...]] = deque(maxlen=LIVE_TABLE_MAX_ROWS)
         self._table = _new_table()
         self._progress = Progress(
@@ -549,12 +548,11 @@ class _MetricsManager:
         loss: float,
         residual: float,
         boundary: float,
-        val_kpi_median: float | None,
+        val_kpis: tuple[float, float, float] | None,
         lr: float,
         grad_norm: float,
-        optimizer_step: int,
         epoch_time: float,
-    ) -> None:
+    ) -> dict | None:
         self._acc_loss += loss
         self._acc_res += residual
         self._acc_bnd += boundary
@@ -562,41 +560,44 @@ class _MetricsManager:
         self._acc_t += epoch_time
 
         count = epoch % LOG_FREQUENCY + 1
-        row = {
-            "epoch": epoch + 1,
-            "optimizer_step": optimizer_step,
-            "lr": lr,
-            "moving_avg_loss": self._acc_loss / count,
-            "residual": self._acc_res / count,
-            "boundary": self._acc_bnd / count,
-            "grad_norm": self._acc_gn / count,
-            "epoch_time": self._acc_t / count,
-            "val_kpi_median": val_kpi_median,
-        }
-        self.rows.append(row)
-
         if (epoch + 1) % LOG_FREQUENCY == 0:
-            row = _metrics_row(
+            p05, p50, p95 = val_kpis or (None, None, None)
+            persisted = {
+                "lr": lr,
+                "loss": self._acc_loss / count,
+                "residual": self._acc_res / count,
+                "boundary": self._acc_bnd / count,
+                "grad_norm": self._acc_gn / count,
+                "epoch_time_seconds": self._acc_t / count,
+                "val_kpi_p05": p05,
+                "val_kpi_p50": p50,
+                "val_kpi_p95": p95,
+            }
+            self.rows.append(persisted)
+            display_row = _metrics_row(
                 epoch=epoch + 1,
                 total_epochs=self._total_epochs,
                 lr=lr,
                 grad_norm=self._acc_gn / count,
                 loss=self._acc_loss / count,
-                val_kpi_median=val_kpi_median,
+                val_kpis=val_kpis,
                 epoch_time=self._acc_t / count,
             )
-            self._table_rows.append(row)
+            self._table_rows.append(display_row)
             if self.metrics_row_sink is not None:
-                self.metrics_row_sink(row)
+                self.metrics_row_sink(display_row)
             table = _new_table()
             for r in self._table_rows:
                 table.add_row(*r)
             self._table = table
             self._acc_loss = self._acc_res = self._acc_bnd = self._acc_gn = self._acc_t = 0.0
+        else:
+            persisted = None
 
         self._progress.update(self._epoch_task, advance=1)
         if self._live is not None:
             self._live.update(self.renderable())
+        return persisted
 
 
 # ---------------------------------------------------------------------------
@@ -648,44 +649,57 @@ class _FileStorageManager:
                 run_dir.parent.rmdir()
 
     def write_params(self, run_dir: Path, params: any) -> None:
-        (run_dir / "network.flax").write_bytes(flax.serialization.to_bytes(params))
+        path = run_dir / "network.flax"
+        temporary = path.with_suffix(".flax.tmp")
+        temporary.write_bytes(flax.serialization.to_bytes(params))
+        temporary.replace(path)
 
     def read_params(self, pinn_path: Path, target_params: any) -> any:
         with open(pinn_path, "rb") as f:
             return flax.serialization.from_bytes(target_params, f.read())
 
-    def write_config(self, run_dir: Path, config: HyperParams) -> None:
-        config.to_json(path=str(run_dir / "config.json"))
+    def write_metrics(self, run_dir: Path, rows: list[dict]) -> None:
+        fields = (
+            "lr",
+            "loss",
+            "residual",
+            "boundary",
+            "grad_norm",
+            "epoch_time_seconds",
+            "val_kpi_p05",
+            "val_kpi_p50",
+            "val_kpi_p95",
+        )
+        metrics = {key: [row[key] for row in rows] for key in fields}
+        write_json(
+            run_dir / "metrics.json",
+            {"format_version": 1, "logging_distance": LOG_FREQUENCY, **metrics},
+        )
 
-    def write_training_csv(self, run_dir: Path, rows: list[dict]) -> None:
-        if not rows:
-            return
-        with open(run_dir / "training.csv", "w") as f:
-            f.write(
-                "epoch,optimizer_step,lr,moving_avg_loss,val_kpi_median,"
-                "residual,boundary,grad_norm,epoch_time\n"
-            )
-            for entry in rows:
-                val = (
-                    f"{entry['val_kpi_median']:.6f}" if entry["val_kpi_median"] is not None else ""
-                )
-                f.write(
-                    f"{entry['epoch']},{entry['optimizer_step']},{entry['lr']:.2e},"
-                    f"{entry['moving_avg_loss']:.6f},{val},{entry['residual']:.6f},"
-                    f"{entry['boundary']:.6f},{entry['grad_norm']:.6f},"
-                    f"{entry['epoch_time']:.4f}\n"
-                )
+    def write_run(
+        self,
+        run_dir: Path,
+        manager: "NetworkManager",
+        duration: str | None,
+        result: dict,
+    ) -> None:
+        write_json(
+            run_dir / "run.json",
+            {
+                "format_version": 1,
+                "commit": current_commit(),
+                "duration": duration,
+                "device": manager.device,
+                "seed": manager.seed,
+                "config": manager.config.to_dict(),
+                "result": result,
+            },
+        )
 
-    def write_stage2_meta(self, run_dir: Path, scale: float) -> None:
-        (run_dir / "stage2_meta.json").write_text(json.dumps({"scale": scale}) + "\n")
-
-    def write_training_summary(self, run_dir: Path, summary: dict) -> None:
-        (run_dir / "training_summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-
-    def benchmark(self, manager: "NetworkManager", test_mode: bool) -> None:
-        """Save residual montage, grids, and kpis.json for this run."""
+    def benchmark(self, manager: "NetworkManager", test_mode: bool) -> dict:
+        """Save the residual montage and return post-training KPIs."""
         if test_mode:
-            return
+            return {}
         from src.engine.model_evaluation import (
             EVAL_RESOLUTION,
             N_PLOTS,
@@ -717,8 +731,8 @@ class _FileStorageManager:
             kpis=kpis,
         )
         record = build_kpi_record(manager, kpis, KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG, 0.85)
-        (run_dir / "kpis.json").write_text(json.dumps(record, indent=2) + "\n")
         logger.info(f"residual plot saved to {run_dir}")
+        return kpi_values(record)
 
     def save_training_curves(self, run_dir: Path, rows: list[dict], artifact_stem: str) -> None:
         if not rows:
@@ -726,7 +740,7 @@ class _FileStorageManager:
         from src.engine.model_evaluation import plot_training_curves
 
         plot_training_curves(
-            run_dir / "training.csv", run_dir / "training_curves.png", title=artifact_stem
+            run_dir / "metrics.json", run_dir / "training_curves.png", title=artifact_stem
         )
 
 
@@ -798,6 +812,8 @@ class NetworkManager:
         self.training_log: list[dict] = []
         self.training_summary: dict | None = None
         self.artifact_stem: str | None = None
+        self.device = "unknown"
+        self.training_duration_seconds: float | None = None
 
         # Instance-level jitted train_step — closed over self._psi_fn so both the plain
         # and composed cases use one kernel.  soft_bc must stay static (pinn_loss_function
@@ -845,10 +861,10 @@ class NetworkManager:
     # ------------------------------------------------------------------
 
     def to_disk(self) -> str:
-        """Save params, config, training CSV, and benchmark artifacts.
+        """Save params, consolidated run data, metrics, and benchmark plots.
 
         Correctors configured with ``stage1_run_dir`` are nested under
-        ``<stage1_run_dir>/stage2/`` and include ``stage2_meta.json``.
+        ``<stage1_run_dir>/stage2/`` and record their scale in ``run.json``.
         """
         if self._files.artifact_stem is None:
             self._files.artifact_stem = self._files.new_artifact_stem()
@@ -856,18 +872,33 @@ class NetworkManager:
 
         run_dir = self._files.run_dir()
         run_dir.mkdir(parents=True, exist_ok=True)
+        if self.device == "unknown":
+            self.device = gpu_name()
 
-        self._files.write_params(run_dir, self.state.params)
-        self._files.write_config(run_dir, self.config)
-        self._files.write_training_csv(run_dir, self.training_log)
-        if self.training_summary is not None:
-            self._files.write_training_summary(run_dir, self.training_summary)
-
+        self._files.write_metrics(run_dir, self.training_log)
+        kpis = self._files.benchmark(self, self.test_mode)
+        result = {
+            "status": "completed",
+            **(self.training_summary or {}),
+            "optimizer_updates": int(self.state.step),
+            "examples_processed": int(self.state.step) * self.config.batch_size,
+            "peak_memory_bytes": int(
+                (jax.devices()[0].memory_stats() or {}).get("peak_bytes_in_use", 0)
+            ),
+            "kpis": kpis,
+        }
         if self._prior is not None:
-            self._files.write_stage2_meta(run_dir, self._scale)
-
-        self._files.benchmark(self, self.test_mode)
+            result["stage2_scale"] = self._scale
+        self._files.write_run(
+            run_dir,
+            self,
+            format_duration(self.training_duration_seconds)
+            if self.training_duration_seconds is not None
+            else None,
+            result,
+        )
         self._files.save_training_curves(run_dir, self.training_log, self.artifact_stem)
+        self._files.write_params(run_dir, self.state.params)
         return self.artifact_stem
 
     def from_disk(self, pinn_path) -> any:  # noqa
@@ -967,7 +998,7 @@ class NetworkManager:
     def validation_configs(self) -> list:
         """The manager's fixed validation configs: the first n_validation_size of the
         shared KPI config stream (kpi_benchmark_configs), so training-time tracking,
-        HPO ranking and kpis.json all score identical PlasmaConfig objects.
+        HPO ranking and run.json KPIs all score identical PlasmaConfig objects.
 
         PlasmaConfig construction bakes the building sampler's boundary-theta draw
         into the Fourier fit, so configs must come from ``self.sampler`` — a
@@ -980,13 +1011,14 @@ class NetworkManager:
             self._validation_kpi_configs = kpi_benchmark_configs(self, self.n_validation_size)
         return self._validation_kpi_configs
 
-    def _calculate_validation_kpi(self) -> float:
-        """Median |R_GS| over the fixed validation configs at KPI_POINTS_PER_CONFIG."""
+    def _calculate_validation_kpis(self) -> tuple[float, float, float]:
+        """p05/p50/p95 |R_GS| over the fixed validation configuration stream."""
         from src.engine.model_evaluation import evaluate_plasma_kpis
 
-        return evaluate_plasma_kpis(
+        kpis = evaluate_plasma_kpis(
             self, self.validation_configs(), sample_size=KPI_POINTS_PER_CONFIG
-        )["loss_median"]
+        )
+        return kpis["loss_p05"], kpis["loss_median"], kpis["loss_p95"]
 
     def _train_step(
         self,
@@ -1102,24 +1134,16 @@ class NetworkManager:
         self._files.artifact_stem = self._files.new_artifact_stem()
         self.artifact_stem = self._files.artifact_stem
 
-        # Only materialise a benchmark run dir + train.log when we intend to keep
-        # artifacts. Correctors (save_to_disk=False) train purely in memory and
-        # persist themselves under <stage1>/stage2/.
+        # Only materialise a benchmark run dir when we intend to keep artifacts.
+        # Correctors (save_to_disk=False) train in memory and persist later.
         run_dir = None
-        file_handler = None
-        previous_level = logger.level
         if save_to_disk:
             run_dir = self._files.run_dir()
             run_dir.mkdir(parents=True, exist_ok=True)
-            file_handler = logging.FileHandler(run_dir / "train.log")
-            file_handler.setLevel(logging.DEBUG)
-            file_handler.setFormatter(
-                logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
-            )
-            logger.setLevel(logging.DEBUG)
-            logger.addHandler(file_handler)
-            logger.debug(f"run {self.artifact_stem} hyperparams: {self.config.to_dict()}")
+            self.device = gpu_name()
+            self._files.write_run(run_dir, self, None, {"status": "running"})
 
+        training_started = time.perf_counter()
         try:
             self._metrics = _MetricsManager(total_epochs=self.epochs)
             self._metrics.metrics_row_sink = self.metrics_row_sink
@@ -1133,7 +1157,7 @@ class NetworkManager:
                 )
             else:
                 live = nullcontext()
-            val_kpi_median = None
+            val_kpis = None
             stopper = _PatienceStopper(
                 EARLY_STOPPING_PATIENCE,
                 EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT,
@@ -1151,29 +1175,30 @@ class NetworkManager:
                     loss, residual, boundary, grad_norm = self.train_epoch(epoch)
                     epoch_time = time.perf_counter() - start_time
 
-                    val_kpi_median = None
+                    val_kpis = None
                     should_stop = False
                     if (epoch + 1) % VALIDATION_FREQUENCY == 0:
-                        val_kpi_median = self._calculate_validation_kpi()
-                        should_stop, improved = stopper.update(epoch + 1, val_kpi_median)
+                        val_kpis = self._calculate_validation_kpis()
+                        should_stop, improved = stopper.update(epoch + 1, val_kpis[1])
                         if improved:
                             best_params = self.state.params
-                    if validation_callback is not None and not should_stop:
-                        validation_callback(epoch + 1, val_kpi_median)
 
                     lr = float(self._lr_schedule(self.state.step))
-                    self._metrics.log(
+                    persisted = self._metrics.log(
                         epoch,
                         loss,
                         residual,
                         boundary,
-                        val_kpi_median,
+                        val_kpis,
                         lr,
                         grad_norm,
-                        int(self.state.step),
                         epoch_time,
                     )
                     trained_epochs = epoch + 1
+                    if run_dir is not None and persisted is not None:
+                        self._files.write_metrics(run_dir, self._metrics.rows)
+                    if validation_callback is not None and not should_stop:
+                        validation_callback(epoch + 1, val_kpis[1] if val_kpis else None)
                     if should_stop:
                         stop_reason = "early_stopping"
                         if best_params is not None:
@@ -1187,19 +1212,20 @@ class NetworkManager:
 
             if stop_reason != "early_stopping" and self.config.lbfgs_steps > 0:
                 self.lbfgs(self.config.lbfgs_steps)
-                val_kpi_median = self._calculate_validation_kpi()
+                val_kpis = self._calculate_validation_kpis()
 
-            if stop_reason == "early_stopping" or val_kpi_median is None:
-                val_kpi_median = self._calculate_validation_kpi()
+            if stop_reason == "early_stopping" or val_kpis is None:
+                val_kpis = self._calculate_validation_kpis()
 
-            # Expose training_log for backward compat (to_disk, HPO, etc.)
             self.training_log = self._metrics.rows
             self.training_summary = {
                 "stop_reason": stop_reason,
                 "trained_epochs": trained_epochs,
                 "planned_epochs": self.epochs,
-                "final_val_kpi_median": val_kpi_median,
-                "best_smoothed_val_kpi_median": (
+                "final_val_kpi_p05": val_kpis[0],
+                "final_val_kpi_p50": val_kpis[1],
+                "final_val_kpi_p95": val_kpis[2],
+                "best_smoothed_val_kpi_p50": (
                     stopper.best_value if stopper.best_epoch is not None else None
                 ),
                 "best_validation_epoch": stopper.best_epoch,
@@ -1210,20 +1236,25 @@ class NetworkManager:
                 ),
                 "early_stopping_rolling_window": EARLY_STOPPING_ROLLING_WINDOW,
             }
+            self.training_duration_seconds = time.perf_counter() - training_started
 
             if save_to_disk:
-                logger.debug(f"run {self.artifact_stem} final val_kpi_median={val_kpi_median:.3f}")
-                with open(run_dir / "train.log", "a", encoding="utf-8") as log_f:
-                    Console(file=log_f, width=100, color_system=None).print(
-                        Panel(self._metrics._table, border_style="cyan")
-                    )
                 self.to_disk()
-            return val_kpi_median
-        finally:
-            if file_handler is not None:
-                logger.removeHandler(file_handler)
-                file_handler.close()
-                logger.setLevel(previous_level)
+            return val_kpis[1]
+        except BaseException as exc:
+            if run_dir is not None:
+                self.training_duration_seconds = time.perf_counter() - training_started
+                self._files.write_run(
+                    run_dir,
+                    self,
+                    format_duration(self.training_duration_seconds),
+                    {
+                        "status": "failed",
+                        "error_type": type(exc).__name__,
+                        "error_message": str(exc),
+                    },
+                )
+            raise
 
     def lbfgs(self, steps: int) -> None:
         """Polish AdamW-trained params with L-BFGS on one fixed batch."""
@@ -1282,7 +1313,9 @@ def _new_table() -> Table:
     table.add_column("LR", justify="right", style="yellow")
     table.add_column("||∇L||", justify="right", style="magenta")
     table.add_column("Loss", justify="right", style="magenta")
-    table.add_column("Val KPI", justify="right", style="green")
+    table.add_column("Val p05", justify="right", style="green")
+    table.add_column("Val p50", justify="right", style="green")
+    table.add_column("Val p95", justify="right", style="green")
     table.add_column("Time/Ep", justify="right")
     return table
 
@@ -1293,22 +1326,25 @@ def _metrics_row(
     lr: float,
     grad_norm: float,
     loss: float,
-    val_kpi_median: float | None,
+    val_kpis: tuple[float, float, float] | None,
     epoch_time: float,
 ) -> tuple[str, ...]:
-    """One Training Metrics table row; shared by the live display and show_run replay."""
+    """One Training Metrics table row shared by live display and replay."""
+    p05, p50, p95 = val_kpis or (None, None, None)
     return (
         f"{epoch}/{total_epochs}",
         f"{lr:.2e}",
         f"{grad_norm:.2e}",
         f"{loss:.2e}",
-        f"{val_kpi_median:.2e}" if val_kpi_median is not None else "-",
+        f"{p05:.2e}" if p05 is not None else "-",
+        f"{p50:.2e}" if p50 is not None else "-",
+        f"{p95:.2e}" if p95 is not None else "-",
         f"{epoch_time:.2f}s",
     )
 
 
 def show_run(run: str) -> None:
-    """Re-render the Training Metrics table for a stored run from training.csv."""
+    """Re-render the Training Metrics table for a stored run from metrics.json."""
     run_dir = Path(run)
     if not run_dir.is_dir():
         candidates = [
@@ -1317,28 +1353,35 @@ def show_run(run: str) -> None:
             *(Filepaths.DATA / "hpo").glob(f"*/{run}"),
         ]
         run_dir = next((p for p in candidates if p.is_dir()), run_dir)
-    csv_path = run_dir / "training.csv"
-    if not csv_path.exists():
-        raise SystemExit(f"no training.csv found for run '{run}'")
+    metrics_path = run_dir / "metrics.json"
+    if not metrics_path.exists():
+        raise SystemExit(f"no metrics.json found for run '{run}'")
 
-    with open(csv_path) as f:
-        rows = list(csv.DictReader(f))
-    total_epochs = int(rows[-1]["epoch"])
+    metrics = json.loads(metrics_path.read_text())
+    distance = int(metrics["logging_distance"])
+    run_record = load_run(run_dir)
+    total_epochs = int(run_record.get("result", {}).get("trained_epochs", 0))
+    if not total_epochs:
+        total_epochs = len(metrics["lr"]) * distance
     table = _new_table()
-    val_col = "val_kpi_median" if "val_kpi_median" in rows[0] else "val_loss"
-    for r in rows:
-        epoch = int(r["epoch"])
-        if epoch % LOG_FREQUENCY != 0 and epoch != total_epochs:
-            continue
+    for index, lr in enumerate(metrics["lr"]):
+        epoch = (index + 1) * distance
+        val_kpis = (
+            metrics["val_kpi_p05"][index],
+            metrics["val_kpi_p50"][index],
+            metrics["val_kpi_p95"][index],
+        )
+        if all(value is None for value in val_kpis):
+            val_kpis = None
         table.add_row(
             *_metrics_row(
                 epoch=epoch,
                 total_epochs=total_epochs,
-                lr=float(r["lr"]),
-                grad_norm=float(r["grad_norm"]),
-                loss=float(r["moving_avg_loss"]),
-                val_kpi_median=float(r[val_col]) if r[val_col] else None,
-                epoch_time=float(r["epoch_time"]),
+                lr=lr,
+                grad_norm=metrics["grad_norm"][index],
+                loss=metrics["loss"][index],
+                val_kpis=val_kpis,
+                epoch_time=metrics["epoch_time_seconds"][index],
             )
         )
     console.print(Panel(table, border_style="cyan"))
@@ -1413,6 +1456,15 @@ if __name__ == "__main__":
         "halve activation memory, unlocking wider nets on 12GB",
     )
     parser.add_argument(
+        "--n-train", type=int, default=None, help="Training configurations sampled per epoch"
+    )
+    parser.add_argument(
+        "--inner-samples", type=int, default=None, help="Interior collocation points per config"
+    )
+    parser.add_argument(
+        "--boundary-samples", type=int, default=None, help="Boundary points per config"
+    )
+    parser.add_argument(
         "--show",
         metavar="RUN",
         default=None,
@@ -1451,6 +1503,24 @@ if __name__ == "__main__":
                 )
             if args.batch_size is not None:
                 config = config.replace(batch_size=args.batch_size)
+            if args.n_train is not None:
+                config = config.replace(n_train=args.n_train)
+            if args.inner_samples is not None:
+                config = config.replace(n_rz_inner_samples=args.inner_samples)
+            if args.boundary_samples is not None:
+                config = config.replace(n_rz_boundary_samples=args.boundary_samples)
+            if (
+                min(
+                    config.batch_size,
+                    config.n_train,
+                    config.n_rz_inner_samples,
+                    config.n_rz_boundary_samples,
+                )
+                <= 0
+            ):
+                parser.error("training and sample budgets must be positive")
+            if config.n_train % config.batch_size:
+                parser.error("--n-train must be divisible by --batch-size")
             manager = NetworkManager(config, test_mode=args.test, name=args.name)
             manager.train(save_to_disk=True)
         else:

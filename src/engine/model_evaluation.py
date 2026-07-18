@@ -18,6 +18,7 @@ from src.engine.plasma import get_poloidal_points
 from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG
 from src.lib.geometry_config import PlasmaConfig
 from src.lib.network_config import DomainBounds
+from src.lib.run_artifacts import kpi_values, update_run_result
 
 GridQuantity = Literal["flux", "residual"]
 # Plot count - kept small to ensure plots do not become too large
@@ -49,7 +50,7 @@ def build_kpi_record(
     core_rho: float,
     network_name: str | None = None,
 ) -> dict:
-    """Assemble the kpis.json record dict shared by training and CLI eval.
+    """Assemble the KPI record shared by training and CLI evaluation.
 
     When network_name is None (training path), derive it from the manager's
     artifact slug. When provided (CLI path), use it
@@ -280,11 +281,22 @@ def evaluate_plasma_kpis(
     # Boundary leak stays a separate small pass: the boundary itself is only 256
     # points, but the flux-depth denominator needs one psi-only forward pass over
     # the same interior sample.
-    batched_config = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *configs)
     boundary_theta = jnp.linspace(0.0, 2.0 * jnp.pi, 257)[:-1]
-    boundary_leaks = _boundary_leak_core(
-        _shared_psi_fn(manager), manager.state.params, batched_config, theta, rho, boundary_theta
-    )
+    config_chunk = max(1, KPI_EVAL_POINT_BUDGET // min(sample_size, GRID_EVAL_CHUNK))
+    boundary_chunks: list[np.ndarray] = []
+    for start in range(0, len(configs), config_chunk):
+        batch = configs[start : start + config_chunk]
+        batched_config = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *batch)
+        chunk_result = _boundary_leak_core(
+            _shared_psi_fn(manager),
+            manager.state.params,
+            batched_config,
+            theta,
+            rho,
+            boundary_theta,
+        )
+        boundary_chunks.append(np.asarray(chunk_result))
+    boundary_leaks = np.concatenate(boundary_chunks)
 
     def summary(values: np.ndarray, prefix: str) -> dict[str, float]:
         return {
@@ -306,10 +318,10 @@ def kpi_benchmark_configs(
     manager: NetworkManager,
     n_configs: int = KPI_EVAL_CONFIGS,
 ) -> list[PlasmaConfig]:
-    """THE shared config stream for kpis.json / CLI eval / validation tracking.
+    """THE shared config stream for run KPIs, CLI evaluation, and validation.
 
     Validation configs are drawn from the same Sobol stream (BASE_SEED + 123),
-    so training-time KPI tracking, post-training kpis.json, and CLI re-eval all
+    so training-time KPI tracking, post-training run KPIs, and CLI re-evaluation all
     score the same set of reactor configurations.
     """
     lower, upper = DomainBounds.get_bounds()
@@ -522,67 +534,56 @@ def plot_plasma_grid_montage(
 
 
 def plot_training_curves(
-    csv_path: str | Path, output_path: str | Path, title: str | None = None
+    metrics_path: str | Path, output_path: str | Path, title: str | None = None
 ) -> None:
-    """Two-panel training overview from training.csv: loss/val-loss on top,
+    """Two-panel training overview from metrics.json: loss/validation on top,
     LR + gradient norm (twinned y-axes) below — one glance to see whether a
     run is still descending or has actually annealed to its LR floor."""
-    import csv
-
     import matplotlib
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    epochs: list[int] = []
-    lr: list[float] = []
-    loss: list[float] = []
-    grad_norm: list[float] = []
-    val_epochs: list[int] = []
-    val_kpi: list[float] = []
-    val_label: str | None = None
-    with open(csv_path) as f:
-        for row in csv.DictReader(f):
-            epochs.append(int(row["epoch"]))
-            lr.append(float(row["lr"]))
-            loss.append(float(row["moving_avg_loss"]))
-            grad_norm.append(float(row["grad_norm"]))
-            # New CSVs have val_kpi_median; fall back to val_loss for legacy files.
-            if "val_kpi_median" in row:
-                val_col, label = "val_kpi_median", "val KPI (median |R_GS|)"
-            else:
-                val_col, label = "val_loss", "val loss"
-            if row[val_col]:
-                val_epochs.append(int(row["epoch"]))
-                val_kpi.append(float(row[val_col]))
-                val_label = label
+    metrics = json.loads(Path(metrics_path).read_text())
+    distance = int(metrics["logging_distance"])
+    epochs = [(index + 1) * distance for index in range(len(metrics["lr"]))]
+    val_series = {
+        percentile: [
+            (epoch, value)
+            for epoch, value in zip(epochs, metrics[f"val_kpi_{percentile}"], strict=True)
+            if value is not None
+        ]
+        for percentile in ("p05", "p50", "p95")
+    }
 
     fig, (ax_loss, ax_lr) = plt.subplots(2, 1, figsize=(8, 7), sharex=True, layout="constrained")
 
-    ax_loss.plot(epochs, loss, color="#6cce5a", lw=1.2, label="train loss")
-    if val_kpi:
-        ax_loss.plot(
-            val_epochs,
-            val_kpi,
-            color="#fde725",
-            marker="o",
-            markersize=3,
-            lw=0,
-            label=val_label or "val KPI (median |R_GS|)",
-        )
+    ax_loss.plot(epochs, metrics["loss"], color="#6cce5a", lw=1.2, label="train loss")
+    colors = {"p05": "#35b779", "p50": "#fde725", "p95": "#440154"}
+    for percentile, points in val_series.items():
+        if points:
+            ax_loss.plot(
+                [point[0] for point in points],
+                [point[1] for point in points],
+                color=colors[percentile],
+                marker="o",
+                markersize=3,
+                lw=0,
+                label=f"val KPI {percentile}",
+            )
     ax_loss.set_yscale("log")
     ax_loss.set_ylabel("loss")
     ax_loss.legend(loc="upper right", fontsize=8)
-    ax_loss.set_title(title or Path(csv_path).parent.name, fontsize=10)
+    ax_loss.set_title(title or Path(metrics_path).parent.name, fontsize=10)
 
-    ax_lr.plot(epochs, lr, color="#26828e", lw=1.2)
+    ax_lr.plot(epochs, metrics["lr"], color="#26828e", lw=1.2)
     ax_lr.set_yscale("log")
     ax_lr.set_ylabel("learning rate", color="#26828e")
     ax_lr.tick_params(axis="y", labelcolor="#26828e")
     ax_lr.set_xlabel("epoch")
 
     ax_gn = ax_lr.twinx()
-    ax_gn.plot(epochs, grad_norm, color="#d4d4d8", lw=1.0, alpha=0.7)
+    ax_gn.plot(epochs, metrics["grad_norm"], color="#d4d4d8", lw=1.0, alpha=0.7)
     ax_gn.set_yscale("log")
     ax_gn.set_ylabel("||∇L||", color="#d4d4d8")
     ax_gn.tick_params(axis="y", labelcolor="#d4d4d8")
@@ -626,9 +627,8 @@ def _add_kpi_table(fig: object, kpis: Mapping[str, float]) -> None:
 if __name__ == "__main__":
     # Region-split |GS residual| report: selection metric is the plasma core
     # (rho < --core-rho); the edge shell is reported but tolerated by design.
-    # Each run dir (data/benchmarks/<slug>/) already holds network.flax,
-    # config.json and training.csv from training; this CLI adds kpis.json and the
-    # montage PNG (fixed linear color scale for comparability) into the same dir.
+    # Each run dir already holds network.flax and run.json; this CLI updates the
+    # stored KPIs and montage under the same directory.
     import argparse
     from datetime import datetime
 
@@ -680,9 +680,8 @@ if __name__ == "__main__":
             run_dir / "stage2" if (run_dir / "stage2" / "network.flax").exists() else run_dir
         )
         evaluated_name = f"{name}/stage2" if artifact_dir != run_dir else name
-        config_path = artifact_dir / "config.json"
         flax_path = artifact_dir / "network.flax"
-        if not config_path.exists() or not flax_path.exists():
+        if not (artifact_dir / "run.json").exists() or not flax_path.exists():
             print(f"  skip {name}: missing config or network.flax")
             continue
         manager = load_checkpoint(name)
@@ -698,9 +697,6 @@ if __name__ == "__main__":
             + " ".join(f"{value:>9.4f}" for value in kpis.values())
         )
 
-        # kpis.json: valid JSON, one key per line (indent=2) for terminal readability.
-        # Overwritten each run (latest eval wins); the eval params are included
-        # so the file is self-describing without needing config.json alongside.
         record = build_kpi_record(
             manager,
             kpis,
@@ -709,14 +705,14 @@ if __name__ == "__main__":
             args.core_rho,
             network_name=evaluated_name,
         )
-        (artifact_dir / "kpis.json").write_text(json.dumps(record, indent=2) + "\n")
+        update_run_result(artifact_dir, kpis=kpi_values(record))
 
         if args.no_plots:
             continue
-        csv_path = artifact_dir / "training.csv"
-        if csv_path.exists():
+        metrics_path = artifact_dir / "metrics.json"
+        if metrics_path.exists():
             plot_training_curves(
-                csv_path, artifact_dir / "training_curves.png", title=evaluated_name
+                metrics_path, artifact_dir / "training_curves.png", title=evaluated_name
             )
         grids = evaluate_plasma_grids(
             manager,

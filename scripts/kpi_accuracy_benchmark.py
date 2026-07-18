@@ -32,6 +32,7 @@ from src.engine.model_evaluation import _kpi_sample_points, evaluate_residual_sa
 from src.engine.network import BASE_SEED, NetworkManager
 from src.lib.geometry_config import PlasmaConfig
 from src.lib.network_config import DomainBounds, HyperParams
+from src.lib.run_artifacts import load_config
 
 REPO = Path(__file__).resolve().parent.parent
 OUT_DIR = REPO / "data" / "kpi_accuracy"
@@ -71,7 +72,7 @@ CONFIG_CHUNK = {16_384: 10, 8192: 20, 4096: 40, 2048: 50, 1024: 100}
 
 def load_manager(rel_path: str) -> NetworkManager:
     run_dir = REPO / rel_path
-    hp = HyperParams.from_json(str(run_dir / "config.json"))
+    hp = HyperParams.from_dict(load_config(run_dir))
     manager = NetworkManager(hp)
     manager.state = manager.state.replace(params=manager.from_disk(run_dir / "network.flax"))
     return manager

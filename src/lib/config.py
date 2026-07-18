@@ -15,7 +15,7 @@ import numpy as np
 # Global KPI evaluation protocol
 # Calibrated in docs/evaluation/kpi-accuracy-benchmark.md.
 # Every metric path derives from these two constants: training-time validation
-# tracking, end-of-training kpis.json, eval CLI, HPO pruning/ranking, and the
+# tracking, end-of-training run.json KPIs, eval CLI, HPO pruning/ranking, and the
 # re-eval script all sample the same |R_GS| budget.
 # ---------------------------------------------------------------------------
 # Report-grade budget (~±1% absolute median accuracy): both noise sources are
@@ -48,7 +48,7 @@ class Filepaths:
         print(f"Creating output directory at {DATA}")
         pathlib.Path.mkdir(DATA, parents=True)
 
-    # Per-commit benchmark tree: <commit>/<run>/{network.flax,config.json,...}
+    # Per-commit benchmark tree: <run>/{run.json,metrics.json,network.flax,plots}
     BENCHMARKS = DATA / "benchmarks"
     BENCHMARK_ARCHIVE = BENCHMARKS / "_archive"
     HPO_ROOT = DATA / "hpo"

@@ -42,7 +42,7 @@
 - Streamlit pages use hyphen-separated filenames (e.g., `network-visualisation.py`)
 - Frontend React components use PascalCase; TS modules use camelCase (`api.ts`, `fieldlines.ts`)
 - FastAPI routes: `/api/<resource>/<name>/<action>` (e.g. `/api/network/{name}/fieldlines`)
-- Single-config checkpoints: `data/benchmarks/<YYYY_MM_DD_HH_MM_SS>_<name>_<commit>/`; HPO studies use the same study-slug format and retain `pinn_<timestamp>` trial dirs inside.
+- Single-config checkpoints: `data/benchmarks/<YYYY_MM_DD_HH_MM_SS>_<name>_<commit>/`; retained runs use `run.json`, column-oriented `metrics.json`, `network.flax`, and plots. Readers do not support the superseded split artifact format. HPO studies retain `study.db`, `trials.csv`, and `pinn_<timestamp>` trial dirs.
 - Checkpoint-compatible architecture toggles are lowercase serialized values: `arch="mlp"|"piratenet"`, `rwf=true|false`; defaults stay on the legacy parameter-tree shape.
 
 ## Linting / Formatting

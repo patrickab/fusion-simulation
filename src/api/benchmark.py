@@ -5,6 +5,7 @@ import json
 
 from src.api.network import build_plasma_grids
 from src.api.state import get_manager
+from src.lib.run_artifacts import load_config, load_kpis
 from src.streamlit.network_utils import filter_networks_by_commit, resolve_run_directory
 
 
@@ -23,13 +24,12 @@ def run_benchmark(
 
     for name in reversed(filtered):
         run_dir = resolve_run_directory(name)
-        config_path = run_dir / "config.json"
-        if not config_path.exists():
+        if not (run_dir / "run.json").exists():
             yield _sse_event({"type": "row_error", "network": name, "message": "Missing config"})
             continue
 
         manager = get_manager(name)
-        row: dict = {"type": "row", "network": name, "config": json.loads(config_path.read_text())}
+        row: dict = {"type": "row", "network": name, "config": load_config(run_dir)}
 
         quantities = {
             "Flux Prediction": ("flux",),
@@ -37,9 +37,10 @@ def run_benchmark(
             "Both": ("flux", "residual"),
         }[mode]
         grids = build_plasma_grids(manager, seed, sample_size, resolution, quantities)
-        # KPIs are precomputed post-training (kpis.json); never re-evaluated here.
-        kpis_path = run_dir / "kpis.json"
-        row["kpis"] = json.loads(kpis_path.read_text()) if kpis_path.exists() else {}
+        artifact_dir = (
+            run_dir / "stage2" if (run_dir / "stage2" / "network.flax").exists() else run_dir
+        )
+        row["kpis"] = load_kpis(artifact_dir)
         if "flux" in grids:
             row["flux_grids"] = grids["flux"]
         if "residual" in grids:

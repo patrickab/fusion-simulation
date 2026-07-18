@@ -188,14 +188,15 @@ function StoredRun({ run, files }: { run: string; files: string[] }) {
   const [resolution, setResolution] = useState(50)
   const dSeed = useDebounced(seed, 400)
   const dResolution = useDebounced(resolution, 400)
-  const kpis = useApi(files.includes('kpis.json') ? `kpis:${networkName}` : null, () =>
+  const hasKpis = files.includes('run.json')
+  const kpis = useApi(hasKpis ? `kpis:${networkName}` : null, () =>
     api.kpis(networkName),
   )
   const grids = useApi<Grid2D[]>(
     `stored-run:${networkName}:${dSeed}:${dResolution}`,
     () => api.grid(networkName, 'residual', dSeed, evalConfigCount, dResolution),
   )
-  const dataFiles = files.filter((f) => !f.endsWith('.png') && f !== 'kpis.json')
+  const dataFiles = files.filter((f) => !f.endsWith('.png'))
   return (
     <div className="bench-row">
       <div className="bench-head">
@@ -217,6 +218,7 @@ function StoredRun({ run, files }: { run: string; files: string[] }) {
           ))}
         </div>
       )}
+      {kpis.error && <div className="error">KPIs unavailable for this run</div>}
       {grids.loading && <Spinner />}
       {grids.error && <div className="error">{grids.error}</div>}
       {grids.data && (
