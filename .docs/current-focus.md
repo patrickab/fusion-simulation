@@ -18,20 +18,15 @@ assets are not yet committed.
 
 The staged campaign is:
 
-1. Screen batch 32 versus 64 at 1,200 epochs.
-2. Screen MSE versus Huber at 1,200 epochs using the winning batch.
-3. Compare PirateNet capacities `(128,128)`, `(200,200)`, and `(128,128,128)` at 2,400 epochs.
-4. Run seven full-budget LR/adaptive-sampling anchors around the selected architecture.
-5. Run clean 12-trial broad and 12-trial narrowed Optuna studies, then confirmation seeds 43/44.
+1. Completed: batch 32 beat batch 64 at 600 epochs and is frozen for the remaining study.
+2. Active: screen MSE versus Huber at 600 epochs using batch 32.
+3. Compare PirateNet capacities `(128,128)`, `(200,200)`, and `(128,128,128)` at 600 epochs.
+4. Run seven LR/adaptive-sampling anchors around the selected architecture.
+5. Run clean 12-trial broad and 12-trial narrowed 600-epoch Optuna studies, then confirmation seeds 43/44.
 
 The initial batch-32 screen at peak LR `1e-3` suffered a persistent optimizer regression after
-epoch 430 and was stopped after epoch 600. Controlled screens now use peak LR `5e-4` and prefer
+epoch 430 and was stopped after epoch 600. Controlled screens now use peak LR `1e-4` and prefer
 batch 32 when stable and within 10% of batch 64.
-
-Retained checkpoints now consolidate config, outcome, resources, and KPIs in `run.json`; training
-trajectories use column-oriented `metrics.json` with validation p05/p50/p95. Runtime readers no
-longer support the superseded split files; old experiments will be rerun when needed. Studies
-export `trials.csv` from SQLite.
 
 ## Evaluation Contract
 
@@ -39,8 +34,8 @@ export `trials.csv` from SQLite.
 - Protocol: fixed 200 plasma configurations x 8,192 area-uniform Sobol points.
 - Common training/evaluation seed: 42 for screens and HPO; do not change it casually because
   common random numbers are load-bearing for close rankings.
-- Admit only current-protocol, 2,400-epoch observations to Optuna warmstart. Short screens are
-  decision evidence only.
+- Admit only current-protocol, 600-epoch observations matching the frozen architecture, batch,
+  and loss invariants to Optuna warmstart.
 - Keep hard BC, no Fourier features, no L-BFGS, fixed collocation/training budgets, and fixed
   weight decay throughout this foundation campaign.
 
@@ -48,6 +43,9 @@ export `trials.csv` from SQLite.
 
 - Best reevaluated 5x200 MLP: fused objective about `7.06e-4`; this is the external acceptance
   baseline, not PirateNet warmstart data.
+- The controlled 600-epoch batch screen selected batch 32: fused objective `9.312e-3` versus
+  `3.740e-2` for batch 64, with p95 `1.696e-2` versus `6.696e-2`. Batch 32 remains fixed
+  throughout the exploratory hyperparameter study.
 - PirateNet + RWF incumbent `(128,128)`, no Fourier features, batch 64, Huber, 2,400 epochs:
   median `1.123e-3`, p95 `3.903e-3`, fused `2.294e-3`. It justifies a controlled campaign but is
   not yet competitive with the MLP baseline.
@@ -60,7 +58,6 @@ export `trials.csv` from SQLite.
 
 ## Open Questions
 
-- Batch 32 versus 64 is still confounded in historical runs; the controlled screen decides.
 - MSE is mildly favored by Fourier-free history, but no controlled PirateNet comparison exists.
 - PirateNet capacity and the useful LR/adaptive-sampling neighborhood remain unresolved.
 - Generic legacy warmstart paths can mix stale objectives or widen distributions. The campaign

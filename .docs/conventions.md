@@ -67,8 +67,8 @@
 ## Commit Style
 Conventional Commits with scope: `perf(physics):`, `feat(artifacts):`, `refactor(hpo):`, `docs:`, `fix(eval):`. Never commit/push/amend unless the user explicitly asks.
 
-## Operational rules (AGENTS.md)
-`uv run`/`uv sync` only, never bare `python`/`pip`; module entry points (`uv run python -m src.engine.network`). Long jobs (training/HPO) always in a tmux window named `claude: <name>`, never bare nohup. Optuna launches in tmux need `--reset-sqlite`/`--resume-sqlite` or they hang on an interactive prompt. Perf work documents each change in `docs/performance/` with a runnable benchmark snippet and measured train-step ms + XLA temp memory (`train_step.lower(...).compile().memory_analysis()`).
+## Performance work
+Document each optimization in `docs/performance/` with a runnable benchmark snippet and the measured train-step ms + XLA temp memory (`train_step.lower(...).compile().memory_analysis()`). Operational rules (uv-only, tmux for long jobs, Optuna `--reset-sqlite`/`--resume-sqlite`) live in `AGENTS.md` and the `vibe-hpo` skill.
 
 ## Testing
 - `tests/test_early_stopping.py` uses `unittest` for `_PatienceStopper`; run with `uv run python -m unittest discover -s tests`.

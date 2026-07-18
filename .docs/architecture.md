@@ -91,8 +91,6 @@ Used by the Streamlit UI and referenced for fixed heatmap scales by the React fr
 ## Shared Evaluation Grids (`src/engine/model_evaluation.py`)
 `evaluate_plasma_grids()` is the common data path for frontend Plotly fields and offline Matplotlib montages. `evaluate_residual_samples()` is the batched, jitted KPI core on a deterministic area-uniform Sobol sample, with point and configuration chunking. `evaluate_plasma_kpis()` produces whole-plasma/core summaries, edge p95, and boundary leakage. Training validation, HPO pruning/ranking, final `run.json` KPIs, CLI evaluation, and reevaluation all score the same fixed 200 x 8,192 `kpi_benchmark_configs` stream.
 
-Single-config benchmark artifacts live under `data/benchmarks/<timestamp>_<name>_<commit>/`; retained run dirs hold `run.json`, `metrics.json`, `network.flax`, and plots. Runtime readers support only this consolidated format; old experiments must be rerun rather than migrated. Optuna studies retain SQLite plus `trials.csv`; completed trials use direct `pinn_<ts>/` directories and resolve as `hpo/<study_slug>/<trial_slug>`. Archive locations and directory naming remain unchanged.
-
 ## HPO (`src/engine/optimize_network_optuna.py`, `src/engine/optimize-network-hparams.py`)
 - **Optuna** (primary): thin TPE/pruning adapter over `NetworkManager.train`; `SearchSpaceConfig`
   owns search bounds and fixed study settings. Standard and HPO training share one epoch,
@@ -112,7 +110,7 @@ Single-config benchmark artifacts live under `data/benchmarks/<timestamp>_<name>
   the composed field from both records and reject incomplete corrector metadata.
 - **BoTorch** (legacy): Bayesian optimization via qMaxValueEntropy in normalized unit cube.
 
-The current foundation-model workflow is a resumable staged campaign (`scripts/run_piratenet_foundation_campaign.py`, specified by `docs/hpo/hpo-plan-piratenet.md`). It screens batch size and MSE versus Huber, selects PirateNet capacity, records full-budget parameter anchors, then runs clean broad and narrowed 2,400-epoch Optuna studies. Campaign state and manual-run specs live under a dedicated HPO campaign directory; only objective-compatible full-budget observations are injected into the clean studies. Residual-corrector optimization is intentionally deferred until one foundation checkpoint is frozen.
+The current foundation-model workflow is a resumable staged campaign (`scripts/run_piratenet_foundation_campaign.py`, specified by `docs/hpo/hpo-plan-piratenet.md`). It screens batch size and MSE versus Huber, selects PirateNet capacity, records parameter anchors, then runs clean broad and narrowed 600-epoch Optuna studies centered on peak LR `1e-4`. Campaign state and manual-run specs live under a dedicated HPO campaign directory; only objective-compatible observations are injected into the clean studies. Residual-corrector optimization is intentionally deferred until one foundation checkpoint is frozen.
 
 ## Streamlit UI (`src/streamlit/`) — legacy
 Three pages (still runnable; React frontend is the active replacement):
