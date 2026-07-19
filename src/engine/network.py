@@ -556,6 +556,43 @@ class _PlotextChart:
         return Measurement(20, options.max_width)
 
 
+def _sci(x: float) -> str:
+    """Compact scientific notation: 2e-3, 5e-5, 1.5e-3 (trailing zeros trimmed)."""
+    mantissa, exp = f"{x:.1e}".split("e")
+    return f"{mantissa.rstrip('0').rstrip('.')}e{int(exp)}"
+
+
+def _config_summary(config: "HyperParams") -> Table:
+    """Two-row architecture/operating hyperparameter header for the metrics panel."""
+    dims = config.hidden_dims
+    layers = f"{dims[0]}×{len(dims)}" if len(set(dims)) == 1 else "-".join(map(str, dims))  # noqa: RUF001
+    sep = " [dim]·[/] "
+    architecture = sep.join(
+        (
+            f"[dim]arch[/] {config.arch}",
+            f"[dim]layers[/] {layers}",
+            f"[dim]soft_bc[/] {'on' if config.soft_bc else 'off'}",
+            f"[dim]rwf[/] {'on' if config.rwf else 'off'}",
+        )
+    )
+    total = config.warmup_epochs + config.decay_epochs
+    operating = sep.join(
+        (
+            f"[dim]lr[/] {_sci(config.learning_rate_max)}→{_sci(config.learning_rate_min)}",
+            f"[dim]epochs[/] {total} ({config.warmup_epochs}w/{config.decay_epochs}d)",
+            f"[dim]wd[/] {_sci(config.weight_decay)}",
+            f"[dim]batch[/] {config.batch_size}",
+            f"[dim]σ_resample[/] {config.sigma_residual_adaptive_sampling:g}",  # noqa: RUF001
+        )
+    )
+    grid = Table.grid(padding=(0, 1))
+    grid.add_column(justify="right", style="bold")
+    grid.add_column()
+    grid.add_row("architecture", architecture)
+    grid.add_row("operating", operating)
+    return grid
+
+
 def _charts_renderable(rows: list[dict]) -> any:
     """Validation and lr/||∇L|| charts side by side; lr chart alone before first validation."""
     if not rows:
@@ -646,8 +683,9 @@ def _draw_lr_grad_chart(rows: list[dict]) -> None:
 class _MetricsManager:
     """Owns the Rich training table, progress bar, and completed metric windows."""
 
-    def __init__(self, total_epochs: int) -> None:
+    def __init__(self, total_epochs: int, config: "HyperParams | None" = None) -> None:
         self._total_epochs = total_epochs
+        self._config = config
         self.rows: list[dict] = []
         self._table_rows: deque[tuple[str, ...]] = deque(maxlen=LIVE_TABLE_MAX_ROWS)
         self._table = _new_table(with_title=False)
@@ -669,8 +707,10 @@ class _MetricsManager:
         parts: list[any] = [
             Align.center(Text("Training Metrics", style="italic")),
             Align.center(self._progress),
-            Align.center(self._table),
         ]
+        if self._config is not None:
+            parts.append(Align.center(_config_summary(self._config)))
+        parts.append(Align.center(self._table))
         if (charts := _charts_renderable(self.rows)) is not None:
             parts.append(charts)
         return Panel(Group(*parts), border_style="cyan")
@@ -696,6 +736,7 @@ class _MetricsManager:
         if (epoch + 1) % LOG_FREQUENCY == 0 or val_kpis is not None:
             p05, p50, p95 = val_kpis or (None, None, None)
             persisted = {
+                "epoch": epoch + 1,
                 "lr": lr,
                 "loss": self._acc_loss / self._acc_count,
                 "residual": self._acc_res / self._acc_count,
@@ -719,7 +760,7 @@ class _MetricsManager:
             self._table_rows.append(display_row)
             if self.metrics_row_sink is not None:
                 self.metrics_row_sink(display_row)
-            table = _new_table()
+            table = _new_table(with_title=False)
             for r in self._table_rows:
                 table.add_row(*r)
             self._table = table
@@ -1279,7 +1320,7 @@ class NetworkManager:
 
         training_started = time.perf_counter()
         try:
-            self._metrics = _MetricsManager(total_epochs=self.epochs)
+            self._metrics = _MetricsManager(total_epochs=self.epochs, config=self.config)
             self._metrics.metrics_row_sink = self.metrics_row_sink
             self._live = None
             if show_progress:
