@@ -1054,17 +1054,17 @@ def main() -> None:
 
     if args.test:
         # Quick run for smoke-testing
-        search_space.batch_size = 8
+        search_space.batch_size = 32
         search_space.n_train = 64
         search_space.n_rz_boundary_samples = 16
         search_space.n_rz_inner_samples = 64
-        search_space.hidden_dims = [(32,), (128,), (32, 32), (128, 128)]
-        search_space.warmup_epochs = 5
-        search_space.decay_epochs = 25
+        search_space.hidden_dims = [(32, 32), (64, 64)]
+        search_space.warmup_epochs = 50
+        search_space.decay_epochs = 50
         study.n_validate = 16
-        study.n_trials = 3
-        study.total_epochs = 30
-        study.min_epochs = 5
+        study.n_trials = 10
+        study.total_epochs = 100
+        study.min_epochs = 100
         study.n_startup_trials = 2
         study.checkpoint_policy = "none"
         study.study_name = f"{study.study_name}_test"
