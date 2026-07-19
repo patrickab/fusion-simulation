@@ -247,7 +247,7 @@ LIVE_TABLE_MAX_ROWS = 15
 CHART_HEIGHT = 18  # terminal rows for the side-by-side validation / lr+||∇L|| charts
 
 
-class _PatienceStopper:
+class _Patience:
     """Track meaningful improvements in a rolling-average validation metric."""
 
     def __init__(self, patience: int, min_relative_improvement: float, window: int) -> None:
@@ -726,6 +726,7 @@ class _MetricsManager:
         self._acc_loss = self._acc_res = self._acc_bnd = self._acc_gn = self._acc_t = 0.0
         self._acc_count = 0
         self._live: Live | None = None
+        self._last_refresh_at = 0.0
         self.metrics_row_sink: Callable[[tuple[str, ...]], None] | None = None
 
     def renderable(self) -> Panel:
@@ -796,7 +797,10 @@ class _MetricsManager:
 
         self._progress.update(self._epoch_task, advance=1)
         if self._live is not None:
-            self._live.update(self.renderable())
+            now = time.monotonic()
+            if now - self._last_refresh_at >= 1.0 or epoch + 1 == self._total_epochs:
+                self._live.update(self.renderable(), refresh=True)
+                self._last_refresh_at = now
         return persisted
 
 
@@ -1351,14 +1355,14 @@ class NetworkManager:
             if show_progress:
                 live = Live(
                     self.training_renderable(),
-                    refresh_per_second=10,
+                    auto_refresh=False,
                     console=console,
                     vertical_overflow="visible",
                 )
             else:
                 live = nullcontext()
             val_kpis = None
-            stopper = _PatienceStopper(
+            stopper = _Patience(
                 EARLY_STOPPING_PATIENCE,
                 EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT,
                 EARLY_STOPPING_ROLLING_WINDOW,
