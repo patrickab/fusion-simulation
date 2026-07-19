@@ -597,14 +597,38 @@ def _charts_renderable(rows: list[dict]) -> any:
     """Validation and lr/||∇L|| charts side by side; lr chart alone before first validation."""
     if not rows:
         return None
-    lr_chart = _PlotextChart(_draw_lr_grad_chart, rows, CHART_HEIGHT)
+    lr_chart = _chart_block(
+        "Optimization",
+        Text.assemble(("● lr", "yellow"), "  ", ("● ||∇L||", "magenta")),
+        _PlotextChart(_draw_lr_grad_chart, rows, CHART_HEIGHT),
+    )
     if not any(r["val_kpi_p50"] is not None for r in rows):
-        return lr_chart
-    grid = Table.grid(expand=True)
+        return Group(Text(""), lr_chart)
+    validation_chart = _chart_block(
+        "Validation |R_GS|",
+        Text.assemble(
+            ("● p95", "grey62"),
+            "  ",
+            ("● p50", "green"),
+            "  ",
+            ("● p05", "grey62"),
+        ),
+        _PlotextChart(_draw_validation_chart, rows, CHART_HEIGHT),
+    )
+    grid = Table.grid(expand=True, padding=(0, 2), collapse_padding=True, pad_edge=False)
     grid.add_column(ratio=1)
     grid.add_column(ratio=1)
-    grid.add_row(_PlotextChart(_draw_validation_chart, rows, CHART_HEIGHT), lr_chart)
-    return grid
+    grid.add_row(validation_chart, lr_chart)
+    return Group(Text(""), grid)
+
+
+def _chart_block(title: str, legend: Text, chart: _PlotextChart) -> Group:
+    """Chart heading and legend outside plotext so they never cover data."""
+    header = Table.grid(expand=True, padding=(0, 1))
+    header.add_column()
+    header.add_column(justify="right")
+    header.add_row(Text(title, style="bold"), legend)
+    return Group(header, chart)
 
 
 def _log_series(x: list, y: list) -> tuple[list, list]:
@@ -643,21 +667,21 @@ def _draw_validation_chart(rows: list[dict]) -> None:
     """Validation |R_GS| p05/p50/p95 vs epoch, log y. Colors match the table's Val KPI column."""
     val_rows = [r for r in rows if r["val_kpi_p50"] is not None]
     all_epochs, all_vals = [], []
-    for key, label, color in (
-        ("val_kpi_p95", "p95", "gray"),
-        ("val_kpi_p50", "p50", "green"),
-        ("val_kpi_p05", "p05", "gray"),
+    for key, color in (
+        ("val_kpi_p95", "gray"),
+        ("val_kpi_p50", "green"),
+        ("val_kpi_p05", "gray"),
     ):
         epochs, series = _log_series([r["epoch"] for r in val_rows], [r.get(key) for r in val_rows])
         if epochs:
-            plotext.plot(epochs, series, marker="braille", color=color, label=label)
+            plotext.plot(epochs, series, marker="braille", color=color)
             all_epochs += epochs
             all_vals += series
     plotext.yscale("log")
     if all_vals:
         plotext.yticks(*_log_ticks(all_vals))
         plotext.xticks(*_linear_ticks(all_epochs))
-    plotext.title("validation |R_GS|")
+    plotext.ylabel("|R_GS|")
     plotext.xlabel("epoch")
 
 
@@ -667,16 +691,17 @@ def _draw_lr_grad_chart(rows: list[dict]) -> None:
     lr_x, lr_y = _log_series(epochs, [r["lr"] for r in rows])
     gn_x, gn_y = _log_series(epochs, [r["grad_norm"] for r in rows])
     if lr_x:
-        plotext.plot(lr_x, lr_y, marker="braille", color="yellow", label="lr")
+        plotext.plot(lr_x, lr_y, marker="braille", color="orange")
         plotext.yticks(*_log_ticks(lr_y))
     if gn_x:
-        plotext.plot(gn_x, gn_y, marker="braille", color="magenta", label="||∇L||", yside="right")
+        plotext.plot(gn_x, gn_y, marker="braille", color="magenta", yside="right")
         plotext.yticks(*_log_ticks(gn_y), yside="right")
     plotext.yscale("log")
     plotext.yscale("log", yside="right")
     if epochs:
         plotext.xticks(*_linear_ticks(epochs))
-    plotext.title("lr (left) · ||∇L|| (right)")
+    plotext.ylabel("lr")
+    plotext.ylabel("||∇L||", yside="right")
     plotext.xlabel("epoch")
 
 
@@ -1492,6 +1517,8 @@ def _new_table(with_title: bool = True) -> Table:
         title="Training Metrics" if with_title else None,
         show_header=True,
         header_style="bold cyan",
+        expand=True,
+        padding=(0, 1),
     )
     table.add_column("Epoch", justify="right", style="cyan")
     table.add_column("LR", justify="right", style="yellow")
