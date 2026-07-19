@@ -5,8 +5,9 @@ from datetime import datetime
 import logging
 from pathlib import Path
 import sys
+import time
 import traceback
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, Any, Callable, ClassVar
 
 from rich import box
 from rich.console import Console, Group
@@ -18,6 +19,7 @@ from rich.table import Table
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import VerticalScroll
+from textual.geometry import Size
 from textual.widgets import Footer, RichLog, Static
 
 from src.engine.network import NetworkManager
@@ -36,15 +38,24 @@ console = Console(width=160)
 class OptunaProgressDisplay:
     """Rich live dashboard showing optimization progress and top configs."""
 
-    def __init__(self, study: "StudyConfig", prior_trials: int = 0, live: bool = True) -> None:
+    def __init__(
+        self,
+        study: "StudyConfig",
+        prior_trials: int = 0,
+        live: bool = True,
+        on_change: Callable[[], None] | None = None,
+    ) -> None:
         self.config = study
-        # Per-trial events (markup strings or Rich renderables) for the TUI detail view;
-        # drained by HpoApp on its UI timer. RichLog snapshots renderables at write time.
+        # State-change-triggered repaint instead of a fixed-rate timer poll (which
+        # flickers over higher-latency SSH links); throttled to 1/s like network.py's
+        # _MetricsManager so a fast-epoch trial doesn't flood the terminal.
+        self._on_change = on_change
+        self._last_refresh_at = 0.0
+        # Detail-pane events (markup strings or Rich renderables); drained by
+        # HpoApp._refresh, invoked via on_change.
         self.events: deque[Any] = deque(maxlen=2000)
-        self._trial_rows: list[tuple[str, ...]] = []
-        # Manager of the currently training trial; the TUI renders its metrics table live.
         self.current_manager: NetworkManager | None = None
-        # Keep a rolling window: an ever-growing table eventually exceeds the terminal height
+        # Rolling window: an ever-growing table eventually exceeds the terminal height
         # and desynchronizes Rich's cursor-based redraw when the terminal scrolls.
         self._trials_data: deque[dict[str, Any]] = deque(maxlen=15)
         self._best_configs: list[tuple[dict[str, Any], float, float | None, float | None]] = []
@@ -78,9 +89,14 @@ class OptunaProgressDisplay:
             else None
         )
 
-    def _sync(self) -> None:
+    def _sync(self, force: bool = False) -> None:
         if self._live is not None:
             self._live.update(self._build_layout())
+        if self._on_change is not None:
+            now = time.monotonic()
+            if force or now - self._last_refresh_at >= 1.0:
+                self._last_refresh_at = now
+                self._on_change()
 
     def _get_trials_table(self) -> Table:
         table = Table(title="Previous Trials", show_header=True, header_style="bold cyan")
@@ -116,6 +132,19 @@ class OptunaProgressDisplay:
                 ]
             )
         return table
+
+    def get_live_training_panel(self) -> Panel | None:
+        """NetworkManager's own standalone-`train()` dashboard, reused as-is so a trial
+        running inside the HPO TUI looks identical to training it alone. Detail pane
+        only (see HpoApp._refresh) — the overview pane stays a static summary."""
+        manager = self.current_manager
+        if manager is None or getattr(manager, "_metrics", None) is None:
+            return None
+        panel = manager.training_renderable()
+        panel.border_style = "magenta"
+        if trial := self._current_trial_info.get("trial"):
+            panel.title = f"Current Trial: {trial}"
+        return panel
 
     def _get_best_table(self) -> Table:
         table = Table(
@@ -225,7 +254,7 @@ class OptunaProgressDisplay:
             self.events.append("")
             self.events.append("")
         self.events.append(f"[bold cyan]── trial {trial_num} ──[/]")
-        self._sync()
+        self._sync(force=True)
 
     def update_epoch(self, epoch: int, val_loss: float | None = None) -> None:
         if not self._current_trial_info:
@@ -236,18 +265,20 @@ class OptunaProgressDisplay:
         self._progress.update(self._epoch_task, completed=epoch)
         self._sync()
 
-    def add_metrics_row(self, row: tuple[str, ...]) -> None:
-        """Collect finalized training-table rows; flushed as one styled table per trial."""
-        self._trial_rows.append(row)
+    def add_metrics_row(self, _row: tuple[str, ...]) -> None:
+        """Sink for network.py's per-logged-epoch rows; row data lives on
+        current_manager._metrics, this just triggers a throttled repaint."""
+        self._sync()
 
-    def _flush_trial_table(self) -> None:
-        """Write the finished trial's full metrics history as a styled Rich table."""
-        if self._trial_rows and self.current_manager is not None:
-            table = self.current_manager._new_table()
-            for row in self._trial_rows:
-                table.add_row(*row)
-            self.events.append(table)
-        self._trial_rows = []
+    def _flush_trial_table(self, trial_num: int) -> None:
+        """Write the finished trial's standalone training dashboard (same renderable
+        shown live) into the scrollable detail log."""
+        manager = self.current_manager
+        if manager is not None and getattr(manager, "_metrics", None) is not None:
+            panel = manager.training_renderable()
+            panel.title = f"Trial {trial_num} — final"
+            panel.border_style = "cyan"
+            self.events.append(panel)
 
     def add_warmstart_trials(
         self, candidates: list[tuple["HyperParams", float, float | None, float | None]]
@@ -279,7 +310,7 @@ class OptunaProgressDisplay:
                     "status": "[blue]warmstart[/]",
                 }
             )
-        self._sync()
+        self._sync(force=True)
 
     def update(
         self,
@@ -295,7 +326,7 @@ class OptunaProgressDisplay:
         self._progress.update(self._task, completed=self._trials_processed)
         self._progress.update(self._epoch_task, visible=False)
         self._current_trial_info = {}
-        self._flush_trial_table()
+        self._flush_trial_table(trial_num)
         if status in self._counts:
             self._counts[status] += 1
 
@@ -323,7 +354,7 @@ class OptunaProgressDisplay:
             f"[bold cyan]trial {trial_num}[/] {status_text}"
             + (f"  median {median:.4f}  p95 {p95:.4f}" if median is not None else "")
         )
-        self._sync()
+        self._sync(force=True)
 
     def __enter__(self) -> "OptunaProgressDisplay":
         self._live.__enter__()
@@ -365,14 +396,26 @@ class HpoApp(App):
         # Textual's truecolor theme.
         self.theme = "ansi-dark"
         self._search_space, self._study, self._restart = search_space, study, restart
-        self._state = OptunaProgressDisplay(study, live=False)
+        self._state = OptunaProgressDisplay(study, live=False, on_change=self._request_refresh)
         handler = _EventLogHandler(self._state.events)
-        for source in (logger, network_logger):
-            source.addHandler(handler)
+        # get_logger() wires each source to a Console(stderr=True) RichHandler, whose direct
+        # terminal writes land outside Textual's alt-screen buffer and corrupt the display.
+        # Swap them out for the run (restored in on_unmount).
+        self._log_sources = (logger, network_logger)
+        self._original_handlers = {source: source.handlers[:] for source in self._log_sources}
+        for source in self._log_sources:
+            source.handlers = [handler]
+        # Line count of the live training panel's last write, so _refresh can trim
+        # just that tail instead of re-rendering the whole log every tick.
+        self._live_line_count = 0
         # Filled by _run_study on a crash; read after .run() returns so the caller
         # can print the traceback to the real terminal once Textual has restored it
         # (prints inside the alternate screen would be wiped on exit).
         self.crash_traceback: str | None = None
+
+    def on_unmount(self) -> None:
+        for source, handlers in self._original_handlers.items():
+            source.handlers = handlers
 
     def compose(self) -> ComposeResult:
         with VerticalScroll(id="overview-pane"):
@@ -381,16 +424,40 @@ class HpoApp(App):
         yield Footer()
 
     def on_mount(self) -> None:
-        self.set_interval(0.25, self._refresh)
+        self._refresh()  # paint the empty-state layout immediately; further frames are event-driven
         self.run_worker(self._run_study, thread=True)
 
+    def _request_refresh(self) -> None:
+        # Called from the worker thread (OptunaProgressDisplay._sync); call_from_thread
+        # marshals the repaint onto Textual's own event loop, the only thread allowed
+        # to touch widgets.
+        self.call_from_thread(self._refresh)
+
     def _refresh(self) -> None:
-        # ponytail: the worker thread mutates display state while we render it; the GIL makes
-        # this tear-free enough for a dashboard — add a lock only if frames visibly glitch.
         self.query_one("#overview", Static).update(self._state._build_layout())
         log = self.query_one("#detail", RichLog)
+        was_at_bottom = log.is_vertical_scroll_end
+
+        # Drop only the previous live-panel tail (rewritten below); history above it is
+        # never touched, so a scrolled-up view holds its position instead of jumping on
+        # every throttled tick.
+        if self._live_line_count:
+            del log.lines[-self._live_line_count :]
+            log._line_cache.clear()  # stale entries would otherwise show old tail content
+            self._live_line_count = 0
+
         while self._state.events:
-            log.write(self._state.events.popleft())
+            log.write(self._state.events.popleft(), scroll_end=False)
+
+        if (live_panel := self._state.get_live_training_panel()) is not None:
+            lines_before = len(log.lines)
+            log.write(live_panel, scroll_end=False)
+            self._live_line_count = len(log.lines) - lines_before
+
+        log.virtual_size = Size(log._widest_line_width, len(log.lines))
+        log.refresh()
+        if was_at_bottom:
+            log.scroll_end(animate=False, immediate=True)
 
     def action_toggle_view(self) -> None:
         overview, detail = self.query_one("#overview-pane"), self.query_one("#detail")
@@ -409,18 +476,13 @@ class HpoApp(App):
             # run_optimization already removed the study dir; just exit cleanly.
             pass
         except Exception:
-            # Stash the full traceback, log it to optuna.log, and exit the app.
-            # The caller (main()) prints it to the real terminal after .run()
-            # returns — Textual's alternate screen is gone by then — and exits
-            # non-zero, matching the non-tty path so driver watchers fire on
-            # failure too (not just on a clean finish).
+            # Stashed for the caller to print after .run() returns, once Textual's
+            # alt-screen is gone; printing here would be wiped on exit.
             self.crash_traceback = traceback.format_exc()
             logger.error(f"study crashed:\n{self.crash_traceback}")
         finally:
-            # Always exit: a clean finish lets sequential drivers (tmux benchmark
-            # runs) proceed without waiting for 'q'; a crash re-enters the normal
-            # terminal where the traceback is printed. Results live in
-            # top_trials.json / optuna.log either way.
+            # Always exit: lets sequential drivers (tmux benchmark runs) proceed
+            # without waiting for 'q'.
             self.call_from_thread(self.exit)
 
 
