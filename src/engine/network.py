@@ -238,6 +238,9 @@ RESAMPLING_FREQUENCY = 10  # Resample training set every N epochs
 LOG_FREQUENCY = 10  # Refresh the live table and flush metrics every N epochs
 N_VALIDATION_SIZE = KPI_EVAL_CONFIGS  # Number of validation plasma configs
 VALIDATION_FREQUENCY = 5 * LOG_FREQUENCY  # Evaluate validation set every N epochs
+# Early stopping is always on. If it fires prematurely, the run is misconfigured
+# (LR band too high/low, oversized budget); fix that or adjust the improvement
+# threshold below — do not add a bypass flag.
 EARLY_STOPPING_PATIENCE = 6  # Stop after this many non-improving validation rounds
 EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT = 0.01
 EARLY_STOPPING_ROLLING_WINDOW = 3
@@ -1103,6 +1106,10 @@ class NetworkManager:
         )
         self._files.save_training_curves(run_dir, self.training_log, self.artifact_stem)
         self._files.write_params(run_dir, self.state.params)
+        if getattr(self, "_lbfgs_params", None) is not None:
+            (run_dir / "network_lbfgs.flax").write_bytes(
+                flax.serialization.to_bytes(self._lbfgs_params)
+            )
         return self.artifact_stem
 
     def from_disk(self, pinn_path) -> any:  # noqa
@@ -1348,6 +1355,8 @@ class NetworkManager:
             self._files.write_run(run_dir, self, None, {"status": "running"})
 
         training_started = time.perf_counter()
+        self._lbfgs_params = None
+        self._lbfgs_val_kpis = None
         try:
             self._metrics = _MetricsManager(total_epochs=self.epochs, config=self.config)
             self._metrics.metrics_row_sink = self.metrics_row_sink
@@ -1415,8 +1424,13 @@ class NetworkManager:
                         break
 
             if stop_reason != "early_stopping" and self.config.lbfgs_steps > 0:
+                adamw_params = self.state.params
                 self.lbfgs(self.config.lbfgs_steps)
-                val_kpis = self._calculate_validation_kpis()
+                self._lbfgs_params = self.state.params
+                self._lbfgs_val_kpis = self._calculate_validation_kpis()
+                # Canonical weights stay the AdamW result; polish must never
+                # overwrite them, so the polished set is persisted separately.
+                self.state = self.state.replace(params=adamw_params)
 
             if stop_reason == "early_stopping" or val_kpis is None:
                 val_kpis = self._calculate_validation_kpis()
@@ -1429,6 +1443,16 @@ class NetworkManager:
                 "final_val_kpi_p05": val_kpis[0],
                 "final_val_kpi_p50": val_kpis[1],
                 "final_val_kpi_p95": val_kpis[2],
+                **(
+                    {
+                        "lbfgs_steps_run": self.config.lbfgs_steps,
+                        "lbfgs_val_kpi_p05": self._lbfgs_val_kpis[0],
+                        "lbfgs_val_kpi_p50": self._lbfgs_val_kpis[1],
+                        "lbfgs_val_kpi_p95": self._lbfgs_val_kpis[2],
+                    }
+                    if self._lbfgs_val_kpis is not None
+                    else {}
+                ),
                 "best_smoothed_val_kpi_p50": (
                     stopper.best_value if stopper.best_epoch is not None else None
                 ),
@@ -1463,7 +1487,7 @@ class NetworkManager:
                 )
             raise
 
-    def lbfgs(self, steps: int) -> None:
+    def lbfgs(self, steps: int, learning_rate: float | None = 0.1) -> None:
         """Polish AdamW-trained params with L-BFGS on one fixed batch."""
         self.sampler.precompute_coordinate_samples()
         batch = self.train_set[: self.config.batch_size]
@@ -1482,7 +1506,10 @@ class NetworkManager:
             )
             return total
 
-        opt = optax.lbfgs()
+        # Damped steps: the polish objective is a single fixed batch, and full
+        # linesearch-sized quasi-Newton steps over-specialize to it at the
+        # expense of full-distribution KPIs.
+        opt = optax.lbfgs(learning_rate=learning_rate)
 
         @jax.jit
         def step(params: any, opt_state: any) -> tuple[any, any, jnp.ndarray]:
