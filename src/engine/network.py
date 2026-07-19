@@ -244,10 +244,8 @@ VALIDATION_FREQUENCY = 5 * LOG_FREQUENCY  # Evaluate validation set every N epoc
 EARLY_STOPPING_PATIENCE = 6  # Stop after this many non-improving validation rounds
 EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT = 0.01
 EARLY_STOPPING_ROLLING_WINDOW = 3
-# Cap rows shown in the live table; unbounded growth desyncs Rich's redraw
-# once it overflows the terminal, corrupting scrollback.
-LIVE_TABLE_MAX_ROWS = 15
-CHART_HEIGHT = 18  # terminal rows for the side-by-side validation / lr+||∇L|| charts
+CHART_HEIGHT = 18  # fixed fallback for the static --show replay (no live terminal to size against)
+CHART_MIN_HEIGHT = 10  # never shrink the live charts below this even in short terminals
 
 
 class _Patience:
@@ -596,17 +594,26 @@ def _config_summary(config: "HyperParams") -> Table:
     return grid
 
 
-def _charts_renderable(rows: list[dict]) -> any:
-    """Validation and lr/||∇L|| charts side by side; lr chart alone before first validation."""
+def _charts_renderable(rows: list[dict], chart_height: int) -> any:
+    """Validation, loss and lr/||∇L|| charts side by side; validation joins after the first run."""
     if not rows:
         return None
+    loss_chart = _chart_block(
+        "Loss",
+        Text.assemble(("● train", "cyan"), "  ", ("● val", "green")),
+        _PlotextChart(_draw_loss_chart, rows, chart_height),
+    )
     lr_chart = _chart_block(
         "Optimization",
         Text.assemble(("● lr", "yellow"), "  ", ("● ||∇L||", "magenta")),
-        _PlotextChart(_draw_lr_grad_chart, rows, CHART_HEIGHT),
+        _PlotextChart(_draw_lr_grad_chart, rows, chart_height),
     )
+    grid = Table.grid(expand=True, padding=(0, 2), collapse_padding=True, pad_edge=False)
     if not any(r["val_kpi_p50"] is not None for r in rows):
-        return Group(Text(""), lr_chart)
+        grid.add_column(ratio=1)
+        grid.add_column(ratio=1)
+        grid.add_row(loss_chart, lr_chart)
+        return Group(Text(""), grid)
     validation_chart = _chart_block(
         "Validation |R_GS|",
         Text.assemble(
@@ -616,12 +623,12 @@ def _charts_renderable(rows: list[dict]) -> any:
             "  ",
             ("● p05", "grey62"),
         ),
-        _PlotextChart(_draw_validation_chart, rows, CHART_HEIGHT),
+        _PlotextChart(_draw_validation_chart, rows, chart_height),
     )
-    grid = Table.grid(expand=True, padding=(0, 2), collapse_padding=True, pad_edge=False)
     grid.add_column(ratio=1)
     grid.add_column(ratio=1)
-    grid.add_row(validation_chart, lr_chart)
+    grid.add_column(ratio=1)
+    grid.add_row(validation_chart, loss_chart, lr_chart)
     return Group(Text(""), grid)
 
 
@@ -688,6 +695,26 @@ def _draw_validation_chart(rows: list[dict]) -> None:
     plotext.xlabel("epoch")
 
 
+def _draw_loss_chart(rows: list[dict]) -> None:
+    """Train loss and validation median residual vs epoch, shared log y-axis."""
+    epochs = [r["epoch"] for r in rows]
+    train_x, train_y = _log_series(epochs, [r["loss"] for r in rows])
+    val_x, val_y = _log_series(epochs, [r.get("val_kpi_p50") for r in rows])
+    all_vals = []
+    if train_x:
+        plotext.plot(train_x, train_y, marker="braille", color="cyan")
+        all_vals += train_y
+    if val_x:
+        plotext.plot(val_x, val_y, marker="braille", color="green")
+        all_vals += val_y
+    plotext.yscale("log")
+    if all_vals:
+        plotext.yticks(*_log_ticks(all_vals))
+        plotext.xticks(*_linear_ticks(epochs))
+    plotext.ylabel("loss")
+    plotext.xlabel("epoch")
+
+
 def _draw_lr_grad_chart(rows: list[dict]) -> None:
     """lr (left axis) and ||∇L|| (right axis) vs epoch, both log y."""
     epochs = [r["epoch"] for r in rows]
@@ -715,8 +742,7 @@ class _MetricsManager:
         self._total_epochs = total_epochs
         self._config = config
         self.rows: list[dict] = []
-        self._table_rows: deque[tuple[str, ...]] = deque(maxlen=LIVE_TABLE_MAX_ROWS)
-        self._table = _new_table(with_title=False)
+        self._table_rows: list[tuple[str, ...]] = []
         self._progress = Progress(
             TextColumn("[bold cyan]{task.description}"),
             BarColumn(style="cyan", complete_style="bold cyan"),
@@ -733,15 +759,74 @@ class _MetricsManager:
         self.metrics_row_sink: Callable[[tuple[str, ...]], None] | None = None
 
     def renderable(self) -> Panel:
+        """2x2 layout: metrics table + loss chart on top, validation + lr/||∇L|| below.
+
+        The top and bottom rows split the panel's remaining height evenly, so the table/loss
+        row and the validation/lr row each get half the screen. The table shows as many of
+        the most recent epochs as fit in its half rather than a fixed row count.
+        """
         parts: list[any] = [
             Align.center(Text("Training Metrics", style="italic")),
             Align.center(self._progress),
         ]
         if self._config is not None:
             parts.append(Align.center(_config_summary(self._config)))
-        parts.append(Align.center(self._table))
-        if (charts := _charts_renderable(self.rows)) is not None:
-            parts.append(charts)
+        if not self.rows:
+            parts.append(Align.center(_new_table(with_title=False)))
+            return Panel(Group(*parts), border_style="cyan")
+
+        # border, title, progress, config, blank spacer, safety margin
+        fixed = 2 + 1 + 1 + (2 if self._config is not None else 0) + 2
+        available = max(2 * CHART_MIN_HEIGHT, console.size.height - fixed)
+        top_row_height = available // 2
+        bottom_row_height = available - top_row_height
+
+        table_capacity = max(1, top_row_height - 4)  # table box: borders, header, separator
+        table = _new_table(with_title=False)
+        for r in self._table_rows[-table_capacity:]:
+            table.add_row(*r)
+
+        loss_canvas = max(CHART_MIN_HEIGHT, top_row_height - 1)  # -1 for the chart's header line
+        top_row = Table.grid(expand=True, padding=(0, 2), collapse_padding=True, pad_edge=False)
+        top_row.add_column(ratio=1)
+        top_row.add_column(ratio=1)
+        top_row.add_row(
+            table,
+            _chart_block(
+                "Loss",
+                Text.assemble(("● train", "cyan"), "  ", ("● val", "green")),
+                _PlotextChart(_draw_loss_chart, self.rows, loss_canvas),
+            ),
+        )
+        parts.append(top_row)
+
+        bottom_canvas = max(CHART_MIN_HEIGHT, bottom_row_height - 1)  # -1 for the row's header line
+        lr_chart = _chart_block(
+            "Optimization",
+            Text.assemble(("● lr", "yellow"), "  ", ("● ||∇L||", "magenta")),
+            _PlotextChart(_draw_lr_grad_chart, self.rows, bottom_canvas),
+        )
+        if not any(r["val_kpi_p50"] is not None for r in self.rows):
+            parts.append(Group(Text(""), lr_chart))
+        else:
+            validation_chart = _chart_block(
+                "Validation |R_GS|",
+                Text.assemble(
+                    ("● p95", "grey62"),
+                    "  ",
+                    ("● p50", "green"),
+                    "  ",
+                    ("● p05", "grey62"),
+                ),
+                _PlotextChart(_draw_validation_chart, self.rows, bottom_canvas),
+            )
+            bottom_row = Table.grid(
+                expand=True, padding=(0, 2), collapse_padding=True, pad_edge=False
+            )
+            bottom_row.add_column(ratio=1)
+            bottom_row.add_column(ratio=1)
+            bottom_row.add_row(validation_chart, lr_chart)
+            parts.append(Group(Text(""), bottom_row))
         return Panel(Group(*parts), border_style="cyan")
 
     def log(
@@ -789,10 +874,6 @@ class _MetricsManager:
             self._table_rows.append(display_row)
             if self.metrics_row_sink is not None:
                 self.metrics_row_sink(display_row)
-            table = _new_table(with_title=False)
-            for r in self._table_rows:
-                table.add_row(*r)
-            self._table = table
             self._acc_loss = self._acc_res = self._acc_bnd = self._acc_gn = self._acc_t = 0.0
             self._acc_count = 0
         else:
@@ -1362,11 +1443,14 @@ class NetworkManager:
             self._metrics.metrics_row_sink = self.metrics_row_sink
             self._live = None
             if show_progress:
+                # screen=True takes over the full terminal (alt-screen buffer) instead of
+                # scrolling inline; _panel_chart_height sizes the charts to match so nothing
+                # is cropped or left wasted at the bottom.
                 live = Live(
                     self.training_renderable(),
                     auto_refresh=False,
                     console=console,
-                    vertical_overflow="visible",
+                    screen=True,
                 )
             else:
                 live = nullcontext()
@@ -1609,6 +1693,7 @@ def show_run(run: str) -> None:
         {
             "epoch": (index + 1) * distance,
             "lr": lr,
+            "loss": metrics["loss"][index],
             "grad_norm": metrics["grad_norm"][index],
             "val_kpi_p05": metrics["val_kpi_p05"][index],
             "val_kpi_p50": metrics["val_kpi_p50"][index],
@@ -1635,7 +1720,7 @@ def show_run(run: str) -> None:
         Align.center(Text("Training Metrics", style="italic")),
         Align.center(table),
     ]
-    if (charts := _charts_renderable(rows)) is not None:
+    if (charts := _charts_renderable(rows, CHART_HEIGHT)) is not None:
         parts.append(charts)
     console.print(Panel(Group(*parts), border_style="cyan"))
 
