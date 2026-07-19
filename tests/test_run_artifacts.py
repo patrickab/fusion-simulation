@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import Mock, patch
 
 from src.engine.network import _MetricsManager
 from src.lib.run_artifacts import format_duration, write_json
@@ -44,6 +45,26 @@ class RunArtifactTests(unittest.TestCase):
 
         self.assertEqual(len(metrics.rows), 60)
         self.assertEqual(sum(row["val_kpi_p50"] is not None for row in metrics.rows), 12)
+
+    def test_live_dashboard_refresh_is_throttled_and_finishes_current(self) -> None:
+        metrics = _MetricsManager(total_epochs=4)
+        metrics._live = Mock()
+
+        with patch("src.engine.network.time.monotonic", side_effect=(10.0, 10.4, 11.1, 11.2)):
+            for epoch in range(4):
+                metrics.log(
+                    epoch,
+                    loss=1.0,
+                    residual=2.0,
+                    boundary=3.0,
+                    val_kpis=None,
+                    lr=5e-4,
+                    grad_norm=4e-2,
+                    epoch_time=1.0,
+                )
+
+        self.assertEqual(metrics._live.update.call_count, 3)
+        self.assertTrue(all(call.kwargs["refresh"] for call in metrics._live.update.call_args_list))
 
     def test_scientific_json_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
