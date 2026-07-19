@@ -18,11 +18,21 @@ assets are not yet committed.
 
 The staged campaign is:
 
-1. Completed: batch 32 beat batch 64 at 600 epochs and is frozen for the remaining study.
-2. Active: screen MSE versus Huber at 600 epochs using batch 32.
-3. Compare PirateNet capacities `(128,128)`, `(200,200)`, and `(128,128,128)` at 600 epochs.
-4. Run seven LR/adaptive-sampling anchors around the selected architecture.
-5. Run clean 12-trial broad and 12-trial narrowed 600-epoch Optuna studies, then confirmation seeds 43/44.
+1. Completed: batch 32 beat batch 64 at 600 epochs (fused `9.31e-3` vs `3.74e-2`) and is frozen.
+2. Completed: MSE beat Huber by 15.6% fused with better p95; `huber_delta=0.0` is frozen.
+3. Completed: `(200,200)` beat `(128,128)` and `(128,128,128)` by 33% (fused `5.17e-3` vs
+   `7.76e-3`/`7.77e-3`); depth added nothing at this budget. `hidden_dims=(200,200)` is frozen.
+4. Active: L-BFGS polish A/B (2026-07-19 amendment) — winner config + `lbfgs_steps=300`,
+   decided pairwise against the unpolished winner, then fixed for all later runs.
+5. Run eight LR/adaptive-sampling anchors (P0-P7; P7 added 2026-07-19 with a high `3e-5` LR
+   floor after the `(200,200)` trace showed LR starvation below `~2.5e-5`).
+6. Run clean 12-trial broad and 12-trial narrowed 600-epoch Optuna studies (broad
+   `learning_rate_min` bound raised to `5e-5`), then confirmation seeds 43/44.
+
+The campaign driver now resumes by campaign name rather than commit (mid-campaign commits
+previously forked a fresh campaign directory) and recovers completed runs from `result.json`
+if the orchestrator dies before recording them. A `(200,200)` run costs ~44 min on the
+RTX 3060 (vs ~24 min for `(128,128)`), so the remaining ~33 runs are roughly a day of GPU time.
 
 The initial batch-32 screen at peak LR `1e-3` suffered a persistent optimizer regression after
 epoch 430 and was stopped after epoch 600. Controlled screens now use peak LR `1e-4` and prefer
