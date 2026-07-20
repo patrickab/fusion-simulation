@@ -1,9 +1,14 @@
+from typing import TYPE_CHECKING
+
 import numpy as np
 import pyvista as pv
 
-from src.engine.network import NetworkManager, Sampler
+from src.engine.network import Sampler
 from src.lib.geometry_config import PlasmaGeometry, PlasmaState, ToroidalCoilConfig
 import streamlit as st
+
+if TYPE_CHECKING:
+    from src.engine.network_manager import NetworkManager
 
 default_coil_config = ToroidalCoilConfig(
     distance_from_plasma=1.5,

@@ -22,12 +22,12 @@ from textual.containers import VerticalScroll
 from textual.geometry import Size
 from textual.widgets import Footer, RichLog, Static
 
-from src.engine.network import NetworkManager
 from src.engine.network import logger as network_logger
 from src.lib.logger import get_logger
 from src.lib.utils import format_hpo_params
 
 if TYPE_CHECKING:
+    from src.engine.network_manager import NetworkManager
     from src.engine.optimize_network_optuna import SearchSpaceConfig, StudyConfig
     from src.lib.network_config import HyperParams
 

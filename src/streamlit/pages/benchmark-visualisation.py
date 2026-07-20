@@ -1,4 +1,4 @@
-from src.engine.network import NetworkManager
+from src.engine.network_manager import NetworkManager
 from src.lib.geometry_config import PlasmaConfig
 from src.lib.network_config import HyperParams
 from src.lib.run_artifacts import load_config

@@ -4,7 +4,7 @@ import jax.numpy as jnp
 from stpyvista import stpyvista
 
 from src.engine.model_evaluation import compute_gs_residual_on_points
-from src.engine.network import NetworkManager
+from src.engine.network_manager import NetworkManager
 from src.engine.plasma import calculate_fusion_plasma
 from src.lib.config import Filepaths
 from src.lib.network_config import HyperParams

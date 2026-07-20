@@ -11,7 +11,8 @@ src/
 │   └── schemas.py                # Pydantic request models (GeometryRequest, SampleRequest, ...)
 │
 ├── engine/
-│   ├── network.py              # MLP/PirateNet FluxPINN (+ Fourier/RWF), Sampler, patience stopping, NetworkManager facade, frozen FoundationModel and composed stage-2 fields
+│   ├── network.py              # MLP/PirateNet FluxPINN (+ Fourier/RWF), Sampler, patience stopping, Trainer (optimizer/JIT state, train loop, L-BFGS), frozen FoundationModel and composed stage-2 fields — no Rich/Plotext/filesystem imports
+│   ├── network_manager.py      # NetworkManager facade: composes a Trainer with Rich/Plotext live display, run-dir/checkpoint/metrics.json persistence, and the training CLI (`python -m src.engine.network_manager`)
 │   ├── residual_correction.py  # Corrector CLI + shared plain/nested/HPO checkpoint loading → composed NetworkManager. No parallel manager classes.
 │   ├── physics.py              # GS operator, loss functions, B-field computation via AD
 │   ├── plasma.py               # Parametric boundary → 3D FusionPlasma; point-in-plasma test
@@ -108,8 +109,10 @@ data_legacy/                                   # Ignored pre-consolidation artif
 | `ToroidalCoil3D` | geometry_config.py | Inner/outer/cap surface arrays |
 | `FluxInput` | network_config.py | Batched (B, N) R-Z + config PyTree |
 | `HyperParams` | network_config.py | All training hyperparameters |
+| `EpochMetrics`/`ValidationMetrics`/`TrainingResult` | network_config.py | Typed Trainer.train() progress event and return value — the observer seam network_manager.py subscribes to |
 | `FluxPINN` | network.py | Checkpoint-compatible MLP or PirateNet architecture, optionally Fourier-encoded/RWF |
-| `NetworkManager` | network.py | Training/inference/artifact facade; accepts an optional `FoundationModel` prior for correction |
+| `Trainer` | network.py | Model/sampler/optimizer/JIT state + training loop; reports via an optional `TrainingObserver` callback, no Rich/filesystem imports |
+| `NetworkManager` | network_manager.py | Training/inference/artifact facade composing a Trainer; accepts an optional `FoundationModel` prior for correction |
 | `FoundationModel` | network.py | Frozen dataclass: converged FluxPINN + params; used as prior for residual-correction stage 2 |
 | HPO configs | optimize_network_optuna.py | `SearchSpaceConfig` owns model axes; `StudyConfig` owns orchestration and checkpoint policy |
 | Pydantic req models | `src/api/schemas.py` | Geometry, sampling, grids, field lines, artifact actions and benchmark requests |

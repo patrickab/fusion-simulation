@@ -16,7 +16,7 @@ import numpy as np
 import torch
 from torch.quasirandom import SobolEngine
 
-from src.engine.network import NetworkManager
+from src.engine.network_manager import NetworkManager
 from src.lib.config import Filepaths
 from src.lib.logger import get_logger
 from src.lib.network_config import HyperParams

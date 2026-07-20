@@ -67,8 +67,8 @@ from src.engine.network import (
     EARLY_STOPPING_PATIENCE,
     EARLY_STOPPING_ROLLING_WINDOW,
     FoundationModel,
-    NetworkManager,
 )
+from src.engine.network_manager import NetworkManager
 from src.engine.residual_correction import load_foundation
 from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG, Filepaths, current_commit
 from src.lib.network_config import HyperParams

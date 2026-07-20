@@ -69,12 +69,13 @@ Vite dev server proxies `/api` → `127.0.0.1:8010` (matches `run-webapp.sh`). B
 - **Cached boundary fit**: `PlasmaBoundary` stores the 32-harmonic Fourier ridge coefficients at construction; only basis evaluation stays in the differentiated path.
 - **Perf trail**: `docs/performance/*.md` records each optimization with its runnable benchmark; train step went 42.7 → 28.4 ms (−33%, RTX 3060, direct-training defaults).
 
-## Neural Network (`src/engine/network.py`)
+## Neural Network (`src/engine/network.py`, `src/engine/network_manager.py`)
 - **FluxPINN**: shared 10-scalar normalized input (r, z, r₀, a, κ, δ, p₀, F_axis, α, γ) and scalar ψ̂ output. `arch="mlp"` is the checkpoint-compatible Swish MLP; `arch="piratenet"` uses two encoded branches, gated residual blocks, and zero-initialized learned skip weights. Both can opt into random Fourier spatial features and Random Weight Factorization (`rwf`).
 - **Sampler**: Sobol quasi-random sequences for collocation points; 50% Sobol + 50% adaptive (focus on high-loss regions). Geometries resampled every 10 epochs.
-- **NetworkManager**: facade over `_Field` (single or composed psi), `_MetricsManager` (Rich table and completed metric windows), and `_FileStorageManager` (run artifacts, including nested `stage2/`). Training stops after six validation rounds without a 1% improvement in rolling validation p50 and restores the best parameters. Retained runs contain `run.json` (commit, duration, device, seed, config, outcome and KPIs), column-oriented `metrics.json`, `network.flax`, and plots. Rich and `metrics.json` record validation p05/p50/p95; early stopping and pruning use p50.
+- **Trainer** (`network.py`): owns the model, sampler, optimizer/JIT state, `_Field` (single or composed psi), and the training loop (`train_epoch`, `train`, `lbfgs`). Reports progress solely through an optional `TrainingObserver` callback emitting `EpochMetrics`/`ValidationMetrics` (`src/lib/network_config.py`) and returns a `TrainingResult` — no Rich, Plotext, or filesystem imports.
+- **NetworkManager** (`network_manager.py`): facade composing a `Trainer` with `_MetricsManager` (Rich table/Plotext charts) and `_FileStorageManager` (run artifacts, including nested `stage2/`). Its `train()` subscribes a Trainer observer that feeds the Rich display, writes `metrics.json` incrementally, and forwards HPO callbacks (`validation_callback`, `metrics_row_sink`). Training stops after six validation rounds without a 1% improvement in rolling validation p50 and restores the best parameters. Retained runs contain `run.json` (commit, duration, device, seed, config, outcome and KPIs), column-oriented `metrics.json`, `network.flax`, and plots. Rich and `metrics.json` record validation p05/p50/p95; early stopping and pruning use p50.
 - **Optimizer**: AdamW with warmup cosine decay schedule.
-- **Replay**: `uv run python -m src.engine.network --show <commit/run>` re-renders the Rich Training Metrics table from `metrics.json`.
+- **Replay**: `uv run python -m src.engine.network_manager --show <commit/run>` re-renders the Rich Training Metrics table from `metrics.json`.
 
 ## Geometry (`src/lib/geometry_config.py`, `src/engine/plasma.py`, `src/toroidal_geometry.py`)
 - Parametric plasma boundary: R(θ) = R₀ + a·cos(θ + δ·sin θ), Z(θ) = κ·a·sin θ

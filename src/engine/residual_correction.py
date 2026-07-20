@@ -23,10 +23,8 @@ import argparse
 import json
 from pathlib import Path
 
-from src.engine.network import (
-    FoundationModel,
-    NetworkManager,
-)
+from src.engine.network import FoundationModel
+from src.engine.network_manager import NetworkManager
 from src.lib.config import KPI_EVAL_CONFIGS
 from src.lib.logger import get_logger
 from src.lib.network_config import HyperParams

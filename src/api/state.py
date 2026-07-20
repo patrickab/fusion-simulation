@@ -6,7 +6,7 @@ re-tracing JAX/JIT on every request for the same checkpoint.
 
 from fastapi import HTTPException
 
-from src.engine.network import NetworkManager
+from src.engine.network_manager import NetworkManager
 from src.engine.residual_correction import load_checkpoint
 
 _managers: dict[str, NetworkManager] = {}
