@@ -10,7 +10,8 @@ from src.engine.model_evaluation import (
     PlasmaGridBatch,
     evaluate_plasma_grids,
 )
-from src.engine.network import NetworkManager, Sampler
+from src.engine.network import Sampler
+from src.engine.network_manager import NetworkManager
 from src.engine.physics import get_b_field_cartesian
 from src.engine.plasma import boundary_normalized_radius
 from src.lib.geometry_config import PlasmaGeometry, PlasmaState

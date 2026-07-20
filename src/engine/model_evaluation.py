@@ -12,7 +12,8 @@ import jax.numpy as jnp
 import numpy as np
 from scipy.stats import qmc
 
-from src.engine.network import BASE_SEED, NetworkManager
+from src.engine.network import BASE_SEED
+from src.engine.network_manager import NetworkManager
 from src.engine.physics import PsiFn, estimate_psi_axis, grad_shafranov_residual
 from src.engine.plasma import get_poloidal_points
 from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG

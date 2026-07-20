@@ -9,7 +9,7 @@ Always use `uv run`/`uv sync`, never bare `python`/`pip`. Run package entry
 points as modules:
 
 ```bash
-uv run python -m src.engine.network --test
+uv run python -m src.engine.network_manager --test
 uv run python -m src.engine.optimize_network_optuna --test
 ```
 

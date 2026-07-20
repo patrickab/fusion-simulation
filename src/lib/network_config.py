@@ -1,5 +1,7 @@
+from dataclasses import dataclass
 import json
 from pathlib import Path
+from typing import Literal, Protocol
 
 from flax import struct
 import jax.numpy as jnp
@@ -155,3 +157,53 @@ class FluxInput(BaseModel):
         return (jnp.atleast_1d(self.config.State.F_axis) * jnp.atleast_1d(self.config.Geometry.a))[
             :, jnp.newaxis, jnp.newaxis
         ]
+
+
+# --- C. Trainer/NetworkManager seam ---
+# Shared result/event types so network.py's Trainer never has to import Rich,
+# Plotext, or filesystem code (owned by network_manager.py) to report progress.
+
+
+@dataclass(frozen=True)
+class ValidationMetrics:
+    p05: float
+    p50: float
+    p95: float
+
+
+@dataclass(frozen=True)
+class EpochMetrics:
+    """One epoch's training result, emitted to a TrainingObserver.
+
+    ``epoch`` is the 0-indexed loop counter (matches Trainer.train_epoch's
+    ``epoch`` argument); ``validation`` is set only on validation rounds.
+    ``should_stop`` mirrors the patience decision for this epoch so an
+    observer can suppress a final report right before training stops.
+    """
+
+    epoch: int
+    loss: float
+    residual_loss: float
+    boundary_loss: float
+    gradient_norm: float
+    learning_rate: float
+    duration_seconds: float
+    validation: ValidationMetrics | None = None
+    should_stop: bool = False
+
+
+@dataclass(frozen=True)
+class TrainingResult:
+    stop_reason: Literal["epoch_budget", "early_stopping"]
+    trained_epochs: int
+    planned_epochs: int
+    final_validation: ValidationMetrics
+    best_epoch: int | None
+    best_smoothed_validation_p50: float | None
+    lbfgs_validation: ValidationMetrics | None
+    optimizer_updates: int
+    duration_seconds: float
+
+
+class TrainingObserver(Protocol):
+    def __call__(self, event: EpochMetrics) -> None: ...
