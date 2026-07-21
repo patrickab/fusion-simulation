@@ -19,8 +19,9 @@ Simulation of magnetic forces in a Tokamak Fusion Reactor using a Physics Inform
 - [Reactor Geometry](#reactor-geometry)
 - [Physics Problem & Loss Function](#physics-problem--loss-function)
 - [Prediction of 3D Magnetic Field Lines](#prediction-of-3d-magnetic-field-lines)
+- [Evolution of network performance](#evolution-of-network-performance)
+- [Hyperparameter Optimization](#hyperparameter-optimization)
 - [Neural Network Architecture](#neural-network-architecture)
-- [JAX Design Considerations](#jax-specific-design-considerations-for-efficiency)
 
 ---
 
