@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from src.engine.network import _MetricsManager
+from src.engine.network_manager import _MetricsManager
 from src.lib.run_artifacts import format_duration, write_json
 
 
@@ -50,7 +50,9 @@ class RunArtifactTests(unittest.TestCase):
         metrics = _MetricsManager(total_epochs=4)
         metrics._live = Mock()
 
-        with patch("src.engine.network.time.monotonic", side_effect=(10.0, 10.4, 11.1, 11.2)):
+        with patch(
+            "src.engine.network_manager.time.monotonic", side_effect=(10.0, 10.4, 11.1, 11.2)
+        ):
             for epoch in range(4):
                 metrics.log(
                     epoch,

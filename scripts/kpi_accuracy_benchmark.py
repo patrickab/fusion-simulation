@@ -29,8 +29,7 @@ import numpy as np
 from scipy.stats import qmc
 
 from src.engine.model_evaluation import _kpi_sample_points, evaluate_residual_samples
-from src.engine.network import BASE_SEED
-from src.engine.network_manager import NetworkManager
+from src.engine.network import BASE_SEED, NetworkManager
 from src.lib.geometry_config import PlasmaConfig
 from src.lib.network_config import DomainBounds, HyperParams
 from src.lib.run_artifacts import load_config

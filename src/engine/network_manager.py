@@ -1124,7 +1124,7 @@ if __name__ == "__main__":
             globals()["N_VALIDATION_SIZE"] = 16
             import src.engine.network as _network_module
 
-            _network_module.VALIDATION_FREQUENCY = 20
+            _network_module.VALIDATION_FREQUENCY = 10
             config = HyperParams(
                 huber_delta=args.huber_delta,
                 soft_bc=args.soft_bc,
