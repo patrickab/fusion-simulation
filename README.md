@@ -114,9 +114,15 @@ https://github.com/user-attachments/assets/4b60c624-9668-419b-a0a0-912037ec2a8b
 
 ## Evolution of network performance
 
-The following video shows 2-dimensional residual plots for different networks. It demonstrates the results from the latest hyperparameter optimization.
+Through testing of different architetures and loss/activation functions the average absolute residual has been reduced by two orders of magnitude from a value range between $[0,10]$ in April to $[0,10^{-2}]$ as of now (July 15th 2026).
 
-Through the use of Optuna & iterative optimization the average absolute residual (evaluated on $2048$ points for $100$ different configuartions) has been reduced from a value range between $[0,1]$ in April to $[0,10^{-2}]$ as of now (July 15th 2026).
+---
+
+## Hyperparameter Optimization
+
+In addition a pipeline for bayesian hyperparameter optimization with Optuna has been implemented. For categorical search spaces the default [TPE optimizer](https://arxiv.org/abs/2304.11127) for categorical search spaces and Gaussian Process Regression with [Expected Improvement](https://ekamperi.github.io/machine%20learning/2021/06/11/acquisition-functions.html#expected-improvement-ei) (EI) for continuous search spaces has been implemented. A future integration of [Max-Value Entropy Search](https://arxiv.org/abs/1703.01968) (MES) is planned.
+
+The following video shows 2-dimensional residual plots for different networks. It demonstrates the results from the latest hyperparameter optimization.
 
 https://github.com/user-attachments/assets/53aa94e8-0f4e-43d7-b939-f76465dfef12
 
