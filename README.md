@@ -120,7 +120,7 @@ Through testing of different architetures and loss/activation functions the aver
 
 ## Hyperparameter Optimization
 
-In addition a pipeline for bayesian hyperparameter optimization with [Optuna](https://github.com/optuna/optuna) has been implemented. For categorical search spaces the default [TPE optimizer](https://arxiv.org/abs/2304.11127) for categorical search spaces and Gaussian Process Regression with [Expected Improvement](https://ekamperi.github.io/machine%20learning/2021/06/11/acquisition-functions.html#expected-improvement-ei) (EI) for continuous search spaces has been implemented. A future integration of [Max-Value Entropy Search](https://arxiv.org/abs/1703.01968) (MES) is planned.
+In addition a pipeline for bayesian hyperparameter optimization with [Optuna](https://github.com/optuna/optuna) has been implemented. For categorical search spaces the default [TPE optimizer](https://arxiv.org/abs/2304.11127) is used. For continuous search spaces the pipeline automatically switches to Gaussian Process Regression with [Expected Improvement](https://ekamperi.github.io/machine%20learning/2021/06/11/acquisition-functions.html#expected-improvement-ei) (EI). A future integration of [Max-Value Entropy Search](https://arxiv.org/abs/1703.01968) (MES) is planned.
 
 The following video shows 2-dimensional residual plots for different networks. It demonstrates the results from the latest hyperparameter optimization.
 
