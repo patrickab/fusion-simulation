@@ -19,7 +19,8 @@ budget (docs/evaluation/kpi-accuracy-benchmark.md).
     └────────────────────────┘  │ inject as completed trials
                                 │
     ┌───────────────────────────▼──────────────────────┐
-    │  Optuna study  (TPE sampler + Hyperband pruner)  │
+    │  Optuna study  (TPE or GP sampler + Hyperband    │
+    │  pruner; GP+logEI when the space is all-Range)   │
     │                                                  │
     │  per trial:                                      │
     │    sample HyperParams ◄── SearchSpaceConfig      │
@@ -59,7 +60,7 @@ import jax
 import optuna
 from optuna.distributions import CategoricalDistribution, FloatDistribution
 from optuna.pruners import HyperbandPruner, NopPruner
-from optuna.samplers import TPESampler
+from optuna.samplers import BaseSampler, GPSampler, TPESampler
 
 from src.engine.model_evaluation import evaluate_validation_loss_stats
 from src.engine.network import (
@@ -792,6 +793,18 @@ def _generate_benchmark_report(
         logger.warning(f"Benchmark report generation failed: {e}")
 
 
+def build_sampler(search_space: SearchSpaceConfig, study: StudyConfig) -> BaseSampler:
+    """GPSampler (GP regression, logEI acquisition by default) when every suggestable
+    axis is a continuous Range; TPE otherwise (categorical axes like hidden_dims)."""
+    axes = list(search_space.get_suggestable_params().values())
+    # Corrector studies additionally suggest stage2_scale (see objective()).
+    if study.stage1_run is not None and isinstance(search_space.stage2_scale, list | Range):
+        axes.append(search_space.stage2_scale)
+    if axes and all(isinstance(spec, Range) for spec in axes):
+        return GPSampler(seed=42, n_startup_trials=study.n_startup_trials)
+    return TPESampler(seed=42, n_startup_trials=study.n_startup_trials)
+
+
 def run_optimization(
     search_space: SearchSpaceConfig | None = None,
     study: StudyConfig | None = None,
@@ -876,7 +889,7 @@ def run_optimization(
             storage=f"sqlite:///{storage_path}",
             load_if_exists=not restart,
             direction="minimize",
-            sampler=TPESampler(seed=42, n_startup_trials=study.n_startup_trials),
+            sampler=build_sampler(search_space, study),
             pruner=(
                 HyperbandPruner(
                     min_resource=study.min_epochs,
@@ -913,7 +926,7 @@ def run_optimization(
                 study_name=study.study_name,
                 storage=f"sqlite:///{storage_path}",
                 direction="minimize",
-                sampler=TPESampler(seed=42, n_startup_trials=study.n_startup_trials),
+                sampler=build_sampler(search_space, study),
                 pruner=(
                     HyperbandPruner(
                         min_resource=study.min_epochs,

@@ -93,8 +93,9 @@ Used by the Streamlit UI and referenced for fixed heatmap scales by the React fr
 `evaluate_plasma_grids()` is the common data path for frontend Plotly fields and offline Matplotlib montages. `evaluate_residual_samples()` is the batched, jitted KPI core on a deterministic area-uniform Sobol sample, with point and configuration chunking. `evaluate_plasma_kpis()` produces whole-plasma/core summaries, edge p95, and boundary leakage. Training validation, HPO pruning/ranking, final `run.json` KPIs, CLI evaluation, and reevaluation all score the same fixed 200 x 8,192 `kpi_benchmark_configs` stream.
 
 ## HPO (`src/engine/optimize_network_optuna.py`, `src/engine/optimize-network-hparams.py`)
-- **Optuna** (primary): thin TPE/pruning adapter over `NetworkManager.train`; `SearchSpaceConfig`
-  owns search bounds and fixed study settings. Standard and HPO training share one epoch,
+- **Optuna** (primary): thin sampling/pruning adapter over `NetworkManager.train`; `SearchSpaceConfig`
+  owns search bounds and fixed study settings. `build_sampler` picks `GPSampler` (GP regression,
+  logEI acquisition by default) when every suggestable axis is a continuous `Range`, else `TPESampler`. Standard and HPO training share one epoch,
   validation, patience stopping, L-BFGS, and saving path. Validation scores the fixed `kpi_benchmark_configs`
   stream (config construction only — it never advances training Sobol state). A patience stop is
   a normally completed, rankable Optuna trial (not `FAIL`); its stop metadata is retained in trial
