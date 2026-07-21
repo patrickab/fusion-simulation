@@ -1,4 +1,5 @@
 import contextlib
+import csv
 from datetime import datetime
 import math
 from pathlib import Path
@@ -98,21 +99,29 @@ def get_available_networks(view_mode: str = "All") -> list[str]:
 
 
 def get_hpo_studies(archived: bool = False) -> dict[str, list[str]]:
-    """List HPO study slugs and their direct trial-network slugs."""
+    """List HPO study slugs and their direct or foundation-owned trial slugs."""
     root = Filepaths.HPO_ARCHIVE if archived else Filepaths.HPO_ROOT
     if not root.exists():
         return {}
-    return {
-        study.name: sorted(
+    studies = {}
+    for study in sorted(p for p in root.iterdir() if p.is_dir() and p.name != "_archive"):
+        runs = {
             run.name
             for run in study.iterdir()
             if run.is_dir()
             and not run.name.startswith("_")
             and (run / "run.json").exists()
             and (run / "network.flax").exists()
-        )
-        for study in sorted(p for p in root.iterdir() if p.is_dir() and p.name != "_archive")
-    }
+        }
+        trials_csv = study / "trials.csv"
+        if trials_csv.exists():
+            with trials_csv.open(newline="", encoding="utf-8") as file:
+                for row in csv.DictReader(file):
+                    run = Path(row.get("run", ""))
+                    if run.is_absolute() and (run / "run.json").exists():
+                        runs.add(run.name)
+        studies[study.name] = sorted(runs)
+    return studies
 
 
 def get_available_commits(networks: list[str]) -> list[str]:
@@ -150,6 +159,13 @@ def resolve_run_directory(name: str) -> Path:
             path = root / study / run
             if path.is_dir():
                 return path
+            trials_csv = root / study / "trials.csv"
+            if trials_csv.exists():
+                with trials_csv.open(newline="", encoding="utf-8") as file:
+                    for row in csv.DictReader(file):
+                        external = Path(row.get("run", ""))
+                        if external.is_absolute() and external.name == run and external.is_dir():
+                            return external
         raise FileNotFoundError(f"Run dir not found: {name}")
     if "/" in name or name.startswith("."):
         raise FileNotFoundError(f"Invalid network name: {name}")

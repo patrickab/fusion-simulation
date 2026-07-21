@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from enum import StrEnum
 import json
 from pathlib import Path
 from typing import Literal, Protocol
@@ -10,52 +11,45 @@ from src.lib.config import BaseModel
 from src.lib.geometry_config import PlasmaConfig
 
 
+class Architecture(StrEnum):
+    """Supported network architectures."""
+
+    mlp = "mlp"
+    piratenet = "piratenet"
+
+
 @struct.dataclass
 class HyperParams(BaseModel):
-    """Central configuration for the experiment."""
+    """Central configuration for the experiment.
 
-    hidden_dims: tuple[int, ...] = (128, 128, 128, 128)
-    # 0.0 → MSE PDE loss; >0 → optax Huber loss with this delta. Ablation 1
-    # (kinked LUT boundary) had Huber winning clearly; grid 2 (smooth Fourier
-    # boundary envelope) closed the gap — mse core_med 0.388 vs huber 0.420
-    # plain, huber 0.383 vs mse 0.502 with nff=64 — confirming the kinked
-    # boundary, not the loss, was ablation 1's real culprit. Kept as a toggle
-    # since the two losses are now close enough to depend on architecture.
-    huber_delta: float = 1.0
-    # random Fourier features on (r, z); 0 = plain MLP. nff=64 gave the best
-    # core median in grid 2 (2026-07-11) at the cost of a noisier boundary
-    # shell (edge_p95/bnd_leak both ~2-3x higher) — tolerated per the
-    # core-first selection rule, and is the CLI default for new training runs
-    # (src/engine/network.py --fourier-features). Keep the dataclass default at
-    # zero so programmatic HyperParams() remains the plain-MLP baseline.
-    n_fourier_features: int = 0
-    fourier_sigma: float = 2.0
-    # L-BFGS polish steps on a fixed batch after AdamW; 0 = off. Grid 2 showed
-    # no consistent gain (made plain-huber worse: 0.460 vs 0.420) for
-    # 1.5-8min/run extra cost — not worth defaulting on.
-    lbfgs_steps: int = 0
+    Defaults resemble known best configurations.
+    """
+
+    # Optimizer & loss
     learning_rate_max: float = 2e-3
     learning_rate_min: float = 5e-5
     weight_decay: float = 1e-7
-    weight_boundary_condition: float = 10.0
-    # Collapse-guard hinge: penalizes interior-mean ψ below 0.05·F_axis·a (also
-    # pins the ψ>0-at-axis sign convention); zero loss once above the floor.
-    weight_flux_scale: float = 10.0
-    # Train like legacy bb503b0: raw ψ output + Dirichlet/Neumann penalties (no envelope).
-    soft_bc: bool = False
-    # Random Weight Factorization (Wang et al. arXiv 2210.01274): reparametrize each
-    # dense kernel as W = diag(exp(s)) · V to improve PINN accuracy.
-    rwf: bool = False
-    # Network architecture: "mlp" = plain MLP (default, existing behaviour), "piratenet" =
-    # PirateNet residual blocks (arXiv 2402.00326, eq. 4.1-4.7).
-    arch: str = "mlp"
     sigma_residual_adaptive_sampling: float = 0.05
+    weight_boundary_condition: float | None = 10.0  # soft-BC penalty; None/0.0 = off
+    weight_flux_scale: float | None = 10.0  # collapse-guard hinge (pins psi>0); None/0.0 = off
+    huber_delta: float | None = None  # None/0.0 = MSE PDE loss
     batch_size: int = 64
-    n_rz_inner_samples: int = 512
-    n_rz_boundary_samples: int = 128
+
+    # Training budget
     n_train: int = 1024
     warmup_epochs: int = 100
     decay_epochs: int = 500
+    n_rz_inner_samples: int = 512
+    n_rz_boundary_samples: int = 128
+    lbfgs_steps: int = 0
+
+    arch: Architecture = Architecture.mlp
+    hidden_dims: tuple[int, ...] = (200, 200, 200, 200, 200)
+    n_fourier_features: int = 0
+    fourier_sigma: float = 2.0
+    # Random Weight Factorization (Wang et al. arXiv 2210.01274)
+    rwf: bool = False
+    soft_bc: bool = False
 
     def to_json(self, path: str) -> None:
         """Write hyperparameters to disk as JSON."""

@@ -5,6 +5,7 @@ import json
 
 from src.api.network import build_plasma_grids
 from src.api.state import get_manager
+from src.lib.config import NEURAL_CORRECTOR_DIR
 from src.lib.run_artifacts import load_config, load_kpis
 from src.streamlit.network_utils import filter_networks_by_commit, resolve_run_directory
 
@@ -37,9 +38,8 @@ def run_benchmark(
             "Both": ("flux", "residual"),
         }[mode]
         grids = build_plasma_grids(manager, seed, sample_size, resolution, quantities)
-        artifact_dir = (
-            run_dir / "stage2" if (run_dir / "stage2" / "network.flax").exists() else run_dir
-        )
+        corrector_dir = run_dir / NEURAL_CORRECTOR_DIR
+        artifact_dir = corrector_dir if (corrector_dir / "network.flax").exists() else run_dir
         row["kpis"] = load_kpis(artifact_dir)
         if "flux" in grids:
             row["flux_grids"] = grids["flux"]

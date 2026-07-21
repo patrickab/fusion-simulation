@@ -27,8 +27,10 @@ from src.lib.logger import get_logger
 from src.lib.utils import format_hpo_params
 
 if TYPE_CHECKING:
+    import optuna
+
     from src.engine.network_manager import NetworkManager
-    from src.engine.optimize_network_optuna import SearchSpaceConfig, StudyConfig
+    from src.engine.optimize_network_optuna import StudyConfig
     from src.lib.network_config import HyperParams
 
 logger = get_logger(name="OptunaHPO")
@@ -389,13 +391,17 @@ class HpoApp(App):
     """
 
     def __init__(
-        self, search_space: "SearchSpaceConfig", study: "StudyConfig", restart: bool
+        self,
+        study: "StudyConfig",
+        restart: bool,
+        trial_callback: "Callable[[optuna.Study, optuna.trial.FrozenTrial], None] | None" = None,
     ) -> None:
         super().__init__()
         # ansi-dark passes the terminal's own palette/background through instead of
         # Textual's truecolor theme.
         self.theme = "ansi-dark"
-        self._search_space, self._study, self._restart = search_space, study, restart
+        self._study, self._restart = study, restart
+        self._trial_callback = trial_callback
         self._state = OptunaProgressDisplay(study, live=False, on_change=self._request_refresh)
         handler = _EventLogHandler(self._state.events)
         # get_logger() wires each source to a Console(stderr=True) RichHandler, whose direct
@@ -470,7 +476,10 @@ class HpoApp(App):
 
         try:
             run_optimization(
-                self._search_space, self._study, restart=self._restart, display=self._state
+                self._study,
+                restart=self._restart,
+                display=self._state,
+                trial_callback=self._trial_callback,
             )
         except KeyboardInterrupt:
             # run_optimization already removed the study dir; just exit cleanly.

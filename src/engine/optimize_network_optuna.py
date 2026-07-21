@@ -15,7 +15,7 @@ budget (docs/evaluation/kpi-accuracy-benchmark.md).
     ┌───────────▼────────────┐
     │  warmstart (optional)  │
     │  benchmark study.db    ├──┐
-    │  WARMSTART_CONFIG_PATHS├──┤
+    │  configured run paths  ├──┤
     └────────────────────────┘  │ inject as completed trials
                                 │
     ┌───────────────────────────▼──────────────────────┐
@@ -71,8 +71,14 @@ from src.engine.network import (
 )
 from src.engine.network_manager import NetworkManager
 from src.engine.residual_correction import load_foundation
-from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG, Filepaths, current_commit
-from src.lib.network_config import HyperParams
+from src.lib.config import (
+    KPI_EVAL_CONFIGS,
+    KPI_POINTS_PER_CONFIG,
+    NEURAL_CORRECTOR_DIR,
+    Filepaths,
+    current_commit,
+)
+from src.lib.network_config import Architecture, HyperParams
 from src.lib.optuna_tui import HpoApp, OptunaProgressDisplay, logger, resolve_reset_choice
 from src.lib.run_artifacts import (
     format_duration,
@@ -81,25 +87,6 @@ from src.lib.run_artifacts import (
     load_run,
     update_run_result,
 )
-
-HPO_ROOT = Filepaths.DATA / "hpo"
-
-# Architectures (width * depth) to search over. Hand-ordered biggest-first:
-# check_capacity() smoke-trains the first entry as the worst case.
-_ARCHITECTURES = [
-    (320,) * 5,
-    (256,) * 6,
-    (200,) * 5,  # incumbent
-]
-
-WARMSTART_CONFIG_PATHS: list[Path] = []
-
-
-# Benchmark run dir whose Optuna study.db warms up a fresh study. Its completed
-# trials are read back from each trial's run.json and
-# injected as historical evidence for TPE -- no retraining. None disables it.
-# The study name is auto-discovered (the non-legacy study with the most trials).
-WARMSTART_EXPERIMENT_DB: Path | None = None
 
 # Budget fields change what the loss *means* (sampling/training amount), so a mismatch
 # invalidates a warmstart candidate (with total epochs, see budget_mismatch); nothing else does.
@@ -123,39 +110,54 @@ class SearchSpaceConfig:
         - Scalar = pinned
         - list   = discrete choices
         - Range  = continuous
+        - None   = not pinned here; the HyperParams default applies
 
-    Fields mirror HyperParams except for the corrector's stage2_scale.
+    Fields mirror HyperParams (same grouping) except for corrector_scale.
     """
 
-    hidden_dims: tuple[int, ...] | list[tuple[int, ...]] = field(
-        default_factory=_ARCHITECTURES.copy
-    )
-    learning_rate_max: Range = Range(5e-4, 1e-3, log=True)
-    learning_rate_min: float = 1e-5
-    weight_decay: Range = Range(1e-9, 1e-8, log=True)
-    sigma_residual_adaptive_sampling: Range = Range(0.02, 0.05)
-    weight_boundary_condition: float = 10.0
-    weight_flux_scale: float = 10.0
-    soft_bc: bool = False
-    n_rz_inner_samples: int = 512
-    n_rz_boundary_samples: int = 256
+    # Optimizer & loss
+    learning_rate_max: float | Range
+    learning_rate_min: float | Range
+    weight_decay: float | Range
+    sigma_residual_adaptive_sampling: float | Range
+
+    # Architecture choices each study must decide explicitly.
+    hidden_dims: tuple[int, ...] | list[tuple[int, ...]]
+    rwf: bool
+    soft_bc: bool
+
+    # Architecture defaults
+    arch: Architecture = Architecture.mlp
+    n_fourier_features: int | None = None
+    weight_boundary_condition: float | Range | None = None  # soft-BC studies only
+    weight_flux_scale: float | Range | None = None  # collapse-guard hinge weight
+    huber_delta: float | None = None  # None/0.0 = MSE
     batch_size: int = 32
-    n_train: int = 1024
+
+    # Training budget
+    n_train: int = 1024  # size training set
     warmup_epochs: int = 400
     decay_epochs: int = 2000
-    huber_delta: float = 0.0
-    n_fourier_features: int = 0
+    n_rz_inner_samples: int = 512
+    n_rz_boundary_samples: int = 256
     lbfgs_steps: int = 0
-    rwf: bool = False
-    arch: str = "mlp"
-    stage2_scale: float | list[float] | Range = 0.01
+
+    # --- Neural-corrector studies only; never fed to HyperParams ---
+    corrector_scale: float | list[float] | Range = 0.01
 
     def get_static_params(self) -> dict[str, Any]:
-        """Fields pinned to a single value -- fed straight into HyperParams(**...)."""
+        """Fields pinned to a single value -- fed straight into HyperParams(**...).
+
+        None means "not pinned": the field is omitted so the HyperParams
+        default applies (huber_delta's default is itself None, so omitting it
+        is equivalent to pinning MSE).
+        """
         return {
-            f.name: getattr(self, f.name)
+            f.name: value
             for f in fields(self)
-            if f.name != "stage2_scale" and not isinstance(getattr(self, f.name), list | Range)
+            if f.name != "corrector_scale"
+            and not isinstance(value := getattr(self, f.name), list | Range)
+            and value is not None
         }
 
     def get_suggestable_params(self) -> dict[str, list | Range]:
@@ -163,7 +165,7 @@ class SearchSpaceConfig:
         return {
             f.name: getattr(self, f.name)
             for f in fields(self)
-            if f.name != "stage2_scale" and isinstance(getattr(self, f.name), list | Range)
+            if f.name != "corrector_scale" and isinstance(getattr(self, f.name), list | Range)
         }
 
     def budget_mismatch(self, hparams: HyperParams) -> dict[str, Any]:
@@ -181,56 +183,37 @@ class SearchSpaceConfig:
         return mismatches
 
 
-_DEFAULT_TOTAL_EPOCHS = SearchSpaceConfig.warmup_epochs + SearchSpaceConfig.decay_epochs
-
-
 @dataclass
 class StudyConfig:
     """Orchestration knobs for the Optuna study itself -- never fed to HyperParams."""
 
+    search_space: SearchSpaceConfig
     study_name: str = "arch_wide_or_deep_2400ep"
     n_trials: int = 20
     top_k: int = 3
     n_startup_trials: int = 10
     n_validate: int = KPI_EVAL_CONFIGS
-    min_epochs: int = _DEFAULT_TOTAL_EPOCHS // 8
-    total_epochs: int = _DEFAULT_TOTAL_EPOCHS
+    min_epochs: int | None = None  # Hyperband pruning floor; None = total_epochs // 8
     prune_trials: bool = True
-    # "none": no checkpoints/benchmark dirs (--test). "top_k": completed trials save
-    # post-hoc. "all": every trial saves during training and retains its train.log.
-    checkpoint_policy: Literal["none", "top_k", "all"] = "top_k"
-    # Retrain (at this study's budget) or skip warmstart configs with a mismatched budget.
-    # Resolved in main(); lives on `study` so it survives the HpoApp path unchanged.
-    retrain: bool = False
-    # Weight on the p95 tail in the fused ranking score
-    # ``loss_median + score_beta * loss_p95`` (both terms are |R_GS|). ~0.2-0.5
-    # trades typical vs. worst-case error; p95 ~10x median keeps the tail modest.
-    score_beta: float = 0.3
-    # Inject the WARMSTART_EXPERIMENT_DB benchmark trials as historical evidence.
-    # Disabled in --test: a smoke test's tiny budget is incomparable, and injected
-    # trials would consume the small n_trials budget.
-    warmstart: bool = True
-    # Frozen stage-1 checkpoint used by every trial in a corrector study.
-    stage1_run: str | None = None
+    checkpoint_policy: Literal["none", "top_k", "all"] = "all"
+    score_beta: float = 0.3  # p95 tail weight in ``loss_median + score_beta * loss_p95``
+
+    # Previous experiments can be read back and injected as historical evidence.
+    warmstart_experiment_db: Path | None = None
+    warmstart_config_paths: list[Path] = field(default_factory=list)
+    retrain: bool = False  # retrain budget-mismatched warmstart configs
+
+    foundation_path: str | Path | None = None  # frozen foundation for corrector studies
+
+    @property
+    def total_epochs(self) -> int:
+        """Per-trial epoch budget, always the search space's schedule."""
+        return self.search_space.warmup_epochs + self.search_space.decay_epochs
 
 
-def _record_foundation(study_path: Path, stage1_run: str | None, source: Path | None) -> None:
-    """Persist the foundation identity and a self-contained checkpoint copy."""
-    path = study_path / "foundation.json"
-    if path.exists():
-        saved = json.loads(path.read_text()).get("stage1_run")
-        if saved != stage1_run:
-            raise ValueError(
-                f"Study foundation is {saved!r}, but this run requested {stage1_run!r}"
-            )
-    if source is not None:
-        destination = study_path / "_foundation"
-        destination.mkdir(exist_ok=True)
-        if source.resolve() != destination.resolve():
-            for artifact in ("run.json", "network.flax"):
-                shutil.copy2(source / artifact, destination / artifact)
-    if not path.exists() and stage1_run is not None:
-        path.write_text(json.dumps({"stage1_run": stage1_run}, indent=2) + "\n")
+def load_configs(paths: list[Path]) -> list[tuple[Path, HyperParams]]:
+    """Load configs from disk."""
+    return [(path, HyperParams.from_dict(load_config(path.parent))) for path in paths]
 
 
 def _write_objective_metadata(
@@ -269,26 +252,22 @@ def study_dir(study_name: str, commit: str | None = None) -> Path:
     An existing directory for the same name and commit is reused (resume);
     otherwise a fresh timestamped one is created.
     """
+
+    def _timestamp() -> str:
+        return datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+
     commit = commit or current_commit()
     # ponytail: >1 match (two runs of the same name+commit) picks the newest;
     # that's the one a bare re-run means to resume.
-    existing = sorted(HPO_ROOT.glob(f"*_{study_name}_{commit}"))
-    path = existing[-1] if existing else HPO_ROOT / f"{_now()}_{study_name}_{commit}"
+    existing = sorted(Filepaths.HPO_ROOT.glob(f"*_{study_name}_{commit}"))
+    path = (
+        existing[-1] if existing else Filepaths.HPO_ROOT / f"{_timestamp()}_{study_name}_{commit}"
+    )
     path.mkdir(parents=True, exist_ok=True)
     return path
 
 
-def _now() -> str:
-    return datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
-
-
-def load_configs(paths: list[Path] = WARMSTART_CONFIG_PATHS) -> list[tuple[Path, HyperParams]]:
-    # Fail-fast by design: a wrong/missing WARMSTART_CONFIG_PATHS entry SHALL crash --
-    # the caller supplies correct paths; a silently skipped warmstart config is worse.
-    return [(path, HyperParams.from_dict(load_config(path.parent))) for path in paths]
-
-
-def load_experiment_db(db_dir: Path | None = WARMSTART_EXPERIMENT_DB) -> optuna.Study | None:
+def load_experiment_db(db_dir: Path | None) -> optuna.Study | None:
     """Open the benchmark Optuna study living under ``db_dir/study.db``.
 
     The study name is auto-discovered: the non-legacy study (i.e. not
@@ -324,34 +303,32 @@ def _reevaluate_config(path: Path, hp: HyperParams, budget: dict[str, Any]) -> H
     return corrected
 
 
-def optuna_warmstart(
-    search_space: SearchSpaceConfig, retrain: bool, score_beta: float = 0.3
-) -> optuna.Study | None:
-    """Populate the legacy ``warmstart_experiments`` ledger from WARMSTART_CONFIG_PATHS.
+def optuna_warmstart(study: StudyConfig) -> optuna.Study | None:
+    """Populate the legacy ``warmstart_experiments`` ledger from configured paths.
 
     No-op returning None if the list is empty or no benchmark db is configured.
-    Budget-mismatched entries are retrained or skipped depending on ``retrain``.
+    Budget-mismatched entries are retrained or skipped depending on ``study.retrain``.
     """
-    if WARMSTART_EXPERIMENT_DB is None or not WARMSTART_CONFIG_PATHS:
+    if study.warmstart_experiment_db is None or not study.warmstart_config_paths:
         return None
 
     db = optuna.create_study(
         study_name="warmstart_experiments",
-        storage=f"sqlite:///{WARMSTART_EXPERIMENT_DB / 'study.db'}",
+        storage=f"sqlite:///{study.warmstart_experiment_db / 'study.db'}",
         load_if_exists=True,
         direction="minimize",
     )
 
-    for path, hp in load_configs(WARMSTART_CONFIG_PATHS):
-        mismatched = search_space.budget_mismatch(hp)
+    for path, hp in load_configs(study.warmstart_config_paths):
+        mismatched = study.search_space.budget_mismatch(hp)
 
         if mismatched:
-            if not retrain:
+            if not study.retrain:
                 continue  # skip: never enters the ledger, never informs TPE
             hp = _reevaluate_config(path, hp, mismatched)
 
         kpis = load_kpis(path.parent)
-        loss = kpis["loss_median"] + score_beta * kpis["loss_p95"]
+        loss = kpis["loss_median"] + study.score_beta * kpis["loss_p95"]
 
         db.add_trial(
             optuna.trial.create_trial(
@@ -472,16 +449,13 @@ def _inject_historical_trials(
         )
 
 
-def check_capacity(
-    search_space: SearchSpaceConfig,
-    study: StudyConfig,
-    foundation: FoundationModel | None = None,
-) -> None:
+def check_capacity(study: StudyConfig, foundation: FoundationModel | None = None) -> None:
     """Verify the search space's most resource-demanding config trains without crashing."""
+    search_space = study.search_space
     suggestable = search_space.get_suggestable_params()
     picked = {
         # Each spec's most demanding end: Range.high, or a list's first entry
-        # (lists like _ARCHITECTURE_GRID are hand-ordered biggest-first).
+        # (lists like _ARCHITECTURES are hand-ordered biggest-first).
         name: spec.high if isinstance(spec, Range) else spec[0]
         for name, spec in suggestable.items()
     }
@@ -494,11 +468,11 @@ def check_capacity(
 
 def objective(
     trial: optuna.Trial,
-    search_space: SearchSpaceConfig,
     study: StudyConfig,
     display: OptunaProgressDisplay,
     hpo_benchmark_dir: Path,
     foundation: FoundationModel | None = None,
+    foundation_dir: Path | None = None,
 ) -> float:
     """Train one network and return its fused ranking score (median + beta*p95 of |R_GS|).
 
@@ -506,18 +480,18 @@ def objective(
     protocol: KPI_POINTS_PER_CONFIG x fixed validation configs), not the composite
     training loss.  Pruning and ranking therefore measure the same quantity.
     """
-    hp = build_hyperparams(trial, search_space)
+    hp = build_hyperparams(trial, study.search_space)
     trial.set_user_attr("config", hp.to_dict())
     trial.set_user_attr("training_seed", 42)
-    stage2_scale = 1.0
+    corrector_scale = 1.0
     if foundation is not None:
-        scale_spec = search_space.stage2_scale
-        stage2_scale = (
-            _suggest(trial, "stage2_scale", scale_spec)
+        scale_spec = study.search_space.corrector_scale
+        corrector_scale = (
+            _suggest(trial, "corrector_scale", scale_spec)
             if isinstance(scale_spec, list | Range)
             else scale_spec
         )
-        trial.set_user_attr("stage2_scale", stage2_scale)
+        trial.set_user_attr("corrector_scale", corrector_scale)
     display_params = {
         "depth": len(hp.hidden_dims),
         "width": hp.hidden_dims[0],
@@ -525,15 +499,17 @@ def objective(
         "lr_min": hp.learning_rate_min,
         "wd": hp.weight_decay,
         "sig": hp.sigma_residual_adaptive_sampling,
-        "eps": stage2_scale if foundation is not None else None,
+        "eps": corrector_scale if foundation is not None else None,
     }
     manager = NetworkManager(
         hp,
         n_validation_size=study.n_validate,
         test_mode=study.checkpoint_policy == "none",
-        output_dir=hpo_benchmark_dir,
+        output_dir=(foundation_dir / NEURAL_CORRECTOR_DIR / hpo_benchmark_dir.name)
+        if foundation_dir is not None
+        else hpo_benchmark_dir,
         prior=foundation,
-        scale=stage2_scale,
+        scale=corrector_scale,
     )
     total_epochs = hp.warmup_epochs + hp.decay_epochs
     display.start_trial(trial.number + 1, display_params, total_epochs)
@@ -571,14 +547,9 @@ def objective(
         trial.set_user_attr("loss_p95", val_p95)
         if study.checkpoint_policy == "top_k":
             manager.to_disk()
-        if (
-            manager.artifact_stem is not None
-            and (hpo_benchmark_dir / manager.artifact_stem / "run.json").exists()
-        ):
-            update_run_result(
-                hpo_benchmark_dir / manager.artifact_stem,
-                objective_value=val_score,
-            )
+        run_dir = manager.run_dir()
+        if (run_dir / "run.json").exists():
+            update_run_result(run_dir, objective_value=val_score)
         display.update(
             trial.number + 1,
             display_params,
@@ -603,7 +574,10 @@ def objective(
         raise
     finally:
         if manager.artifact_stem is not None:
-            trial.set_user_attr("run", manager.artifact_stem)
+            run = manager.run_dir()
+            trial.set_user_attr(
+                "run", str(run) if foundation_dir is not None else manager.artifact_stem
+            )
         # Only this trial's own run directory is touched.
         manager.discard_unsaved_run()
         jax.clear_caches()
@@ -645,7 +619,7 @@ def _write_trials_csv(study: optuna.Study, hpo_benchmark_dir: Path) -> None:
         for trial in trials:
             attrs = trial.user_attrs
             run_name = attrs.get("run", "")
-            run_dir = hpo_benchmark_dir / run_name if run_name else None
+            run_dir = _trial_run_dir(hpo_benchmark_dir, run_name) if run_name else None
             run = (
                 load_run(run_dir) if run_dir is not None and (run_dir / "run.json").exists() else {}
             )
@@ -678,6 +652,12 @@ def _write_trials_csv(study: optuna.Study, hpo_benchmark_dir: Path) -> None:
 
 def _csv_float(value: object) -> str:
     return f"{float(value):.4e}" if value is not None else ""
+
+
+def _trial_run_dir(hpo_benchmark_dir: Path, run: object) -> Path:
+    """Resolve a local HPO stem or an absolute corrector artifact path."""
+    path = Path(str(run))
+    return path if path.is_absolute() else hpo_benchmark_dir / path
 
 
 def _csv_value(value: object) -> object:
@@ -720,8 +700,12 @@ def _save_top_configs(
                         "loss": loss,
                         "config": hp.to_dict(),
                         **(
-                            {"stage2_scale": ranked_trials[rank - 1].user_attrs["stage2_scale"]}
-                            if "stage2_scale" in ranked_trials[rank - 1].user_attrs
+                            {
+                                "corrector_scale": ranked_trials[rank - 1].user_attrs[
+                                    "corrector_scale"
+                                ]
+                            }
+                            if "corrector_scale" in ranked_trials[rank - 1].user_attrs
                             else {}
                         ),
                     }
@@ -745,12 +729,12 @@ def _bundle_top_artifacts(trials: list[optuna.trial.FrozenTrial], hpo_benchmark_
         run = trial.user_attrs.get("run")
         if run is None:
             continue
-        source = (hpo_benchmark_dir / run).resolve()
-        if source.parent != study_dir:
+        source = _trial_run_dir(hpo_benchmark_dir, run).resolve()
+        if not source.is_relative_to(study_dir) and NEURAL_CORRECTOR_DIR not in source.parts:
             raise ValueError(f"Trial {trial.number} has invalid run path {run!r}")
         if not (source / "network.flax").exists():
             continue
-        destination = bundle_dir / f"{rank:02d}_{run}"
+        destination = bundle_dir / f"{rank:02d}_{source.name}"
         destination.mkdir()
         artifacts = []
         for artifact in source.iterdir():
@@ -779,9 +763,11 @@ def _generate_benchmark_report(
     output_path = hpo_benchmark_dir / "benchmark_report.pdf"
     output_path.unlink(missing_ok=True)
     run_dirs = [
-        hpo_benchmark_dir / t.user_attrs["run"]
+        _trial_run_dir(hpo_benchmark_dir, t.user_attrs["run"])
         for t in trials
-        if (hpo_benchmark_dir / t.user_attrs.get("run", "") / "network.flax").exists()
+        if (
+            _trial_run_dir(hpo_benchmark_dir, t.user_attrs.get("run", "")) / "network.flax"
+        ).exists()
     ]
     if not run_dirs:
         return
@@ -793,31 +779,31 @@ def _generate_benchmark_report(
         logger.warning(f"Benchmark report generation failed: {e}")
 
 
-def build_sampler(search_space: SearchSpaceConfig, study: StudyConfig) -> BaseSampler:
+def build_sampler(study: StudyConfig) -> BaseSampler:
     """GPSampler (GP regression, logEI acquisition by default) when every suggestable
     axis is a continuous Range; TPE otherwise (categorical axes like hidden_dims)."""
+    search_space = study.search_space
     axes = list(search_space.get_suggestable_params().values())
-    # Corrector studies additionally suggest stage2_scale (see objective()).
-    if study.stage1_run is not None and isinstance(search_space.stage2_scale, list | Range):
-        axes.append(search_space.stage2_scale)
+    # Corrector studies additionally suggest corrector_scale (see objective()).
+    if study.foundation_path is not None and isinstance(search_space.corrector_scale, list | Range):
+        axes.append(search_space.corrector_scale)
     if axes and all(isinstance(spec, Range) for spec in axes):
         return GPSampler(seed=42, n_startup_trials=study.n_startup_trials)
     return TPESampler(seed=42, n_startup_trials=study.n_startup_trials)
 
 
 def run_optimization(
-    search_space: SearchSpaceConfig | None = None,
-    study: StudyConfig | None = None,
+    study: StudyConfig,
     *,
     display: OptunaProgressDisplay,
     restart: bool = False,
     trial_callback: Callable[[optuna.Study, optuna.trial.FrozenTrial], None] | None = None,
 ) -> list[tuple[HyperParams, float]]:
     """Run or resume a study and return its best configurations."""
-    search_space = search_space or SearchSpaceConfig()
-    study = study or StudyConfig()
-    if study.stage1_run is not None and study.warmstart:
-        raise ValueError("Corrector studies require StudyConfig(warmstart=False)")
+    if study.foundation_path is not None and (
+        study.warmstart_experiment_db is not None or study.warmstart_config_paths
+    ):
+        raise ValueError("Corrector studies cannot configure warmstart sources")
     # Freeze the commit once for the whole run: a commit made mid-study would
     # otherwise move study.db / optuna.log / trials.csv to a different path
     # and split the study across two commit dirs.
@@ -831,17 +817,12 @@ def run_optimization(
             points_per_config=KPI_POINTS_PER_CONFIG,
         )
     foundation = None
-    foundation_source = None
-    if study.stage1_run is not None:
-        local_foundation = hpo_benchmark_dir / "_foundation"
-        local_complete = all(
-            (local_foundation / artifact).exists() for artifact in ("run.json", "network.flax")
+    foundation_dir = None
+    if study.foundation_path is not None:
+        foundation, _, foundation_dir = load_foundation(
+            study.foundation_path,
+            soft_bc=study.search_space.soft_bc,
         )
-        foundation, _, foundation_source = load_foundation(
-            local_foundation if local_complete else study.stage1_run,
-            soft_bc=search_space.soft_bc,
-        )
-    _record_foundation(hpo_benchmark_dir, study.stage1_run, foundation_source)
     file_handler = logging.FileHandler(
         hpo_benchmark_dir / "optuna.log", mode="w" if restart else "a"
     )
@@ -852,23 +833,26 @@ def run_optimization(
     # Warmstart candidates from two sources, both optional:
     #   * the benchmark db -- raw trials read back from each run dir's
     #     run.json config + KPIs, fused score recomputed.
-    #   * the legacy WARMSTART_CONFIG_PATHS ledger -- trials carry their own
+    #   * the legacy configured-path ledger -- trials carry their own
     #     config + pre-fused value; optuna_warmstart() may retrain budget-stale
     #     configs, so it runs before check_capacity.
-    benchmark_study = load_experiment_db(WARMSTART_EXPERIMENT_DB) if study.warmstart else None
+    benchmark_study = load_experiment_db(study.warmstart_experiment_db)
     candidates = _get_experiment_db_configs(
-        benchmark_study, WARMSTART_EXPERIMENT_DB, study.score_beta
+        benchmark_study, study.warmstart_experiment_db, study.score_beta
     )
-    legacy_ledger = optuna_warmstart(
-        search_space, retrain=study.retrain, score_beta=study.score_beta
-    )
+    legacy_ledger = optuna_warmstart(study)
     candidates += _get_experiment_db_configs(legacy_ledger, None, study.score_beta)
-    check_capacity(search_space, study, foundation)
+    check_capacity(study, foundation)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
 
     storage_path = hpo_benchmark_dir / "study.db"
     if restart:
         storage_path.unlink(missing_ok=True)
+        if foundation_dir is not None:
+            shutil.rmtree(
+                foundation_dir / NEURAL_CORRECTOR_DIR / hpo_benchmark_dir.name,
+                ignore_errors=True,
+            )
         for run_dir in hpo_benchmark_dir.glob("pinn_*"):
             if run_dir.is_dir():
                 shutil.rmtree(run_dir)
@@ -883,16 +867,16 @@ def run_optimization(
             overwrite=True,
         )
 
-    try:
-        optuna_study = optuna.create_study(
+    def create_study(load_if_exists: bool) -> optuna.Study:
+        return optuna.create_study(
             study_name=study.study_name,
             storage=f"sqlite:///{storage_path}",
-            load_if_exists=not restart,
+            load_if_exists=load_if_exists,
             direction="minimize",
-            sampler=build_sampler(search_space, study),
+            sampler=build_sampler(study),
             pruner=(
                 HyperbandPruner(
-                    min_resource=study.min_epochs,
+                    min_resource=study.min_epochs or study.total_epochs // 8,
                     max_resource=study.total_epochs,
                     reduction_factor=3,
                 )
@@ -900,6 +884,9 @@ def run_optimization(
                 else NopPruner()
             ),
         )
+
+    try:
+        optuna_study = create_study(load_if_exists=not restart)
         # Reap zombie RUNNING trials left by a crashed/interrupted prior run --
         # they'd otherwise block the budget forever (Optuna never auto-stales
         # them for sqlite).
@@ -922,27 +909,13 @@ def run_optimization(
             logger.info("Study has no completed trials -- discarding for a fresh start")
             del optuna_study
             storage_path.unlink()
-            optuna_study = optuna.create_study(
-                study_name=study.study_name,
-                storage=f"sqlite:///{storage_path}",
-                direction="minimize",
-                sampler=build_sampler(search_space, study),
-                pruner=(
-                    HyperbandPruner(
-                        min_resource=study.min_epochs,
-                        max_resource=study.total_epochs,
-                        reduction_factor=3,
-                    )
-                    if study.prune_trials
-                    else NopPruner()
-                ),
-            )
+            optuna_study = create_study(load_if_exists=False)
 
         # Inject warmstart candidates once (dedup by the warmstart user_attr, so
         # a resume of an already-warmstarted study skips re-injecting).
         already_warmstarted = any(t.user_attrs.get("warmstart", False) for t in optuna_study.trials)
         if candidates and not already_warmstarted:
-            _inject_historical_trials(optuna_study, search_space, candidates)
+            _inject_historical_trials(optuna_study, study.search_space, candidates)
         # Always seed the display with warmstart candidates -- on a resume the
         # injection is skipped (already in the db) but the TUI was just started
         # and its trials table is empty.
@@ -965,7 +938,7 @@ def run_optimization(
             callbacks.append(trial_callback)
         optuna_study.optimize(
             lambda trial: objective(
-                trial, search_space, study, display, hpo_benchmark_dir, foundation
+                trial, study, display, hpo_benchmark_dir, foundation, foundation_dir
             ),
             n_trials=max(0, study.n_trials - prior_trials),
             catch=(Exception,),
@@ -982,7 +955,9 @@ def run_optimization(
             ),
             key=lambda trial: trial.value,
         )[: study.top_k]
-        results = [(build_hyperparams(trial, search_space), trial.value) for trial in complete]
+        results = [
+            (build_hyperparams(trial, study.search_space), trial.value) for trial in complete
+        ]
         for rank, (hp, loss) in enumerate(results, 1):
             architecture = f"{len(hp.hidden_dims)}x{hp.hidden_dims[0]}"
             logger.info(
@@ -1000,22 +975,22 @@ def run_optimization(
         raise
 
 
-def resolve_retrain_choice(search_space: SearchSpaceConfig) -> bool:
+def resolve_retrain_choice(study: StudyConfig) -> bool:
     """Whether to retrain budget-mismatched warmstart configs.
 
-    Returns False immediately if there are no mismatches or warmstart is disabled.
+    Returns False immediately if no configured paths have a mismatched budget.
     Raises on non-tty when mismatches exist -- the destructive choice cannot be silently guessed.
     """
-    # Retrain only applies to the legacy WARMSTART_CONFIG_PATHS path (the
+    # Retrain only applies to the legacy configured-path ledger (the
     # benchmark-db path injects already-trained trials as-is). Nothing to
     # reconcile if that path is off -- return before touching the fail-fast
     # load_configs, whose paths need not exist then.
-    if WARMSTART_EXPERIMENT_DB is None or not WARMSTART_CONFIG_PATHS:
+    if study.warmstart_experiment_db is None or not study.warmstart_config_paths:
         return False
     mismatched = [
         path
-        for path, hp in load_configs(WARMSTART_CONFIG_PATHS)
-        if search_space.budget_mismatch(hp)
+        for path, hp in load_configs(study.warmstart_config_paths)
+        if study.search_space.budget_mismatch(hp)
     ]
     if not mismatched:
         return False
@@ -1060,8 +1035,17 @@ def main() -> None:
     parser.add_argument("--save-all", action="store_true")
     args = parser.parse_args()
 
-    search_space = SearchSpaceConfig()
-    study = StudyConfig()
+    # CLI default study: LR/wd/sigma neighborhood of the incumbent, arch searched.
+    search_space = SearchSpaceConfig(
+        learning_rate_max=Range(5e-4, 1e-3, log=True),
+        learning_rate_min=1e-5,
+        weight_decay=Range(1e-9, 1e-8, log=True),
+        sigma_residual_adaptive_sampling=Range(0.02, 0.05),
+        hidden_dims=[(320,) * 5, (256,) * 6, (200,) * 5],
+        rwf=False,
+        soft_bc=False,
+    )
+    study = StudyConfig(search_space=search_space)
     study.prune_trials = not args.full_trials
     study.checkpoint_policy = "all" if args.save_all else "top_k"
 
@@ -1076,12 +1060,10 @@ def main() -> None:
         search_space.decay_epochs = 50
         study.n_validate = 16
         study.n_trials = 10
-        study.total_epochs = 100
-        study.min_epochs = 100
+        study.min_epochs = 100  # = total_epochs: a single Hyperband rung
         study.n_startup_trials = 2
         study.checkpoint_policy = "none"
         study.study_name = f"{study.study_name}_test"
-        study.warmstart = False
 
     if args.test:
         reset = True  # tests always start clean; never prompt
@@ -1107,13 +1089,13 @@ def main() -> None:
         study.retrain = False
     else:
         # neither flag -> prompt, but only if a warmstart config's budget actually mismatches
-        study.retrain = resolve_retrain_choice(search_space)
+        study.retrain = resolve_retrain_choice(study)
 
     # TUI whenever a terminal exists; piped/nohup output gets the plain Live dashboard,
     # which degrades to sequential text on non-ttys. All logging/benchmark artifacts
     # (study.db, optuna.log, trials.csv, checkpoints) are identical either way.
     if sys.stdout.isatty():
-        app = HpoApp(search_space, study, restart=reset)
+        app = HpoApp(study, reset=reset)
         app.run()
         if app.crash_traceback is not None:
             # Textual's alternate screen is gone now; print to the real terminal
@@ -1122,7 +1104,7 @@ def main() -> None:
             sys.exit(1)
     else:
         with OptunaProgressDisplay(study) as display:
-            run_optimization(search_space, study, display=display, restart=reset)
+            run_optimization(study, display=display, restart=reset)
 
 
 if __name__ == "__main__":

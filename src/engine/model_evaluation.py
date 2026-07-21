@@ -16,7 +16,7 @@ from src.engine.network import BASE_SEED
 from src.engine.network_manager import NetworkManager
 from src.engine.physics import PsiFn, estimate_psi_axis, grad_shafranov_residual
 from src.engine.plasma import get_poloidal_points
-from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG
+from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG, NEURAL_CORRECTOR_DIR
 from src.lib.geometry_config import PlasmaConfig
 from src.lib.network_config import DomainBounds
 from src.lib.run_artifacts import kpi_values, update_run_result
@@ -60,7 +60,7 @@ def build_kpi_record(
     hp = manager.config
     if network_name is None:
         network_name = manager.artifact_stem
-    loss_label = f"huber={hp.huber_delta:g}" if hp.huber_delta > 0 else "mse"
+    loss_label = "mse" if hp.huber_delta is None else f"huber={hp.huber_delta:g}"
     return {
         "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "network": network_name,
@@ -677,10 +677,9 @@ if __name__ == "__main__":
         except FileNotFoundError:
             print(f"  skip {name}: run dir not found")
             continue
-        artifact_dir = (
-            run_dir / "stage2" if (run_dir / "stage2" / "network.flax").exists() else run_dir
-        )
-        evaluated_name = f"{name}/stage2" if artifact_dir != run_dir else name
+        corrector_dir = run_dir / NEURAL_CORRECTOR_DIR
+        artifact_dir = corrector_dir if (corrector_dir / "network.flax").exists() else run_dir
+        evaluated_name = f"{name}/{NEURAL_CORRECTOR_DIR}" if artifact_dir != run_dir else name
         flax_path = artifact_dir / "network.flax"
         if not (artifact_dir / "run.json").exists() or not flax_path.exists():
             print(f"  skip {name}: missing config or network.flax")
@@ -691,7 +690,9 @@ if __name__ == "__main__":
         kpis = evaluate_plasma_kpis(
             manager, configs, sample_size=args.n_points, core_rho=args.core_rho
         )
-        loss_label = f"huber={hp.huber_delta:g}" if hp.huber_delta > 0 else "mse"
+        loss_label = (
+            "mse" if hp.huber_delta is None or hp.huber_delta == 0 else f"huber={hp.huber_delta:g}"
+        )
         print(
             f"{name:<50} {loss_label:>10} {hp.learning_rate_max:>8.1e} "
             f"{hp.n_fourier_features:>4d} {hp.lbfgs_steps:>6d} "

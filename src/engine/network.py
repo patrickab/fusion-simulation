@@ -26,6 +26,7 @@ from src.lib.geometry_config import (
 )
 from src.lib.logger import get_logger
 from src.lib.network_config import (
+    Architecture,
     DomainBounds,
     EpochMetrics,
     FluxInput,
@@ -142,7 +143,7 @@ class FluxPINN(nn.Module):
     # Network architecture: "mlp" = plain MLP (default), "piratenet" = PirateNet
     # residual blocks (arXiv 2402.00326, eq. 4.1-4.7). Default "mlp" for
     # checkpoint compat — "piratenet" changes the params tree.
-    arch: str = "mlp"
+    arch: Architecture = Architecture.mlp
 
     @nn.compact
     def __call__(
@@ -439,8 +440,8 @@ class FoundationModel:
     """A converged FluxPINN bound to a specific frozen checkpoint.
 
     Its params are a constant prior — never part of the trainable pytree.
-    Used by the multistage corrector: stage-1 is wrapped here so jax.grad
-    differentiates only stage-2 params while R/Z derivatives still flow through
+    Used by the neural corrector: the foundation is wrapped here so jax.grad
+    differentiates only corrector params while R/Z derivatives still flow through
     the sum (arXiv 2407.17213 / 2507.16636).
     """
 
@@ -461,10 +462,10 @@ class _Field:
     """Builds and owns the psi-function for a Trainer.
 
     For a plain network: ``psi_fn(params, R, Z, cfg) = apply_psi_fn(head, params, ...)``.
-    For a corrector: ``psi_fn(params, R, Z, cfg) = psi_stage1(frozen) + scale *
-    psi_stage2(params)``.
+    For a corrector: ``psi_fn(params, R, Z, cfg) = psi_foundation(frozen) + scale *
+    psi_corrector(params)``.
     The prior's params are closed over as constants so jax.grad on the corrector
-    differentiates only stage-2 params.
+    differentiates only corrector params.
     """
 
     def __init__(
@@ -753,9 +754,9 @@ class Trainer:
             ) = self._train_step_jit(
                 self.state,
                 inputs,
-                self.config.weight_boundary_condition,
-                self.config.huber_delta,
-                self.config.weight_flux_scale,
+                self.config.weight_boundary_condition or 0.0,
+                self.config.huber_delta or 0.0,
+                self.config.weight_flux_scale or 0.0,
                 self.config.soft_bc,
             )
             losses.append(loss)
@@ -844,8 +845,11 @@ class Trainer:
                 break
 
         # Restore best model
-        self.state = self.state.replace(params=best_model)
-        val_kpis = best_model_kpis
+        if best_model is not None:
+            self.state = self.state.replace(params=best_model)
+            val_kpis = best_model_kpis
+        elif val_kpis is None:
+            val_kpis = self._calculate_validation_kpis()
 
         if stop_reason != "early_stopping" and self.config.lbfgs_steps > 0:
             adamw_params = self.state.params
@@ -884,9 +888,9 @@ class Trainer:
                 params,
                 psi_fn,
                 inputs,
-                self.config.weight_boundary_condition,
-                self.config.huber_delta,
-                self.config.weight_flux_scale,
+                self.config.weight_boundary_condition or 0.0,
+                self.config.huber_delta or 0.0,
+                self.config.weight_flux_scale or 0.0,
                 self.config.soft_bc,
             )
             return total

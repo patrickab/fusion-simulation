@@ -24,6 +24,7 @@ import numpy as np
 # 7 min dev / 1.5 h full training runs.
 KPI_POINTS_PER_CONFIG = 8_192  # |R_GS| sample points per reactor config
 KPI_EVAL_CONFIGS = 200  # reactor configs per evaluation
+NEURAL_CORRECTOR_DIR = "neural_corrector"
 
 
 @functools.lru_cache(maxsize=1)

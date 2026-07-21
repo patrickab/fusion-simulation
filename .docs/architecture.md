@@ -73,7 +73,7 @@ Vite dev server proxies `/api` → `127.0.0.1:8010` (matches `run-webapp.sh`). B
 - **FluxPINN**: shared 10-scalar normalized input (r, z, r₀, a, κ, δ, p₀, F_axis, α, γ) and scalar ψ̂ output. `arch="mlp"` is the checkpoint-compatible Swish MLP; `arch="piratenet"` uses two encoded branches, gated residual blocks, and zero-initialized learned skip weights. Both can opt into random Fourier spatial features and Random Weight Factorization (`rwf`).
 - **Sampler**: Sobol quasi-random sequences for collocation points; 50% Sobol + 50% adaptive (focus on high-loss regions). Geometries resampled every 10 epochs.
 - **Trainer** (`network.py`): owns the model, sampler, optimizer/JIT state, `_Field` (single or composed psi), and the training loop (`train_epoch`, `train`, `lbfgs`). Reports progress solely through an optional `TrainingObserver` callback emitting `EpochMetrics`/`ValidationMetrics` (`src/lib/network_config.py`) and returns a `TrainingResult` — no Rich, Plotext, or filesystem imports.
-- **NetworkManager** (`network_manager.py`): facade composing a `Trainer` with `_MetricsManager` (Rich table/Plotext charts) and `_FileStorageManager` (run artifacts, including nested `stage2/`). Its `train()` subscribes a Trainer observer that feeds the Rich display, writes `metrics.json` incrementally, and forwards HPO callbacks (`validation_callback`, `metrics_row_sink`). Training stops after six validation rounds without a 1% improvement in rolling validation p50; whichever way training terminates, the best-validation parameters (tracked in memory during the loop) are restored and are what gets checkpointed. Retained runs contain `run.json` (commit, duration, device, seed, config, outcome and KPIs), column-oriented `metrics.json`, `network.flax`, and plots. Rich and `metrics.json` record validation p05/p50/p95; early stopping and pruning use p50.
+- **NetworkManager** (`network_manager.py`): facade composing a `Trainer` with `_MetricsManager` (Rich table/Plotext charts) and `_FileStorageManager` (run artifacts, including a foundation-owned `neural_corrector/`). Its `train()` subscribes a Trainer observer that feeds the Rich display, writes `metrics.json` incrementally, and forwards HPO callbacks (`validation_callback`, `metrics_row_sink`). Training stops after six validation rounds without a 1% improvement in rolling validation p50; whichever way training terminates, the best-validation parameters (tracked in memory during the loop) are restored and are what gets checkpointed. Retained runs contain `run.json` (commit, duration, device, seed, config, outcome and KPIs), column-oriented `metrics.json`, `network.flax`, and plots. Rich and `metrics.json` record validation p05/p50/p95; early stopping and pruning use p50.
 - **Optimizer**: AdamW with warmup cosine decay schedule.
 - **Replay**: `uv run python -m src.engine.network_manager --show <commit/run>` re-renders the Rich Training Metrics table from `metrics.json`.
 
@@ -106,10 +106,10 @@ Used by the Streamlit UI and referenced for fixed heatmap scales by the React fr
   (piped/nohup) automatically
   falls back to the plain Rich Live dashboard; all artifacts are identical either way.
   NetworkManager always tracks metrics/training_log now; Rich Live attaches only in CLI mode.
-  Corrector studies set `StudyConfig.stage1_run`; the frozen foundation is loaded once, its slug
-  and a self-contained checkpoint copy are stored at study level, and each trial records its
-  `stage2_scale` outside `HyperParams`. Shared checkpoint loading and HPO re-evaluation reconstruct
-  the composed field from both records and reject incomplete corrector metadata.
+   Corrector studies set `StudyConfig.foundation_path`; each retained trial is stored under
+   `<foundation>/neural_corrector/<study>/<trial>` and records its `corrector_scale` outside
+   `HyperParams`. The artifact path identifies the foundation, so no separate foundation metadata
+   or copied checkpoint is needed for loading and HPO re-evaluation.
 - **BoTorch** (legacy): Bayesian optimization via qMaxValueEntropy in normalized unit cube.
 
 The current foundation-model workflow is a resumable staged campaign (`scripts/run_piratenet_foundation_campaign.py`, specified by `docs/hpo/hpo-plan-piratenet.md`). It screens batch size and MSE versus Huber, selects PirateNet capacity, records parameter anchors, then runs clean broad and narrowed 600-epoch Optuna studies centered on peak LR `1e-4`. Campaign state and manual-run specs live under a dedicated HPO campaign directory; only objective-compatible observations are injected into the clean studies. Residual-corrector optimization is intentionally deferred until one foundation checkpoint is frozen.

@@ -376,6 +376,8 @@ def _fmt_int(value: object) -> str:
 
 
 def _loss_label(huber_delta: object) -> str:
+    if huber_delta is None:
+        return "MSE"
     try:
         delta = float(huber_delta)
     except (TypeError, ValueError):

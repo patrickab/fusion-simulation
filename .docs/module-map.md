@@ -11,7 +11,7 @@ src/
 │   └── schemas.py                # Pydantic request models (GeometryRequest, SampleRequest, ...)
 │
 ├── engine/
-│   ├── network.py              # MLP/PirateNet FluxPINN (+ Fourier/RWF), Sampler, patience stopping, Trainer (optimizer/JIT state, train loop, L-BFGS), frozen FoundationModel and composed stage-2 fields — no Rich/Plotext/filesystem imports
+│   ├── network.py              # MLP/PirateNet FluxPINN (+ Fourier/RWF), Sampler, patience stopping, Trainer (optimizer/JIT state, train loop, L-BFGS), frozen FoundationModel and composed neural-corrector fields — no Rich/Plotext/filesystem imports
 │   ├── network_manager.py      # NetworkManager facade: composes a Trainer with Rich/Plotext live display, run-dir/checkpoint/metrics.json persistence, and the training CLI (`python -m src.engine.network_manager`)
 │   ├── residual_correction.py  # Corrector CLI + shared plain/nested/HPO checkpoint loading → composed NetworkManager. No parallel manager classes.
 │   ├── physics.py              # GS operator, loss functions, B-field computation via AD
@@ -113,7 +113,7 @@ data_legacy/                                   # Ignored pre-consolidation artif
 | `FluxPINN` | network.py | Checkpoint-compatible MLP or PirateNet architecture, optionally Fourier-encoded/RWF |
 | `Trainer` | network.py | Model/sampler/optimizer/JIT state + training loop; reports via an optional `TrainingObserver` callback, no Rich/filesystem imports |
 | `NetworkManager` | network_manager.py | Training/inference/artifact facade composing a Trainer; accepts an optional `FoundationModel` prior for correction |
-| `FoundationModel` | network.py | Frozen dataclass: converged FluxPINN + params; used as prior for residual-correction stage 2 |
+| `FoundationModel` | network.py | Frozen dataclass: converged FluxPINN + params; used as prior for neural correction |
 | HPO configs | optimize_network_optuna.py | `SearchSpaceConfig` owns model axes; `StudyConfig` owns orchestration and checkpoint policy |
 | Pydantic req models | `src/api/schemas.py` | Geometry, sampling, grids, field lines, artifact actions and benchmark requests |
 | API response interfaces | `frontend/src/api.ts` | Samples, grids, model stack, geometry, field lines and benchmark SSE contracts |

@@ -1,6 +1,5 @@
 """FastAPI layer wrapping the existing src/ physics + network code for the React frontend."""
 
-import json
 import shutil
 
 from fastapi import FastAPI, HTTPException
@@ -18,7 +17,8 @@ from src.api.schemas import (
     RenameRequest,
     SampleRequest,
 )
-from src.lib.config import Filepaths
+from src.engine.residual_correction import corrector_foundation_dir
+from src.lib.config import NEURAL_CORRECTOR_DIR, Filepaths
 from src.lib.geometry_config import ToroidalCoilConfig
 from src.lib.run_artifacts import load_config, load_kpis, load_run
 from src.streamlit.network_utils import (
@@ -108,27 +108,24 @@ def network_config(name: str) -> dict:
 
 @app.get("/api/network/{name:path}/models")
 def network_models(name: str) -> dict:
-    """Describe the foundation and optional stage-2 corrector for a run."""
+    """Describe the foundation and optional neural corrector for a run."""
     try:
         run_dir = resolve_run_directory(name)
     except FileNotFoundError:
         raise HTTPException(404, f"Run dir not found: {name}") from None
 
-    corrector_dir = run_dir / "stage2"
+    corrector_dir = run_dir / NEURAL_CORRECTOR_DIR
     corrector = None
     if (corrector_dir / "network.flax").exists():
-        scale = load_run(corrector_dir).get("result", {}).get("stage2_scale", 1.0)
-        corrector = {"name": f"{name}/stage2", "scale": scale}
+        scale = load_run(corrector_dir).get("result", {}).get("corrector_scale", 1.0)
+        corrector = {"name": f"{name}/{NEURAL_CORRECTOR_DIR}", "scale": scale}
         foundation_name = name
+    elif foundation_dir := corrector_foundation_dir(run_dir):
+        scale = load_run(run_dir).get("result", {}).get("corrector_scale", 1.0)
+        foundation_name = foundation_dir.name
+        corrector = {"name": name, "scale": scale}
     else:
-        foundation_path = run_dir.parent / "foundation.json"
-        run = load_run(run_dir)
-        scale = run.get("result", {}).get("stage2_scale")
-        if foundation_path.exists() and scale is not None:
-            foundation_name = json.loads(foundation_path.read_text())["stage1_run"]
-            corrector = {"name": name, "scale": scale}
-        else:
-            foundation_name = name
+        foundation_name = name
     return {"foundation": {"name": foundation_name}, "corrector": corrector}
 
 
@@ -141,7 +138,8 @@ def network_kpis(name: str) -> dict:
         raise HTTPException(404, f"Run dir not found: {name}") from None
     # Prefer the composed-field KPIs when a corrector exists, so the reported
     # metrics match the field get_manager() renders for this run.
-    artifact_dir = run_dir / "stage2" if (run_dir / "stage2" / "network.flax").exists() else run_dir
+    corrector_dir = run_dir / NEURAL_CORRECTOR_DIR
+    artifact_dir = corrector_dir if (corrector_dir / "network.flax").exists() else run_dir
     kpis = load_kpis(artifact_dir)
     if not kpis:
         raise HTTPException(404, f"No KPIs stored for {name}")

@@ -34,10 +34,10 @@ from src.engine.network import (
     Sampler,
     Trainer,
 )
-from src.lib.config import Filepaths, current_commit
+from src.lib.config import NEURAL_CORRECTOR_DIR, Filepaths, current_commit
 from src.lib.geometry_config import PlasmaConfig
 from src.lib.logger import get_logger
-from src.lib.network_config import EpochMetrics, HyperParams
+from src.lib.network_config import Architecture, EpochMetrics, HyperParams
 from src.lib.run_artifacts import format_duration, gpu_name, kpi_values, load_run, write_json
 
 console = Console()
@@ -431,16 +431,16 @@ class _FileStorageManager:
         name: str,
         output_dir: Path | None,
         *,
-        stage1_run_dir: Path | None = None,
+        foundation_dir: Path | None = None,
     ) -> None:
         self.name = name
         self.output_dir = output_dir
-        self._stage1_run_dir = stage1_run_dir
+        self._foundation_dir = foundation_dir
         self.artifact_stem: str | None = None
 
     def new_artifact_stem(self) -> str:
-        if self._stage1_run_dir is not None:
-            return f"{self._stage1_run_dir.name}/stage2"
+        if self._foundation_dir is not None:
+            return f"{self._foundation_dir.name}/{NEURAL_CORRECTOR_DIR}"
         timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
         if self.output_dir:
             return f"pinn_{timestamp}"
@@ -449,8 +449,8 @@ class _FileStorageManager:
     def run_dir(self) -> Path:
         if self.artifact_stem is None:
             self.artifact_stem = self.new_artifact_stem()
-        if self._stage1_run_dir is not None:
-            return self._stage1_run_dir / "stage2"
+        if self._foundation_dir is not None:
+            return self._foundation_dir / NEURAL_CORRECTOR_DIR
         base = self.output_dir or Filepaths.BENCHMARKS
         return base / self.artifact_stem
 
@@ -589,7 +589,7 @@ class NetworkManager:
         *,
         prior: FoundationModel | None = None,
         scale: float = 1.0,
-        stage1_run_dir: Path | None = None,
+        foundation_dir: Path | None = None,
     ) -> None:
         self.seed = seed
         self.test_mode = test_mode
@@ -603,14 +603,14 @@ class NetworkManager:
             config, seed=seed, n_validation_size=n_validation_size, prior=prior, scale=scale
         )
 
-        if stage1_run_dir is not None and prior is None:
-            raise ValueError("stage1_run_dir is only valid for a corrector")
+        if foundation_dir is not None and prior is None:
+            raise ValueError("foundation_dir is only valid for a corrector")
         self._prior = prior
         self._scale = scale
         self._files = _FileStorageManager(
             name=name,
             output_dir=output_dir,
-            stage1_run_dir=stage1_run_dir,
+            foundation_dir=foundation_dir,
         )
 
         self.training_log: list[dict] = []
@@ -706,8 +706,8 @@ class NetworkManager:
     def to_disk(self) -> str:
         """Save params, consolidated run data, metrics, and benchmark plots.
 
-        Correctors configured with ``stage1_run_dir`` are nested under
-        ``<stage1_run_dir>/stage2/`` and record their scale in ``run.json``.
+        Correctors configured with ``foundation_dir`` are nested under
+        ``<foundation_dir>/neural_corrector/`` and record their scale in ``run.json``.
         """
         if self._files.artifact_stem is None:
             self._files.artifact_stem = self._files.new_artifact_stem()
@@ -731,7 +731,7 @@ class NetworkManager:
             "kpis": kpis,
         }
         if self._prior is not None:
-            result["stage2_scale"] = self._scale
+            result["corrector_scale"] = self._scale
         self._files.write_run(
             run_dir,
             self,
@@ -1005,8 +1005,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--huber-delta",
         type=float,
-        default=1.0,
-        help="PDE loss: >0 = Huber with this delta (default 1.0), 0.0 = MSE",
+        default=None,
+        help="PDE loss: float = Huber with this delta, unset = MSE",
     )
     parser.add_argument(
         "--weight-flux-scale",
@@ -1033,8 +1033,9 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--arch",
-        choices=["mlp", "piratenet"],
-        default="mlp",
+        type=Architecture,
+        choices=list(Architecture),
+        default=Architecture.mlp,
         help="Network architecture: 'mlp' = plain MLP (default), 'piratenet' = PirateNet "
         "residual blocks (arXiv 2402.00326)",
     )
