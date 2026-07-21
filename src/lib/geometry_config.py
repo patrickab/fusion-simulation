@@ -83,6 +83,7 @@ class PlasmaBoundary(BaseModel):
     theta: jnp.ndarray  # Poloidal angles (rad)
     dR_dtheta: jnp.ndarray  # dR/dtheta (m/rad)
     dZ_dtheta: jnp.ndarray  # dZ/dtheta (m/rad)
+    radius_fourier_coeffs: jnp.ndarray  # Smooth boundary-radius fit coefficients
     R_center: float  # Magnetic axis R (m)
     Z_center: float  # Magnetic axis Z (m)
 

@@ -1,23 +1,36 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import {
   api,
   invalidate,
+  kpiEntries,
+  parseArtifactSlug,
   useApi,
   useDebounced,
-  type BFieldResponse,
+  type FieldLinesResponse,
   type GeometryResponse,
   type Grid2D,
+  type HpoStudies,
+  type NetworkModels,
   type SampleResponse,
 } from '../api'
 import { useStore } from '../store'
-import { GridHeatmap, SampleScatter, type Range2 } from '../plots'
+import {
+  DEFAULT_RESIDUAL_RANGE,
+  FLUX_COLORBAR,
+  GridHeatmap,
+  SampleScatter,
+  minMaxGridValues,
+  type Range2,
+} from '../plots'
 import { Scene } from '../three/Scene'
 import { FieldLines, PlasmaWireframe } from '../three/Reactor3D'
 import { plasmaGradient } from '../three/colormap'
 import { Colorbar, JsonBlock, Panel, Popover, Section, Segmented, Slider, Spinner, Stat } from '../ui'
 
-const VIEW_MODES = ['New Benchmarks', 'Archive', 'All'] as const
-const MODE_LABELS = { 'New Benchmarks': 'New', Archive: 'Archive', All: 'All' } as const
+const VIEW_MODES = ['Single-Configs', 'HPO runs', 'Archive'] as const
+const ARCHIVE_MODES = ['Single-Configs', 'HPO runs'] as const
+const MODE_LABELS = { 'Single-Configs': 'Single', 'HPO runs': 'HPO', Archive: 'Archive' } as const
+const ARCHIVE_LABELS = { 'Single-Configs': 'Single', 'HPO runs': 'HPO' } as const
 const TABS = ['sampling', 'flux', 'residual', 'topology'] as const
 type Tab = (typeof TABS)[number]
 const TAB_LABELS: Record<Tab, string> = {
@@ -27,55 +40,83 @@ const TAB_LABELS: Record<Tab, string> = {
   topology: '3D topology',
 }
 
-const fmtExp = (v: number) => v.toExponential(2)
-const short = (name: string) => name.replace(/\.flax$/, '')
-
 export function NetworkView() {
-  const [viewMode, setViewMode] = useState<(typeof VIEW_MODES)[number]>('New Benchmarks')
+  const [viewMode, setViewMode] = useState<(typeof VIEW_MODES)[number]>('Single-Configs')
+  const [archiveMode, setArchiveMode] = useState<(typeof ARCHIVE_MODES)[number]>('Single-Configs')
   const [bump, setBump] = useState(0)
   const network = useStore((s) => s.network)
   const setNetwork = useStore((s) => s.setNetwork)
+  const [study, setStudy] = useState('')
   const [tab, setTab] = useState<Tab>('sampling')
   const [seed, setSeed] = useState(0)
   const [sampleSize, setSampleSize] = useState(4)
+  const [resolution, setResolution] = useState(50)
   const [nLines, setNLines] = useState(50)
 
-  const networks = useApi<string[]>(`networks:${viewMode}:${bump}`, () => api.networks(viewMode))
+  const singleConfigs = viewMode === 'Single-Configs' || (viewMode === 'Archive' && archiveMode === 'Single-Configs')
+  const hpo = viewMode === 'HPO runs' || (viewMode === 'Archive' && archiveMode === 'HPO runs')
+  const archived = viewMode === 'Archive'
+  const networks = useApi<string[]>(
+    singleConfigs ? `networks:${archived ? 'Archive' : 'Single-Configs'}:${bump}` : null,
+    () => api.networks(archived ? 'Archive' : 'Single-Configs'),
+  )
+  const hpoStudies = useApi<HpoStudies>(hpo ? `hpo:${archived}:${bump}` : null, () => api.hpoStudies(archived))
+  const studies = Object.keys(hpoStudies.data ?? {})
+  const trialRuns = study ? (hpoStudies.data?.[study] ?? []) : []
+  const hpoNetwork = study && network?.startsWith(`hpo/${study}/`) ? network : null
+  const actionTarget = hpo ? (hpoNetwork ?? (study ? `hpo/${study}` : null)) : network
 
   useEffect(() => {
+    if (!singleConfigs) return
     const list = networks.data
     if (list && (!network || !list.includes(network))) setNetwork(list[0] ?? null)
-  }, [networks.data, network, setNetwork])
+  }, [singleConfigs, networks.data, network, setNetwork])
+  useEffect(() => {
+    if (hpo && !studies.includes(study)) setStudy(studies[0] ?? '')
+  }, [hpo, studies, study])
+  useEffect(() => {
+    if (!hpo) return
+    const next = study && trialRuns[0] ? `hpo/${study}/${trialRuns[0]}` : null
+    const currentRun = hpoNetwork?.split('/')[2]
+    if ((!currentRun || !trialRuns.includes(currentRun)) && network !== next) setNetwork(next)
+  }, [hpo, study, trialRuns, hpoNetwork, network, setNetwork])
 
   const dSeed = useDebounced(seed, 400)
   const dLines = useDebounced(nLines, 400)
   const sampleKey = network ? `sample:${network}:${dSeed}:${sampleSize}` : null
   const sample = useApi<SampleResponse>(sampleKey, () => api.sample(network!, dSeed, sampleSize))
-  const config = useApi<Record<string, unknown>>(network ? `config:${network}` : null, () => api.config(network!))
+  const config = useApi<Record<string, unknown>>(network ? `config:${network}` : null, () => api.config_file(network!))
+  const models = useApi<NetworkModels>(network ? `models:${network}` : null, () => api.models(network!))
 
   const refresh = () => {
     invalidate()
     setBump((b) => b + 1)
   }
   const doArchive = async () => {
-    if (!network) return
-    await api.archive(network)
+    if (!actionTarget) return
+    await api.archive(actionTarget)
     setNetwork(null)
+    setStudy('')
     refresh()
   }
   const doRename = async () => {
-    if (!network) return
-    // ponytail: native prompt; inline editor if it ever grates
-    const newName = window.prompt('New name (without extension):', short(network))
+    if (!actionTarget) return
+    const slug = hpo ? study : actionTarget
+    const current = parseArtifactSlug(slug)?.name
+    if (!current) return
+    // ponytail: native prompt is the smallest editor with a prefilled current name.
+    const newName = window.prompt('New name:', current)
     if (!newName) return
-    const r = await api.rename(network, newName)
+    const r = await api.rename(actionTarget, newName)
     setNetwork(r.name)
+    if (hpo) setStudy(r.name.split('/')[1])
     refresh()
   }
-  const doDelete = async () => {
-    if (!network || !window.confirm(`Delete ${short(network)}?`)) return
-    await api.remove(network)
+  const doDelete = async (target: string, label: string) => {
+    if (!window.confirm(`Delete ${label}?`)) return
+    await api.remove(target)
     setNetwork(null)
+    if (target === `hpo/${study}`) setStudy('')
     refresh()
   }
 
@@ -86,30 +127,74 @@ export function NetworkView() {
           <div className="ctl">
             <Segmented options={VIEW_MODES} value={viewMode} onChange={setViewMode} labels={MODE_LABELS} small />
           </div>
-          <div className="row">
-            <select className="select" value={network ?? ''} onChange={(e) => setNetwork(e.target.value)}>
-              {(networks.data ?? []).map((n) => (
-                <option key={n} value={n}>
-                  {short(n)}
-                </option>
-              ))}
-            </select>
-            <Popover label="⋯" buttonClassName="pop-btn icon" align="right">
-              {(close) => (
-                <>
-                  <button onClick={() => { close(); void doArchive() }}>Archive</button>
-                  <button onClick={() => { close(); void doRename() }}>Rename…</button>
-                  <button className="danger" onClick={() => { close(); void doDelete() }}>
-                    Delete
-                  </button>
-                </>
-              )}
-            </Popover>
-          </div>
+          {viewMode === 'Archive' && (
+            <div className="ctl">
+              <Segmented options={ARCHIVE_MODES} value={archiveMode} onChange={setArchiveMode} labels={ARCHIVE_LABELS} small />
+            </div>
+          )}
+          {singleConfigs ? (
+            <div className="row">
+              <select className="select" value={network ?? ''} onChange={(e) => setNetwork(e.target.value)}>
+                {(networks.data ?? []).map((slug) => <option key={slug} value={slug}>{slug}</option>)}
+              </select>
+              <Actions
+                archived={archived}
+                hpo={false}
+                target={network}
+                onArchive={doArchive}
+                onRename={doRename}
+                onDelete={doDelete}
+              />
+            </div>
+          ) : (
+            <>
+              <label className="ctl">
+                <span className="ctl-row"><span>HPO study</span></span>
+                <select className="select" value={study} onChange={(e) => setStudy(e.target.value)}>
+                  {studies.map((slug) => <option key={slug} value={slug}>{slug}</option>)}
+                </select>
+              </label>
+              <div className="row">
+                <select className="select" value={hpoNetwork?.split('/')[2] ?? ''} disabled={!study || trialRuns.length === 0} onChange={(e) => setNetwork(`hpo/${study}/${e.target.value}`)}>
+                  {trialRuns.length === 0 ? <option>No retained trials</option> : trialRuns.map((run) => <option key={run} value={run}>{run}</option>)}
+                </select>
+                <Actions
+                  archived={archived}
+                  hpo
+                  target={actionTarget}
+                  network={hpoNetwork}
+                  study={study}
+                  onArchive={doArchive}
+                  onRename={doRename}
+                  onDelete={doDelete}
+                />
+              </div>
+            </>
+          )}
         </Section>
         {config.data && (
           <Section title="Training config">
             <JsonBlock obj={config.data} />
+          </Section>
+        )}
+        {models.data && (
+          <Section title="Models">
+            <div className="model-list">
+              <div className="model-row">
+                <span className="model-role">Foundation model</span>
+                <span className="mono model-name">{models.data.foundation.name}</span>
+              </div>
+              <div className="model-row">
+                <span className="model-role">Corrector</span>
+                {models.data.corrector ? (
+                  <span className="mono model-name">
+                    {models.data.corrector.name} <span className="model-detail">scale {models.data.corrector.scale}</span>
+                  </span>
+                ) : (
+                  <span className="model-detail">Not available</span>
+                )}
+              </div>
+            </div>
           </Section>
         )}
         <Section title="Sampling">
@@ -119,7 +204,7 @@ export function NetworkView() {
               <span>Sample size</span>
             </span>
             <select className="select" value={sampleSize} onChange={(e) => setSampleSize(Number(e.target.value))}>
-              {[1, 2, 4, 6, 8].map((n) => (
+              {[1, 2, 4, 8].map((n) => (
                 <option key={n} value={n}>
                   {n}
                 </option>
@@ -127,6 +212,9 @@ export function NetworkView() {
             </select>
           </label>
           {tab === 'topology' && <Slider label="Field lines" value={nLines} min={1} max={50} onChange={setNLines} />}
+          {(tab === 'flux' || tab === 'residual') && (
+            <Slider label="Resolution" value={resolution} min={50} max={600} step={50} onChange={setResolution} />
+          )}
         </Section>
       </Panel>
       <div className="view-main">
@@ -142,9 +230,11 @@ export function NetworkView() {
         ) : (
           <>
             {tab === 'sampling' && <SamplingTab sample={sample} />}
-            {tab === 'flux' && <GridTab kind="flux" network={network} seed={dSeed} sampleSize={sampleSize} sample={sample} />}
+            {tab === 'flux' && (
+              <GridTab kind="flux" network={network} seed={dSeed} sampleSize={sampleSize} resolution={resolution} />
+            )}
             {tab === 'residual' && (
-              <GridTab kind="residual" network={network} seed={dSeed} sampleSize={sampleSize} sample={sample} />
+              <GridTab kind="residual" network={network} seed={dSeed} sampleSize={sampleSize} resolution={resolution} />
             )}
             {tab === 'topology' && (
               <TopologyTab network={network} seed={dSeed} sampleSize={sampleSize} nLines={dLines} sample={sample} />
@@ -156,10 +246,47 @@ export function NetworkView() {
   )
 }
 
+function Actions({
+  archived,
+  hpo,
+  target,
+  network,
+  study,
+  onArchive,
+  onRename,
+  onDelete,
+}: {
+  archived: boolean
+  hpo: boolean
+  target: string | null
+  network?: string | null
+  study?: string
+  onArchive: () => Promise<void>
+  onRename: () => Promise<void>
+  onDelete: (target: string, label: string) => Promise<void>
+}) {
+  if (!target) return null
+  return (
+    <Popover label="⋯" buttonClassName="pop-btn icon" align="right">
+      {(close) => (
+        <>
+          {!archived && <button onClick={() => { close(); void onArchive() }}>{hpo ? 'Archive study' : 'Archive'}</button>}
+          {!archived && <button onClick={() => { close(); void onRename() }}>{hpo ? 'Rename study…' : 'Rename…'}</button>}
+          {hpo && network && <button className="danger" onClick={() => { close(); void onDelete(network, 'network') }}>Delete network</button>}
+          <button className="danger" onClick={() => { close(); void onDelete(hpo ? `hpo/${study}` : target, hpo ? 'HPO study' : 'network') }}>
+            {hpo ? 'Delete study' : 'Delete'}
+          </button>
+        </>
+      )}
+    </Popover>
+  )
+}
+
 function SamplingTab({ sample }: { sample: ReturnType<typeof useApi<SampleResponse>> }) {
-  let xr: Range2 | undefined
-  let yr: Range2 | undefined
-  if (sample.data) {
+  // memoized so the ranges keep their identity across re-renders — fresh arrays
+  // every render would defeat SampleScatter's memo
+  const { xr, yr } = useMemo((): { xr?: Range2; yr?: Range2 } => {
+    if (!sample.data) return {}
     let rMin = Infinity
     let rMax = -Infinity
     let zMin = Infinity
@@ -175,9 +302,8 @@ function SamplingTab({ sample }: { sample: ReturnType<typeof useApi<SampleRespon
       }
     }
     const pad = 0.06 * Math.max(rMax - rMin, zMax - zMin)
-    xr = [rMin - pad, rMax + pad]
-    yr = [zMin - pad, zMax + pad]
-  }
+    return { xr: [rMin - pad, rMax + pad], yr: [zMin - pad, zMax + pad] }
+  }, [sample.data])
   return (
     <div className="scroll" style={{ position: 'relative' }}>
       {sample.loading && <Spinner />}
@@ -200,16 +326,15 @@ function SamplingTab({ sample }: { sample: ReturnType<typeof useApi<SampleRespon
   )
 }
 
-function KpiStats({ sample }: { sample: ReturnType<typeof useApi<SampleResponse>> }) {
-  if (!sample.data) return null
-  const m = sample.data.metrics
+/** Post-training KPIs from the run.json result; nothing recomputed. */
+function KpiStats({ network }: { network: string }) {
+  const kpis = useApi(`kpis:${network}`, () => api.kpis(network))
+  if (!kpis.data) return null
   return (
     <div className="stats">
-      <Stat label="avg loss" value={fmtExp(m.avg_loss)} />
-      <Stat label="interior" value={fmtExp(m.interior_loss)} />
-      <Stat label="boundary" value={fmtExp(m.boundary_loss)} />
-      <Stat label="max loss" value={fmtExp(m.max_loss)} />
-      <Stat label="max residual" value={fmtExp(m.max_residual)} />
+      {kpiEntries(kpis.data).map(([key, value]) => (
+        <Stat key={key} label={key.replaceAll('_', ' ')} value={value.toExponential(2)} />
+      ))}
     </div>
   )
 }
@@ -219,52 +344,57 @@ function GridTab({
   network,
   seed,
   sampleSize,
-  sample,
+  resolution,
 }: {
   kind: 'flux' | 'residual'
   network: string
   seed: number
   sampleSize: number
-  sample: ReturnType<typeof useApi<SampleResponse>>
+  resolution: number
 }) {
-  const resolution = 100
-  const grids = useApi<Grid2D[]>(`${kind}:${network}:${seed}:${sampleSize}:${resolution}`, () =>
-    api[kind](network, seed, sampleSize, resolution),
+  const dResolution = useDebounced(resolution, 400)
+  const cfg = useApi('config', api.config)
+  const residualRange = cfg.data?.residual_color_range ?? DEFAULT_RESIDUAL_RANGE
+  const grids = useApi<Grid2D[]>(
+    `${kind}:${network}:${seed}:${sampleSize}:${dResolution}`,
+    () => api.grid(network, kind, seed, sampleSize, dResolution),
   )
-
-  // ponytail: fixed scales matched to the legacy plot_flux_heatmap/plot_gs_residual_heatmap
-  // (src/lib/visualization.py) — same absolute zmin/zmax across samples, not per-batch min/max
-  const { zmin, zmax } = kind === 'residual' ? { zmin: -0.5, zmax: 0.5 } : { zmin: 0, zmax: 90 }
-
-  let xr: Range2 | undefined
-  let yr: Range2 | undefined
-  if (grids.data?.length) {
-    const { R, Z } = grids.data[0] // all grids share one linspace
-    xr = [R[0], R[R.length - 1]]
-    yr = [Z[0], Z[Z.length - 1]]
-  }
+  const zRange: Range2 | undefined = grids.data?.length
+    ? minMaxGridValues(grids.data)
+    : undefined
 
   return (
     <div className="scroll" style={{ position: 'relative' }}>
-      {grids.loading && <Spinner />}
       {grids.error && <div className="error">{grids.error}</div>}
-      <KpiStats sample={sample} />
+      <KpiStats network={network} />
       <div className="grid">
-        {(grids.data ?? []).map((g, i) => (
-          <div className="card" key={i}>
-            <div className="caption">sample {i}</div>
-            <GridHeatmap
-              grid={g}
-              colorscale={kind === 'residual' ? 'RdBu' : 'Viridis'}
-              reversescale={kind === 'residual'}
-              zmin={zmin}
-              zmax={zmax}
-              xr={xr}
-              yr={yr}
-            />
-          </div>
-        ))}
+        {grids.loading
+          ? Array.from({ length: sampleSize }, (_, i) => (
+              <div className="card" key={i}>
+                <div className="caption">sample {i}</div>
+                <div className="plot-square">
+                  <Spinner center />
+                </div>
+              </div>
+            ))
+          : (grids.data ?? []).map((g, i) => (
+              <div className="card" key={i}>
+                <div className="caption">sample {i}</div>
+                <GridHeatmap
+                  grid={g}
+                  quantity={kind}
+                  zRange={zRange}
+                  residualRange={residualRange}
+                />
+              </div>
+            ))}
       </div>
+      {kind === 'flux' && zRange && (
+        <Colorbar title="ψ" gradient={FLUX_COLORBAR} range={zRange} unit="Wb" />
+      )}
+      {kind === 'residual' && (
+        <Colorbar title="|R_GS|" gradient={plasmaGradient} range={residualRange} />
+      )}
     </div>
   )
 }
@@ -282,29 +412,28 @@ function TopologyTab({
   nLines: number
   sample: ReturnType<typeof useApi<SampleResponse>>
 }) {
-  const field = useApi<BFieldResponse>(`bfield:${network}:${seed}:${sampleSize}:${nLines}`, () =>
-    api.bfield(network, seed, sampleSize, nLines),
+  const field = useApi<FieldLinesResponse>(`fieldlines:${network}:${seed}:${sampleSize}:${nLines}`, () =>
+    api.fieldlines(network, seed, sampleSize, nLines),
   )
   const geom = sample.data?.geom3d
   const geo = useApi<GeometryResponse>(geom ? `geo3d:${JSON.stringify(geom)}` : null, () =>
     api.geometry({ ...geom!, show_coils: false, mesh_stride: 2 }),
   )
 
-  const [bRange, setBRange] = useState<[number, number]>([0, 1])
   const loading = field.loading || geo.loading || sample.loading
   const error = field.error ?? geo.error ?? sample.error
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
-      <KpiStats sample={sample} />
+      <KpiStats network={network} />
       <div className="canvas-wrap">
         {loading && <Spinner />}
         {error && <div className="error">{error}</div>}
         <Scene radius={geom ? (geom.R0 + geom.a) * 2.4 : 22}>
           {geo.data && <PlasmaWireframe surf={geo.data.plasma3d} opacity={0.3} />}
-          {field.data && <FieldLines field={field.data} onRange={setBRange} />}
+          {field.data && <FieldLines field={field.data} />}
         </Scene>
       </div>
-      {field.data && <Colorbar title="|B| (field magnitude)" gradient={plasmaGradient} range={bRange} unit="T" />}
+      {field.data && <Colorbar title="|B| (field magnitude)" gradient={plasmaGradient} range={field.data.b_range} unit="T" />}
     </div>
   )
 }

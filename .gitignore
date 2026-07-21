@@ -1,6 +1,7 @@
-data
+data_legacy
 *__pycache__*
 .aider*
+.data
 .cache*
 .notes*
 .gemini*

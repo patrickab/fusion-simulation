@@ -7,8 +7,24 @@ import optax
 
 from src.lib.geometry_config import PlasmaConfig
 
+# TF32 matmuls (Ampere f32 default) put a ~1e-2 starburst noise floor in |R_GS|:
+# the GS operator's second derivatives amplify boundary-Fourier-fit harmonic m
+# by ~m². Full f32 reproduces the CPU field exactly (measured 2026-07-17, RTX 3060).
+jax.config.update("jax_default_matmul_precision", "highest")
+
 MU_0 = 4 * jnp.pi * 1e-7
 PSI_EDGE = 0.0  # Poloidal flux at plasma boundary
+
+
+def estimate_psi_axis(psi: jnp.ndarray) -> jnp.ndarray:
+    """Magnetic-axis flux: mean of the top-|ψ| collocation samples (signed).
+
+    Sign-agnostic so both ψ>0-at-axis (hard-BC envelope) and ψ<0-at-axis
+    (legacy soft-BC) conventions pick the true extremum, not the edge at ψ≈0.
+    """
+    n_axis = max(1, psi.shape[0] // 20)
+    idx = jnp.argsort(jnp.abs(psi))[-n_axis:]
+    return jax.lax.stop_gradient(jnp.mean(psi[idx]))
 
 
 PsiFn = Callable[[any, jnp.ndarray, jnp.ndarray, PlasmaConfig], jnp.ndarray]
@@ -19,6 +35,7 @@ def toroidal_field_flux_function(
     psi_axis: float,
     F_axis: float,
     exponent: float = 1.0,
+    flux_scale: float = 1.0,
 ) -> jnp.ndarray:
     """Compute the toroidal field flux function F(ψ) = R B_φ.
 
@@ -36,13 +53,23 @@ def toroidal_field_flux_function(
         psi_edge: Flux at the plasma boundary.
         F_axis: Value of F at the magnetic axis (R * B_phi).
         exponent: Profile shape parameter (1.0 = linear).
+        flux_scale: Characteristic flux magnitude for this config (F_axis * a),
+            used to floor the clamp below relative to the config's own scale.
 
     Returns:
         Calculated F(ψ) values.
     """
-    # Ensure numerical stability: clamp depth to 1.0 to prevent gradient explosion
-    # Use abs() to handle initial random weights where psi_axis > PSI_EDGE
-    flux_depth = jnp.maximum(jnp.abs(PSI_EDGE - psi_axis), 1.0)
+    # Signed flux depth: psi_norm must run 0→1 from axis to edge, which
+    # requires dividing by (psi_edge - psi_axis) with its sign intact.
+    # The magnitude floor prevents division by ~0 during early training
+    # (random weights); sign is preserved so the profile direction is
+    # correct for either ψ convention (ψ>0 axis or ψ<0 axis).
+    raw_depth = PSI_EDGE - psi_axis
+    flux_depth = jnp.where(
+        raw_depth >= 0,
+        jnp.maximum(raw_depth, 1e-3 * jnp.abs(flux_scale)),
+        jnp.minimum(raw_depth, -1e-3 * jnp.abs(flux_scale)),
+    )
 
     psi_norm = (psi - psi_axis) / flux_depth
     # Use softplus for C-infinity continuity (smooth gradients for Shafranov operator)
@@ -56,6 +83,7 @@ def pressure_profile(
     psi_axis: float,
     p0: float,
     alpha: float = 1.0,
+    flux_scale: float = 1.0,
 ) -> jnp.ndarray:
     """Pressure profile: p(ψ).
 
@@ -66,12 +94,19 @@ def pressure_profile(
         psi_axis: Flux at the magnetic axis.
         p0: Pressure at the magnetic axis.
         alpha: Profile shape parameter.
+        flux_scale: Characteristic flux magnitude for this config (F_axis * a),
+            used to floor the clamp below relative to the config's own scale.
 
     Returns:
         Calculated pressure p(ψ).
     """
-    # Ensure numerical stability: clamp depth to 1.0 to prevent gradient explosion
-    flux_depth = jnp.maximum(jnp.abs(PSI_EDGE - psi_axis), 1.0)
+    # Signed flux depth: see toroidal_field_flux_function for rationale.
+    raw_depth = PSI_EDGE - psi_axis
+    flux_depth = jnp.where(
+        raw_depth >= 0,
+        jnp.maximum(raw_depth, 1e-3 * jnp.abs(flux_scale)),
+        jnp.minimum(raw_depth, -1e-3 * jnp.abs(flux_scale)),
+    )
 
     psi_norm = (psi - psi_axis) / flux_depth
     # Use softplus for C-infinity continuity
@@ -100,6 +135,8 @@ def _second_derivative(
     return jax.jvp(d_fn, (x,), (jnp.ones_like(x),))[1]
 
 
+# Rematerialize the high-order PDE graph while retaining its primal flux for profile losses.
+@partial(jax.checkpoint, static_argnums=0)
 def shafranov_operator_and_psi(
     psi_fn: Callable,
     params: any,
@@ -111,10 +148,8 @@ def shafranov_operator_and_psi(
 
     Δ*ψ = ∂²ψ/∂R² - (1/R)(∂ψ/∂R) + ∂²ψ/∂Z²
 
-    Note: Uses nested jax.jvp to compute diagonal elements of Hessian (d²ψ/dR², d²ψ/dZ²).
-          Avoids memory allocation and unused cross-derivatives, minimizing VRAM usage.
-
-          Measured speedup: 1.31x
+    The nested R pass returns the primal, first, and second terms together,
+    avoiding a separate network traversal for dpsi/dR.
     """
     R_stable = R + 1e-8
 
@@ -122,21 +157,48 @@ def shafranov_operator_and_psi(
     psi_along_R = lambda r: psi_fn(params, r, Z, *args)  # noqa
     psi_along_Z = lambda z: psi_fn(params, R_stable, z, *args)  # noqa
 
-    # returns (primal, first_derivative) in one pas
-    psi, dpsi_dR = jax.jvp(psi_along_R, (R_stable,), (jnp.ones_like(R_stable),))
-
-    # Diagonal second derivative without cross-derivatives
-    d2psi_dR2 = _second_derivative(psi_along_R, R_stable)
+    tangent_R = jnp.ones_like(R_stable)
+    first_order_R = lambda r: jax.jvp(psi_along_R, (r,), (tangent_R,))  # noqa
+    (psi, dpsi_dR), (_, d2psi_dR2) = jax.jvp(first_order_R, (R_stable,), (tangent_R,))
     d2psi_dZ2 = _second_derivative(psi_along_Z, Z)
 
     delta_star = d2psi_dR2 - (1.0 / R_stable) * dpsi_dR + d2psi_dZ2
     return delta_star, psi
 
 
-# Rematerialization trades compute for memory by recomputing activations during backprop.
-# In PINNs, high-order PDE residuals create massive graphs; remat keeps memory footprint
-# near-constant relative to depth, enabling larger networks and point batches.
-@partial(jax.checkpoint, static_argnums=0)
+def _grad_shafranov_residual_from_operator(
+    delta_star: jnp.ndarray,
+    psi: jnp.ndarray,
+    R: jnp.ndarray,
+    psi_axis: float,
+    config: PlasmaConfig,
+) -> jnp.ndarray:
+    flux_scale = config.State.F_axis * config.Geometry.a
+
+    dp_dpsi = jax.jvp(
+        lambda p: pressure_profile(
+            p, psi_axis, config.State.p0, config.State.pressure_alpha, flux_scale
+        ),
+        (psi,),
+        (jnp.ones_like(psi),),
+    )[1]
+
+    F_val, dF_dpsi = jax.jvp(
+        lambda p: toroidal_field_flux_function(
+            p, psi_axis, config.State.F_axis, config.State.field_exponent, flux_scale
+        ),
+        (psi,),
+        (jnp.ones_like(psi),),
+    )
+
+    rhs = -(MU_0 * R**2 * dp_dpsi) - (F_val * dF_dpsi)
+
+    # Normalize by magnetic pressure scale (B_toroidal^2)
+    # This handles high-field/low-beta regimes robustly
+    scale = (config.State.F_axis / config.Geometry.R0) ** 2 + 1.0
+    return (delta_star - rhs) / scale
+
+
 def grad_shafranov_residual(
     psi_fn: callable,
     params: any,
@@ -169,30 +231,10 @@ def grad_shafranov_residual(
         The residual value (error) at the specified point.
     """
     delta_star, psi = shafranov_operator_and_psi(psi_fn, params, R, Z, config)
-
-    dp_dpsi = jax.jvp(
-        lambda p: pressure_profile(p, psi_axis, config.State.p0, config.State.pressure_alpha),
-        (psi,),
-        (jnp.ones_like(psi),),
-    )[1]
-
-    F_val, dF_dpsi = jax.jvp(
-        lambda p: toroidal_field_flux_function(
-            p, psi_axis, config.State.F_axis, config.State.field_exponent
-        ),
-        (psi,),
-        (jnp.ones_like(psi),),
-    )
-
-    rhs = -(MU_0 * R**2 * dp_dpsi) - (F_val * dF_dpsi)
-
-    # Normalize by magnetic pressure scale (B_toroidal^2)
-    # This handles high-field/low-beta regimes robustly
-    scale = (config.State.F_axis / config.Geometry.R0) ** 2 + 1.0
-    return (delta_star - rhs) / scale
+    return _grad_shafranov_residual_from_operator(delta_star, psi, R, psi_axis, config)
 
 
-@partial(jax.jit, static_argnums=(0,))
+@partial(jax.jit, static_argnums=(0,), static_argnames=("soft_bc",))
 def pinn_loss_function(
     psi_fn: callable,
     params: any,
@@ -200,53 +242,77 @@ def pinn_loss_function(
     Z_interior: jnp.ndarray,
     batch_config: PlasmaConfig,
     weight_boundary_condition: float,
+    huber_delta: float,
+    *,
+    weight_flux_scale: float = 1.0,
+    soft_bc: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Computes the total PINN loss: L_total = L_residual + w * L_boundary
+    """Computes the total PINN loss.
 
-    Uses a double-vectorization strategy.
-    Processes entire tensor batches of plasma configs in parallel.
-    Optimally saturates GPU throughput & allows automatic differentiation.
+    Hard-BC (default): L = L_residual + w_scale·L_flux_scale. Dirichlet BC is
+    structural via the envelope; the BC term is diagnostic-only.
 
-    Design Reasoning:
-    1. Outer Vmap: Iterates over the batch of different plasma configurations.
-    2. Inner Vmap: Iterates over the spatial samples (interior and boundary).
+    Soft-BC (``soft_bc=True``): legacy-style L = L_residual + w_scale·L_flux_scale
+    + w_bc·(L_dirichlet + L_neumann) on raw ψ without an envelope.
     """
 
     def single_config_loss(
         R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        # 1. Axis Estimation
-        psi_int = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R, Z)
-        psi_axis = jax.lax.stop_gradient(jnp.min(psi_int))
+    ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        # 1. Axis for PDE profiles: |ψ| extremum (stop-grad — discovery, not trainable).
+        delta_star, psi_int = jax.vmap(
+            lambda r, z: shafranov_operator_and_psi(psi_fn, params, r, z, config)
+        )(R, Z)
+        psi_axis = estimate_psi_axis(psi_int)
 
-        # 2. PDE Residual Loss
-        residual_fn = jax.vmap(
-            lambda r, z: grad_shafranov_residual(psi_fn, params, r, z, psi_axis, config)
+        # 2. Collapse guard: hinge on the interior-mean flux. The GS equation
+        # sets the amplitude self-consistently (legacy converged ~20-40 Wb with
+        # no anchor), so an equality target would fight the PDE; the hinge only
+        # forbids the trivial ψ≈0 minimum and pins the ψ>0-at-axis convention.
+        # A pointwise anchor at (R₀,0) is exploitable by Fourier-feature nets —
+        # one sharp spike at the anchor zeroes the hinge while the bulk stays ≈0
+        # (observed in run pinn_2026_07_12_19_44_42); the mean anchors the bulk.
+        # Floor 0.05·F_axis·a sits below the legacy-quality bulk mean on all
+        # eval configs, so the hinge (and its gradient) vanish for good solutions.
+        floor = 0.05 * config.State.F_axis * config.Geometry.a
+        loss_scale = jnp.maximum(0.0, 1.0 - jnp.mean(psi_int) / floor) ** 2
+
+        # 3. PDE Residual Loss
+        res_vals = _grad_shafranov_residual_from_operator(delta_star, psi_int, R, psi_axis, config)
+        loss_res = jnp.where(
+            huber_delta > 0,
+            jnp.mean(optax.losses.huber_loss(res_vals, delta=huber_delta)),
+            jnp.mean(res_vals**2),
         )
-        res_vals = residual_fn(R, Z)
-        loss_res = jnp.mean(optax.huber_loss(res_vals, delta=1.0))
 
-        # 3. Boundary Condition Loss (Dirichlet & Neumann)
+        # 4. Boundary losses
         R_b, Z_b = config.Boundary.R, config.Boundary.Z
-        dR_dt, dZ_dt = config.Boundary.dR_dtheta, config.Boundary.dZ_dtheta
-
-        batched_psi = jax.vmap(lambda r, z: psi_fn(params, r, z, config))
-        psi_b, dpsi_dt = jax.jvp(batched_psi, (R_b, Z_b), (dR_dt, dZ_dt))
-
-        # Dirichlet: ψ = 0 at plasma edge
+        psi_b = jax.vmap(lambda r, z: psi_fn(params, r, z, config))(R_b, Z_b)
         loss_dir = jnp.mean((psi_b - PSI_EDGE) ** 2)
-        # Neumann: dψ/dn = 0 at plasma edge (approximated via directional derivative along tangent)
-        loss_neu = jnp.mean(dpsi_dt**2)
+        if soft_bc:
 
-        loss_boundary = loss_dir + loss_neu
+            def grad_psi(r: jnp.ndarray, z: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+                return jax.grad(psi_fn, argnums=(1, 2))(params, r, z, config)
 
-        return loss_res, loss_boundary
+            dR_b, dZ_b = jax.vmap(grad_psi)(R_b, Z_b)
+            dpsi_dt = dR_b * config.Boundary.dR_dtheta + dZ_b * config.Boundary.dZ_dtheta
+            loss_boundary = loss_dir + jnp.mean(dpsi_dt**2)
+        else:
+            loss_boundary = jax.lax.stop_gradient(loss_dir)
+
+        return loss_res, loss_boundary, loss_scale
 
     losses = jax.vmap(single_config_loss)(R_interior, Z_interior, batch_config)
     loss_res = jnp.mean(losses[0])
     loss_boundary = jnp.mean(losses[1])
-    per_config_loss = losses[0] + weight_boundary_condition * losses[1]
-    total = loss_res + weight_boundary_condition * loss_boundary
+    loss_scale = jnp.mean(losses[2])
+    # Adaptive resampling ranks configs by per_config_loss — only include terms
+    # that actually train (hard-BC boundary loss is stop-gradient diagnostic).
+    per_config_loss = losses[0] + weight_flux_scale * losses[2]
+    total = loss_res + weight_flux_scale * loss_scale
+    if soft_bc:
+        per_config_loss = per_config_loss + weight_boundary_condition * losses[1]
+        total = total + weight_boundary_condition * loss_boundary
     return total, loss_res, loss_boundary, per_config_loss
 
 
@@ -289,8 +355,9 @@ def get_b_field(
     psi_vals = jax.vmap(scalar_psi)(R_arr, Z_arr)
     psi_axis = scalar_psi(config.Geometry.R0, 0.0)
 
+    flux_scale = config.State.F_axis * config.Geometry.a
     F_val = toroidal_field_flux_function(
-        psi_vals, psi_axis, config.State.F_axis, config.State.field_exponent
+        psi_vals, psi_axis, config.State.F_axis, config.State.field_exponent, flux_scale
     )
     Bphi = F_val / R_arr
 

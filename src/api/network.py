@@ -1,54 +1,80 @@
 """Checkpoint sampling, flux/residual grids, and B-field grids for the Network view."""
 
-import math
-
-import jax
 import jax.numpy as jnp
 import numpy as np
+import pyvista as pv
+from scipy.stats import qmc
 
-from src.engine.model_evaluation import compute_gs_residual_on_points
-from src.engine.network import NetworkManager, Sampler
+from src.engine.model_evaluation import (
+    GridQuantity,
+    PlasmaGridBatch,
+    evaluate_plasma_grids,
+)
+from src.engine.network import Sampler
+from src.engine.network_manager import NetworkManager
 from src.engine.physics import get_b_field_cartesian
-from src.engine.plasma import is_point_in_plasma
-from src.lib.geometry_config import CylindricalCoordinates, PlasmaGeometry, PlasmaState
-from src.lib.network_config import FluxInput
+from src.engine.plasma import boundary_normalized_radius
+from src.lib.geometry_config import PlasmaGeometry, PlasmaState
+from src.lib.network_config import DomainBounds
 from src.streamlit.network_utils import to_plasma_config
+
+
+def _split_row(row: jnp.ndarray) -> tuple[PlasmaGeometry, PlasmaState]:
+    """Domain Sobol row -> (geometry, state); columns as in Sampler._compute_single_config."""
+    geom = PlasmaGeometry(
+        R0=float(row[0]), a=float(row[1]), kappa=float(row[2]), delta=float(row[3])
+    )
+    state = PlasmaState(
+        p0=float(row[4]),
+        F_axis=float(row[5]),
+        pressure_alpha=float(row[6]),
+        field_exponent=float(row[7]),
+    )
+    return geom, state
+
+
+def _seeded_domain_draw(
+    manager: NetworkManager, seed: int, sample_size: int
+) -> tuple[jnp.ndarray, PlasmaGeometry, PlasmaState]:
+    """Single owner of the seeded domain Sobol contract: engine construction
+    (identical to Sampler._sobol_domain), scaling, and the 3D-config pick —
+    row (seed % n_train) of the train-set draw that historically followed,
+    reached via fast_forward instead of generating the other n_train-1 rows."""
+    lower, upper = DomainBounds.get_bounds()
+    sobol = qmc.Sobol(d=len(lower), scramble=True, seed=seed)
+
+    def scale(unit: np.ndarray) -> jnp.ndarray:
+        return jnp.array(unit, dtype=jnp.float32) * (upper - lower) + lower
+
+    rows = scale(sobol.random(sample_size))
+    if seed % manager.config.n_train:
+        sobol.fast_forward(seed % manager.config.n_train)
+    geom_3d, state_3d = _split_row(scale(sobol.random(1))[0])
+    return rows, geom_3d, state_3d
+
+
+def _seeded_configs(
+    manager: NetworkManager, seed: int, sample_size: int
+) -> tuple[list[tuple[PlasmaGeometry, PlasmaState]], PlasmaGeometry, PlasmaState]:
+    """Seeded config params only — no Sampler (whose init precomputes thousands
+    of collocation coordinates that the grid/fieldlines endpoints never use)."""
+    rows, geom_3d, state_3d = _seeded_domain_draw(manager, seed, sample_size)
+    return [_split_row(row) for row in rows], geom_3d, state_3d
 
 
 def _seeded_samples(
     manager: NetworkManager, seed: int, sample_size: int
 ) -> tuple[list[dict], PlasmaGeometry, PlasmaState]:
-    """Re-derive the same deterministic seeded samples as the Streamlit `reseed_*` flow."""
+    """Re-derive the same deterministic seeded samples as the Streamlit `reseed_*` flow.
+
+    Adds interior collocation points on top of the shared domain draw — the one
+    endpoint that justifies constructing a Sampler (its own domain engine goes
+    unused; seed+1/+2 engines supply the collocation coordinates).
+    """
+    rows, geom_3d, state_3d = _seeded_domain_draw(manager, seed, sample_size)
+
     sampler = Sampler(manager.config, seed=seed)
-
-    seeded_geometry_configs = sampler._get_sobol_sample(
-        n_samples=sample_size,
-        lower_bounds=sampler._domain_lower_bounds,
-        upper_bounds=sampler._domain_upper_bounds,
-        sobol_sampler="domain",
-    )
-    seeded_train_set = sampler._get_sobol_sample(
-        n_samples=manager.config.n_train,
-        lower_bounds=sampler._domain_lower_bounds,
-        upper_bounds=sampler._domain_upper_bounds,
-        sobol_sampler="domain",
-    )
-    sample_3d = seeded_train_set[seed % manager.config.n_train]
-
-    geom_3d = PlasmaGeometry(
-        R0=float(sample_3d[0]),
-        a=float(sample_3d[1]),
-        kappa=float(sample_3d[2]),
-        delta=float(sample_3d[3]),
-    )
-    state_3d = PlasmaState(
-        p0=float(sample_3d[4]),
-        F_axis=float(sample_3d[5]),
-        pressure_alpha=float(sample_3d[6]),
-        field_exponent=float(sample_3d[7]),
-    )
-
-    flux_input = sampler.sample_flux_input(plasma_configs=seeded_geometry_configs)
+    flux_input = sampler.sample_flux_input(plasma_configs=rows)
     data = [
         {
             "geom": flux_input.config[i].Geometry,
@@ -63,10 +89,12 @@ def _seeded_samples(
     return data, geom_3d, state_3d
 
 
+def _to_list(arr: object) -> list:
+    return np.asarray(arr, dtype=np.float64).tolist()
+
+
 def build_sample_response(manager: NetworkManager, seed: int, sample_size: int) -> dict:
     data, geom_3d, state_3d = _seeded_samples(manager, seed, sample_size)
-
-    configs = [to_plasma_config(d["geom"], d["state"]) for d in data]
 
     samples = [
         {
@@ -78,19 +106,16 @@ def build_sample_response(manager: NetworkManager, seed: int, sample_size: int) 
             "F_axis": float(d["state"].F_axis),
             "pressure_alpha": float(d["state"].pressure_alpha),
             "field_exponent": float(d["state"].field_exponent),
-            "boundary_R": np.asarray(d["bR"]).tolist(),
-            "boundary_Z": np.asarray(d["bZ"]).tolist(),
-            "interior_R": np.asarray(d["iR"]).tolist(),
-            "interior_Z": np.asarray(d["iZ"]).tolist(),
+            "boundary_R": _to_list(d["bR"]),
+            "boundary_Z": _to_list(d["bZ"]),
+            "interior_R": _to_list(d["iR"]),
+            "interior_Z": _to_list(d["iZ"]),
         }
         for d in data
     ]
 
-    metrics = _compute_metrics(manager, data, configs)
-
     return {
         "samples": samples,
-        "metrics": metrics,
         "geom3d": {
             "R0": geom_3d.R0,
             "a": geom_3d.a,
@@ -106,164 +131,148 @@ def build_sample_response(manager: NetworkManager, seed: int, sample_size: int) 
     }
 
 
-def _compute_metrics(manager: NetworkManager, data: list[dict], configs: list) -> dict:
-    geometry = jnp_tree_stack([c.Geometry for c in configs])
-    boundary = jnp_tree_stack([c.Boundary for c in configs])
-    state = jnp_tree_stack([c.State for c in configs])
-    batched_config = configs[0].__class__(Geometry=geometry, Boundary=boundary, State=state)
-
-    flux_input = FluxInput(
-        R_sample=jnp.stack([d["iR"] for d in data]),
-        Z_sample=jnp.stack([d["iZ"] for d in data]),
-        config=batched_config,
-    )
-
-    total, l_res, l_dir, l_per_cfg = manager.eval_step(
-        manager.state, flux_input, manager.config.weight_boundary_condition
-    )
-
-    max_res = 0.0
-    for i, cfg in enumerate(configs):
-        res_vals = compute_gs_residual_on_points(
-            manager, cfg, flux_input.R_sample[i], flux_input.Z_sample[i]
-        )
-        max_res = max(max_res, float(jnp.max(jnp.abs(res_vals))))
-
-    return {
-        "avg_loss": float(total),
-        "interior_loss": float(l_res),
-        "boundary_loss": float(l_dir),
-        "max_loss": float(jnp.max(l_per_cfg)),
-        "max_residual": max_res,
-    }
+def _serialize_grid_batch(grids: PlasmaGridBatch, quantity: GridQuantity) -> list[dict]:
+    """Convert shared JAX grid data into the frontend's JSON contract."""
+    return [
+        {
+            "theta": _to_list(grids.theta),
+            "rho": _to_list(grids.rho),
+            "R": _to_list(grids.R[i]),
+            "Z": _to_list(grids.Z[i]),
+            "values": _to_list(grids.values[quantity][i]),
+            "boundary_R": _to_list(grids.boundary_R[i]),
+            "boundary_Z": _to_list(grids.boundary_Z[i]),
+        }
+        for i in range(grids.R.shape[0])
+    ]
 
 
-def jnp_tree_stack(items: list) -> object:
-    """Stack a list of identically-shaped flax dataclasses along a new batch axis 0."""
-    return jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *items)
-
-
-def _grid_bounds(geoms: list[PlasmaGeometry]) -> tuple[list[float], list[float]]:
-    r_min = min(g.R0 - g.a * 1.2 for g in geoms)
-    r_max = max(g.R0 + g.a * 1.2 for g in geoms)
-    z_max = max(g.kappa * g.a * 1.2 for g in geoms)
-    r_mid, extent = (r_min + r_max) / 2, max(r_max - r_min, 2 * z_max)
-    return [r_mid - extent / 2, r_mid + extent / 2], [-extent / 2, extent / 2]
+def build_plasma_grids(
+    manager: NetworkManager,
+    seed: int,
+    sample_size: int,
+    resolution: int,
+    quantities: tuple[GridQuantity, ...],
+) -> dict[GridQuantity, list[dict]]:
+    """Evaluate requested quantities once and serialize them for API consumers."""
+    pairs, _, _ = _seeded_configs(manager, seed, sample_size)
+    configs = [to_plasma_config(geom, state) for geom, state in pairs]
+    grids = evaluate_plasma_grids(manager, configs, resolution, quantities)
+    return {quantity: _serialize_grid_batch(grids, quantity) for quantity in quantities}
 
 
 def build_flux_grids(
     manager: NetworkManager, seed: int, sample_size: int, resolution: int
 ) -> list[dict]:
-    data, _, _ = _seeded_samples(manager, seed, sample_size)
-    configs = [to_plasma_config(d["geom"], d["state"]) for d in data]
-
-    r_lims, z_lims = _grid_bounds([c.Geometry for c in configs])
-    R = jnp.linspace(*r_lims, resolution)
-    Z = jnp.linspace(*z_lims, resolution)
-    R_grid, Z_grid = jnp.meshgrid(R, Z)
-    coords_flat = CylindricalCoordinates(
-        R=R_grid.flatten(), Z=Z_grid.flatten(), phi=jnp.zeros_like(R_grid.flatten())
-    )
-
-    grids = []
-    for cfg in configs:
-        mask = is_point_in_plasma(coords_flat, cfg.Boundary)
-        psi = jnp.full(mask.shape, jnp.nan)
-        if mask.any():
-            val = manager.get_psi(coords_flat.R[mask], coords_flat.Z[mask], cfg)
-            psi = psi.at[mask].set(val.flatten())
-
-        grids.append(
-            {
-                "R": np.asarray(R).tolist(),
-                "Z": np.asarray(Z).tolist(),
-                "values": _nan_to_none_grid(np.asarray(psi).reshape(resolution, resolution)),
-                "boundary_R": np.asarray(cfg.Boundary.R).tolist(),
-                "boundary_Z": np.asarray(cfg.Boundary.Z).tolist(),
-            }
-        )
-    return grids
+    return build_plasma_grids(manager, seed, sample_size, resolution, ("flux",))["flux"]
 
 
 def build_residual_grids(
     manager: NetworkManager, seed: int, sample_size: int, resolution: int
 ) -> list[dict]:
-    data, _, _ = _seeded_samples(manager, seed, sample_size)
-    configs = [to_plasma_config(d["geom"], d["state"]) for d in data]
-
-    r_lims, z_lims = _grid_bounds([c.Geometry for c in configs])
-    R = jnp.linspace(*r_lims, resolution)
-    Z = jnp.linspace(*z_lims, resolution)
-    R_grid, Z_grid = jnp.meshgrid(R, Z)
-    coords_flat = CylindricalCoordinates(
-        R=R_grid.flatten(), Z=Z_grid.flatten(), phi=jnp.zeros_like(R_grid.flatten())
-    )
-
-    grids = []
-    for cfg in configs:
-        mask = is_point_in_plasma(coords_flat, cfg.Boundary)
-        residual = jnp.full(mask.shape, jnp.nan)
-        if mask.any():
-            R_masked = coords_flat.R[mask]
-            Z_masked = coords_flat.Z[mask]
-            res_vals = compute_gs_residual_on_points(manager, cfg, R_masked, Z_masked)
-            residual = residual.at[mask].set(res_vals.flatten())
-
-        grids.append(
-            {
-                "R": np.asarray(R).tolist(),
-                "Z": np.asarray(Z).tolist(),
-                "values": _nan_to_none_grid(np.asarray(residual).reshape(resolution, resolution)),
-                "boundary_R": np.asarray(cfg.Boundary.R).tolist(),
-                "boundary_Z": np.asarray(cfg.Boundary.Z).tolist(),
-            }
-        )
-    return grids
+    return build_plasma_grids(manager, seed, sample_size, resolution, ("residual",))["residual"]
 
 
-def _nan_to_none_grid(grid: np.ndarray) -> list[list[float | None]]:
-    return [[None if math.isnan(v) else float(v) for v in row] for row in grid]
-
-
-def build_bfield_grid(
+def build_field_lines(
     manager: NetworkManager, seed: int, sample_size: int, n_lines: int = 24
 ) -> dict:
-    _, geom_3d, state_3d = _seeded_samples(manager, seed, sample_size)
+    """Trace field lines server-side (VTK RK45, the legacy PyVista path) and
+    ship finished polylines — the client only fills a BufferGeometry."""
+    _, geom_3d, state_3d = _seeded_configs(manager, seed, sample_size)
     config = to_plasma_config(geom_3d, state_3d)
 
     R0, a, kappa = float(geom_3d.R0), float(geom_3d.a), float(geom_3d.kappa)
-    extent = R0 + a + 1.0
-    z_extent = (a * kappa) + 1.0
+    # Tight box: field lines live inside the plasma, so padding is wasted resolution.
+    extent = R0 + a + 0.5
+    z_extent = (a * kappa) + 0.5
 
-    nx = ny = nz = 30
-    xs = np.linspace(-extent, extent, nx)
-    ys = np.linspace(-extent, extent, ny)
-    zs = np.linspace(-z_extent, z_extent, nz)
-    X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+    # 48³ keeps the tracer's psi-drift (trilinear interpolation error, O(h²))
+    # at the few-percent level; 30³ drifted ~10% of the axis flux per line.
+    n = 48
+    grid = pv.ImageData(
+        dimensions=(n, n, n),
+        spacing=(2 * extent / (n - 1), 2 * extent / (n - 1), 2 * z_extent / (n - 1)),
+        origin=(-extent, -extent, -z_extent),
+    )
+    pts = grid.points
 
     vectors = get_b_field_cartesian(
         manager.make_psi_fn(),
         manager.state.params,
-        jnp.array(X.flatten()),
-        jnp.array(Y.flatten()),
-        jnp.array(Z.flatten()),
+        jnp.array(pts[:, 0]),
+        jnp.array(pts[:, 1]),
+        jnp.array(pts[:, 2]),
         config,
     )
-    vectors = np.asarray(vectors)
+    vectors = np.array(vectors)  # copy: asarray on a jax array is read-only
 
-    seed_points = np.stack(
-        [np.linspace(R0 - a * 0.9, R0 + a * 0.9, n_lines), np.zeros(n_lines), np.zeros(n_lines)],
-        axis=-1,
+    # Outside the boundary psi is meaningless extrapolation, and the hard-BC
+    # envelope makes |B| spike ~7x there, bleeding into edge cells through
+    # trilinear interpolation. Zeroing it keeps edge cells clean and terminates
+    # streamlines at the plasma edge (terminal_speed stops the integrator).
+    # 1.05 margin so boundary-straddling cells keep their inside nodes.
+    rho = boundary_normalized_radius(
+        jnp.array(np.hypot(pts[:, 0], pts[:, 1])), jnp.array(pts[:, 2]), config.Boundary
+    )
+    vectors[np.asarray(rho) > 1.05] = 0.0
+    grid["B"] = vectors
+    grid.set_active_vectors("B")
+
+    # Midplane seed line, same params as the legacy Streamlit render
+    # (src/lib/visualization.py); resolution=k yields k+1 seed points.
+    seed_line = pv.Line(
+        pointa=(R0 - a * 0.9, 0, 0), pointb=(R0 + a * 0.9, 0, 0), resolution=n_lines - 1
+    )
+    streamlines = grid.streamlines_from_source(
+        seed_line,
+        integration_direction="both",
+        max_length=1000.0,
+        max_steps=2000,
+        integrator_type=45,
+        compute_vorticity=False,
     )
 
+    line_points = np.asarray(streamlines.points)
+    speeds_all = (
+        np.linalg.norm(np.asarray(streamlines["B"]), axis=1)
+        if streamlines.n_points
+        else np.empty(0)
+    )
+
+    # VTK cell array: [n, id0..id{n-1}, m, ...] — gather per line, drop stubs.
+    # Vertices are decimated for transport only (integration stays exact):
+    # RK45 steps ~0.05 m here, 4x that is still finer than the retired JS
+    # tracer's 0.8 m max step, and ~4x less JSON.
+    stride = 4
+    conn = np.asarray(streamlines.lines)
+    chunks: list[np.ndarray] = []
+    lengths: list[int] = []
+    i = 0
+    while i < len(conn):
+        n_pts = int(conn[i])
+        ids = conn[i + 1 : i + 1 + n_pts]
+        i += 1 + n_pts
+        if n_pts < 8:  # stubs from seeds in near-zero field
+            continue
+        keep = ids[::stride]
+        if (n_pts - 1) % stride:  # always keep the true endpoint
+            keep = np.append(keep, ids[-1])
+        chunks.append(keep)
+        lengths.append(len(keep))
+
+    if chunks:
+        ids = np.concatenate(chunks)
+        points = line_points[ids]
+        speeds = speeds_all[ids]
+        b_range = [float(speeds.min()), float(speeds.max())]
+    else:
+        points = np.empty((0, 3))
+        speeds = np.empty(0)
+        b_range = [0.0, 1.0]
+
     return {
-        "grid": {
-            "nx": nx,
-            "ny": ny,
-            "nz": nz,
-            "origin": [-extent, -extent, -z_extent],
-            "spacing": [2 * extent / (nx - 1), 2 * extent / (ny - 1), 2 * z_extent / (nz - 1)],
-        },
-        "vectors": vectors.flatten().tolist(),
-        "seed_points": seed_points.tolist(),
+        "points": _to_list(points.flatten()),
+        "speeds": _to_list(speeds),
+        "line_lengths": lengths,
+        "b_range": b_range,
     }

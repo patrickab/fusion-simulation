@@ -1,13 +1,19 @@
 // Typed client for the FastAPI backend (src/api/main.py) + a tiny cached-fetch hook.
 import { useEffect, useState } from 'react'
 
-export interface Metrics {
-  avg_loss: number
-  interior_loss: number
-  boundary_loss: number
-  max_loss: number
-  max_residual: number
-}
+/** Post-training KPI values projected from the run.json result. */
+export type Kpis = Record<string, number | string>
+
+/** Numeric KPI entries in display order, metadata keys dropped. */
+export const kpiEntries = (kpis: Kpis): [string, number][] =>
+  Object.entries(kpis).filter(
+    (e): e is [string, number] =>
+      typeof e[1] === 'number' &&
+      (e[0].startsWith('loss_') ||
+        e[0].startsWith('core_') ||
+        e[0] === 'edge_loss_p95' ||
+        e[0] === 'boundary_leak_max'),
+  )
 
 export interface Sample {
   R0: number
@@ -28,15 +34,24 @@ export interface Geom3D { R0: number; a: number; kappa: number; delta: number }
 
 export interface SampleResponse {
   samples: Sample[]
-  metrics: Metrics
   geom3d: Geom3D
   state3d: { p0: number; F_axis: number; pressure_alpha: number; field_exponent: number }
 }
 
+export type GridQuantity = 'flux' | 'residual'
+export type HpoStudies = Record<string, string[]>
+
+export interface NetworkModels {
+  foundation: { name: string }
+  corrector: { name: string; scale: number } | null
+}
+
 export interface Grid2D {
-  R: number[]
-  Z: number[]
-  values: (number | null)[][]
+  theta: number[]
+  rho: number[]
+  R: number[][]
+  Z: number[][]
+  values: number[][]
   boundary_R: number[]
   boundary_Z: number[]
 }
@@ -53,14 +68,16 @@ export interface GeometryRequest extends Geom3D {
   mesh_stride?: number
 }
 
-export interface BFieldResponse {
-  grid: { nx: number; ny: number; nz: number; origin: number[]; spacing: number[] }
-  vectors: number[]
-  seed_points: number[][]
+/** Server-traced (VTK RK45) field lines: concatenated polylines + |B| per vertex. */
+export interface FieldLinesResponse {
+  points: number[] // flat xyz
+  speeds: number[]
+  line_lengths: number[]
+  b_range: [number, number]
 }
 
 export type BenchmarkEvent =
-  | { type: 'row'; network: string; config: Record<string, unknown>; flux_grids?: Grid2D[]; residual_grids?: Grid2D[] }
+  | { type: 'row'; network: string; config: Record<string, unknown>; kpis: Kpis; flux_grids?: Grid2D[]; residual_grids?: Grid2D[] }
   | { type: 'row_error'; network: string; message: string }
   | { type: 'error'; message: string }
   | { type: 'done' }
@@ -77,27 +94,49 @@ const post = <T,>(url: string, body: unknown): Promise<T> =>
     body: JSON.stringify(body),
   }).then((r) => toJson<T>(r))
 
-// network names may contain slashes (subdirectories) — keep them as path separators
+// network names are 'commit/run' paths — keep slashes as path separators
 const enc = (name: string) => encodeURIComponent(name).replaceAll('%2F', '/')
 
 export const api = {
+  config: () =>
+    fetch('/api/config').then((r) =>
+      toJson<{
+        eval_config_count: number
+        eval_resolution: number
+        residual_color_range: [number, number]
+      }>(r),
+    ),
   networks: (viewMode: string) =>
     fetch(`/api/networks?view_mode=${encodeURIComponent(viewMode)}`).then((r) => toJson<string[]>(r)),
-  config: (name: string) =>
+  hpoStudies: (archived: boolean) =>
+    fetch(`/api/hpo?archived=${archived}`).then((r) => toJson<HpoStudies>(r)),
+  config_file: (name: string) =>
     fetch(`/api/network/${enc(name)}/config`).then((r) => toJson<Record<string, unknown>>(r)),
+  models: (name: string) => fetch(`/api/network/${enc(name)}/models`).then((r) => toJson<NetworkModels>(r)),
+  kpis: (name: string) => fetch(`/api/network/${enc(name)}/kpis`).then((r) => toJson<Kpis>(r)),
   archive: (name: string) => fetch(`/api/network/${enc(name)}/archive`, { method: 'POST' }).then((r) => toJson(r)),
   rename: (name: string, newName: string) =>
     post<{ name: string }>(`/api/network/${enc(name)}/rename`, { new_name: newName }),
   remove: (name: string) => fetch(`/api/network/${enc(name)}`, { method: 'DELETE' }).then((r) => toJson(r)),
   sample: (name: string, seed: number, sampleSize: number) =>
-    post<SampleResponse>(`/api/network/${enc(name)}/sample`, { seed, sample_size: sampleSize }),
-  flux: (name: string, seed: number, sampleSize: number, resolution: number) =>
-    post<Grid2D[]>(`/api/network/${enc(name)}/flux`, { seed, sample_size: sampleSize, resolution }),
-  residual: (name: string, seed: number, sampleSize: number, resolution: number) =>
-    post<Grid2D[]>(`/api/network/${enc(name)}/residual`, { seed, sample_size: sampleSize, resolution }),
-  bfield: (name: string, seed: number, sampleSize: number, nLines: number) =>
-    post<BFieldResponse>(`/api/network/${enc(name)}/bfield`, { seed, sample_size: sampleSize, n_lines: nLines }),
+    post<SampleResponse>(`/api/network/${enc(name)}/sample`, {
+      seed,
+      sample_size: sampleSize,
+    }),
+  grid: (name: string, quantity: GridQuantity, seed: number, sampleSize: number, resolution: number) =>
+    post<Grid2D[]>(`/api/network/${enc(name)}/${quantity}`, { seed, sample_size: sampleSize, resolution }),
+  fieldlines: (name: string, seed: number, sampleSize: number, nLines: number) =>
+    post<FieldLinesResponse>(`/api/network/${enc(name)}/fieldlines`, { seed, sample_size: sampleSize, n_lines: nLines }),
   geometry: (body: GeometryRequest) => post<GeometryResponse>('/api/geometry', body),
+  // Flattened data/benchmarks tree grouped by the commit embedded in each slug.
+  benchmarks: () => fetch('/api/benchmarks').then((r) => toJson<Record<string, Record<string, string[]>>>(r)),
+}
+
+export const benchmarkFileUrl = (run: string, file: string) => `/api/benchmarks/files/${run}/${file}`
+
+export function parseArtifactSlug(slug: string): { timestamp: string; name: string; commit: string } | null {
+  const match = slug.match(/^(\d{4}_\d{2}_\d{2}_\d{2}_\d{2}_\d{2})_(.+)_([^_]+)$/)
+  return match ? { timestamp: match[1], name: match[2], commit: match[3] } : null
 }
 
 export async function* benchmarkStream(

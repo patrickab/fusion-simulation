@@ -1,5 +1,7 @@
 """Configuration module for this repository."""
 
+import functools
+import os
 import pathlib
 from pathlib import Path
 import typing
@@ -9,6 +11,30 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+# ---------------------------------------------------------------------------
+# Global KPI evaluation protocol
+# Calibrated in docs/evaluation/kpi-accuracy-benchmark.md.
+# Every metric path derives from these two constants: training-time validation
+# tracking, end-of-training run.json KPIs, eval CLI, HPO pruning/ranking, and the
+# re-eval script all sample the same |R_GS| budget.
+# ---------------------------------------------------------------------------
+# Report-grade budget (~±1% absolute median accuracy): both noise sources are
+# comparable at this size, so points and configs are doubled together from the
+# calibrated 4,096 x 100 minimum. ~0.8 s cached per eval — negligible against
+# 7 min dev / 1.5 h full training runs.
+KPI_POINTS_PER_CONFIG = 8_192  # |R_GS| sample points per reactor config
+KPI_EVAL_CONFIGS = 200  # reactor configs per evaluation
+
+
+@functools.lru_cache(maxsize=1)
+def current_commit() -> str:
+    """Short git commit hash of HEAD, used to partition benchmark/HPO artifacts.
+
+    Memoized: shells out to git only once per process — a commit made during a
+    long study would otherwise change the path mid-run.
+    """
+    return os.popen("git rev-parse --short HEAD").read().strip() or "no_git"
+
 
 class Filepaths:
     """
@@ -17,12 +43,16 @@ class Filepaths:
 
     ROOT = Path.cwd()
     DATA = Path(ROOT) / "data"
-    NETWORKS = DATA / "networks"
-    NETWORK_ARCHIVE = NETWORKS / "archive"
 
-    if not NETWORKS.exists():
-        print(f"Creating output directory at {NETWORKS}")
-        pathlib.Path.mkdir(DATA / "networks", parents=True)
+    if not DATA.exists():
+        print(f"Creating output directory at {DATA}")
+        pathlib.Path.mkdir(DATA, parents=True)
+
+    # Per-commit benchmark tree: <run>/{run.json,metrics.json,network.flax,plots}
+    BENCHMARKS = DATA / "benchmarks"
+    BENCHMARK_ARCHIVE = BENCHMARKS / "_archive"
+    HPO_ROOT = DATA / "hpo"
+    HPO_ARCHIVE = HPO_ROOT / "_archive"
 
     PLASMA_SURFACE = DATA / "plasma_surface.ply"
     TOROIDAL_COILS = DATA / "toroidal_field_coils.ply"

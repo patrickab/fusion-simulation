@@ -1,14 +1,14 @@
-import json
-from pathlib import Path
+import shutil
 
 import jax.numpy as jnp
 from stpyvista import stpyvista
 
 from src.engine.model_evaluation import compute_gs_residual_on_points
-from src.engine.network import NetworkManager
+from src.engine.network_manager import NetworkManager
 from src.engine.plasma import calculate_fusion_plasma
 from src.lib.config import Filepaths
 from src.lib.network_config import HyperParams
+from src.lib.run_artifacts import load_config
 from src.lib.visualization import (
     initialize_plotter,
     plot_flux_heatmap,
@@ -22,7 +22,10 @@ from src.streamlit.network_utils import (
     filter_networks_by_commit,
     get_available_commits,
     get_available_networks,
-    move_network_files,
+    move_run_dir,
+    parse_slug,
+    renamed_slug,
+    resolve_run_directory,
     to_plasma_config,
 )
 from src.streamlit.utils import reseed_network_visualisation
@@ -39,8 +42,8 @@ def _get_networks() -> list[str]:
 
 def sync_selected_network() -> None:
     """Load selected checkpoint once and reseed shared samples."""
-    pinn_path = Filepaths.NETWORKS / st.session_state.selected_pinn
-    new_config = HyperParams.from_json(pinn_path.with_suffix(".json"))
+    run_dir = resolve_run_directory(st.session_state.selected_pinn)
+    new_config = HyperParams.from_dict(load_config(run_dir))
 
     # Re-instantiate only if the JIT-sensitive architecture changes
     if (
@@ -53,7 +56,7 @@ def sync_selected_network() -> None:
         st.session_state.manager.config = new_config
         st.session_state.manager.sampler.config = new_config
 
-    params = st.session_state.manager.from_disk(pinn_path=pinn_path)
+    params = st.session_state.manager.from_disk(pinn_path=run_dir / "network.flax")
     st.session_state.manager.state = st.session_state.manager.state.replace(params=params)
     reseed_network_visualisation()
 
@@ -156,9 +159,9 @@ def render_3d_topology_tab():  # noqa
 
 
 def handle_archive() -> None:
-    Filepaths.NETWORK_ARCHIVE.mkdir(parents=True, exist_ok=True)
-    new_path_stem = Filepaths.NETWORK_ARCHIVE / Path(st.session_state.selected_pinn).stem
-    move_network_files(st.session_state.selected_pinn, new_path_stem)
+    old_run_dir = resolve_run_directory(st.session_state.selected_pinn)
+    new_path = Filepaths.BENCHMARK_ARCHIVE / old_run_dir.name
+    move_run_dir(st.session_state.selected_pinn, new_path)
     _update_networks_after_action()
 
 
@@ -166,25 +169,20 @@ def handle_rename(new_name: str) -> None:
     if not new_name:
         return
 
-    old_path = Filepaths.NETWORKS / st.session_state.selected_pinn
-    new_path_stem = old_path.parent / new_name
+    old_path = resolve_run_directory(st.session_state.selected_pinn)
+    new_path = old_path.parent / renamed_slug(old_path.name, new_name)
 
-    move_network_files(st.session_state.selected_pinn, new_path_stem)
+    move_run_dir(st.session_state.selected_pinn, new_path)
 
     st.session_state.available_networks = _get_networks()
-    st.session_state._next_pinn = str(
-        new_path_stem.with_suffix(".flax").relative_to(Filepaths.NETWORKS)
-    )
+    st.session_state._next_pinn = new_path.name
     st.session_state.rename_mode = False
     st.rerun()
 
 
 def handle_delete() -> None:
-    target_path = Filepaths.NETWORKS / st.session_state.selected_pinn
-    if target_path.exists():
-        target_path.unlink()
-    if target_path.with_suffix(".json").exists():
-        target_path.with_suffix(".json").unlink()
+    target_path = resolve_run_directory(st.session_state.selected_pinn)
+    shutil.rmtree(target_path, ignore_errors=True)
 
     st.session_state.rename_mode = False
     _update_networks_after_action()
@@ -219,7 +217,8 @@ def render_network_actions() -> None:
         st.session_state.rename_mode = not st.session_state.get("rename_mode", False)
 
     if st.session_state.get("rename_mode", False):
-        new_name = st.text_input("New Name", value=Path(st.session_state.selected_pinn).stem)
+        _, current_name, _ = parse_slug(st.session_state.selected_pinn)
+        new_name = st.text_input("New Name", value=current_name)
         if st.button("Save Name"):
             handle_rename(new_name)
 
@@ -236,7 +235,7 @@ def render_sidebar() -> None:
 
         st.radio(
             "View",
-            options=["New Benchmarks", "Archive", "All"],
+            options=["Single-Configs", "Archive", "All"],
             horizontal=True,
             key="network_view_mode",
         )
@@ -278,10 +277,9 @@ def render_sidebar() -> None:
 
         st.divider()
 
-        pinn_path = Filepaths.NETWORKS / st.session_state.selected_pinn
-        if pinn_path.with_suffix(".json").exists():
-            with open(pinn_path.with_suffix(".json")) as f:
-                st.json(json.load(f))
+        pinn_path = resolve_run_directory(st.session_state.selected_pinn)
+        if (pinn_path / "run.json").exists():
+            st.json(load_config(pinn_path))
 
 
 def render_metrics() -> None:
@@ -291,7 +289,10 @@ def render_metrics() -> None:
 
     # Compute evaluation metrics
     total, l_res, l_dir, l_per_cfg = manager.eval_step(
-        manager.state, flux_input, manager.config.weight_boundary_condition
+        manager.state,
+        flux_input,
+        manager.config.weight_boundary_condition,
+        manager.config.huber_delta,
     )
 
     # Compute max pointwise residual across all sampled configurations
@@ -315,7 +316,7 @@ def init_session_state() -> None:
         st.session_state.seed = 0
         st.session_state.sample_size = 4
         st.session_state.filter_commit = "All"
-        st.session_state.network_view_mode = "New Benchmarks"
+        st.session_state.network_view_mode = "Single-Configs"
 
         networks = _get_networks()
         st.session_state.available_networks = networks

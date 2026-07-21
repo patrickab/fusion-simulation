@@ -16,11 +16,12 @@ import numpy as np
 import torch
 from torch.quasirandom import SobolEngine
 
-from src.engine.network import NetworkManager
+from src.engine.network_manager import NetworkManager
+from src.lib.config import Filepaths
 from src.lib.logger import get_logger
 from src.lib.network_config import HyperParams
 
-logger = get_logger(name="HPO", log_dir="logs/hpo")
+logger = get_logger(name="HPO", log_dir=str(Filepaths.DATA / "hpo"))
 
 # Registry for early stopping: {epoch_milestone: best_loss_at_milestone}
 EARLY_STOP_THRESHOLD = 2.0  # N times worse

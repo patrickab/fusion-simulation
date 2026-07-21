@@ -1,44 +1,148 @@
-import argparse
-from datetime import datetime
-import os
-from pathlib import Path
+from collections import deque
+from dataclasses import dataclass
+import functools
+from functools import partial
 import time
 from typing import Callable, Literal
 
 from flax import linen as nn
-import flax.serialization
 from flax.training import train_state
 import jax
 import jax.numpy as jnp
-import numpy as np
 import optax
-from rich.console import Console, Group
-from rich.live import Live
-from rich.panel import Panel
-from rich.progress import BarColumn, Progress, TextColumn, TimeElapsedColumn
-from rich.table import Table
 from scipy.stats import qmc
 
 from src.engine.physics import pinn_loss_function
-from src.engine.plasma import calculate_poloidal_boundary, get_poloidal_points
-from src.lib.config import Filepaths
+from src.engine.plasma import (
+    boundary_normalized_radius,
+    calculate_poloidal_boundary,
+    get_poloidal_points,
+)
+from src.lib.config import KPI_EVAL_CONFIGS, KPI_POINTS_PER_CONFIG
 from src.lib.geometry_config import (
     PlasmaConfig,
     PlasmaGeometry,
     PlasmaState,
 )
 from src.lib.logger import get_logger
-from src.lib.network_config import DomainBounds, FluxInput, HyperParams
+from src.lib.network_config import (
+    DomainBounds,
+    EpochMetrics,
+    FluxInput,
+    HyperParams,
+    TrainingObserver,
+    TrainingResult,
+    ValidationMetrics,
+)
 
-console = Console()
 logger = get_logger(
     name="Network",
 )
 
 
+def denormalize_psi(
+    psi_n: jnp.ndarray,
+    R: jnp.ndarray,
+    Z: jnp.ndarray,
+    cfg: PlasmaConfig,
+    *,
+    soft_bc: bool = False,
+) -> jnp.ndarray:
+    """Map raw network output to physical psi.
+
+    Hard-enforces psi=0 (and, since the envelope is theta-independent along
+    the boundary, dpsi/dtheta=0) at the plasma edge via a multiplicative
+    envelope, so boundary conditions hold by construction instead of via a
+    soft loss penalty.
+
+    ``soft_bc=True`` skips the envelope multiply: soft-BC checkpoints train
+    and evaluate on the raw physical flux, with boundary conditions enforced
+    by Dirichlet/Neumann penalties instead.
+    """
+    scaled = psi_n.squeeze() * cfg.State.F_axis * cfg.Geometry.a
+    if soft_bc:
+        return scaled
+    envelope = 1.0 - boundary_normalized_radius(R, Z, cfg.Boundary) ** 2
+    return envelope * scaled
+
+
+def apply_psi_fn(
+    apply_fn: Callable,
+    params: any,
+    R: jnp.ndarray,
+    Z: jnp.ndarray,
+    cfg: PlasmaConfig,
+    *,
+    soft_bc: bool = False,
+) -> jnp.ndarray:
+    """Adapter converting neural network output to physical psi flux.
+
+    Shared by training, inference, and evaluation call sites; bind ``apply_fn``
+    with ``functools.partial`` to get a ``(params, R, Z, cfg) -> psi`` callable.
+    ``soft_bc`` is forwarded to :func:`denormalize_psi`.
+    """
+    inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
+    p_n, r_n, z_n = inp.normalize()
+    psi_n = apply_fn(params, r=r_n, z=z_n, **p_n)
+    return denormalize_psi(psi_n, R, Z, cfg, soft_bc=soft_bc)
+
+
+# --- Random Weight Factorization dense layer ---
+class RWFDense(nn.Module):
+    """Dense layer with Random Weight Factorization (Wang et al. arXiv 2210.01274).
+
+    Reparametrizes the kernel as W = V * exp(s) where s ~ N(1.0, 0.1) and
+    V is initialized so that the effective kernel V * exp(s) equals a standard
+    glorot_normal draw at init. Both s and V are stored as a single structured
+    param ("w_fact") so their initialization is coupled via one PRNG key.
+
+    See also: "An Expert's Guide to Training PINNs" (arXiv 2308.08468) §4.3.
+    """
+
+    features: int
+    dtype: jnp.dtype = jnp.float32
+
+    _mu: float = 1.0
+    _sigma: float = 0.1
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        in_features = x.shape[-1]
+
+        def w_fact_init(
+            key: jax.Array,
+            shape: tuple[int, ...],
+        ) -> dict[str, jnp.ndarray]:
+            # shape is (in_features, features) — used only to derive the two
+            # sub-shapes; both sub-arrays are drawn from splits of `key`.
+            in_f, out_f = shape
+            key_w, key_s = jax.random.split(key)
+            w0 = nn.initializers.glorot_normal()(key_w, (in_f, out_f), self.dtype)
+            s = self._mu + self._sigma * jax.random.normal(key_s, (out_f,), self.dtype)
+            v = w0 / jnp.exp(s)
+            return {"s": s, "v": v}
+
+        w = self.param("w_fact", w_fact_init, (in_features, self.features))
+        kernel = w["v"] * jnp.exp(w["s"])  # effective kernel = glorot draw at init
+        bias = self.param("bias", nn.initializers.zeros, (self.features,))
+        return (x @ kernel + bias).astype(self.dtype)
+
+
 # --- Network (simple MLP) ---
 class FluxPINN(nn.Module):
     hidden_dims: tuple[int, ...]
+    # Random Fourier features on the spatial (r, z) inputs to counter spectral
+    # bias (Wang et al. 2021). 0 disables; the projection matrix is drawn from
+    # a fixed PRNG key so train and reload see the identical embedding.
+    n_fourier_features: int = 0
+    fourier_sigma: float = 2.0
+    # Random Weight Factorization (Wang et al. arXiv 2210.01274). Default False
+    # for checkpoint compat — enabling changes the params tree.
+    rwf: bool = False
+    # Network architecture: "mlp" = plain MLP (default), "piratenet" = PirateNet
+    # residual blocks (arXiv 2402.00326, eq. 4.1-4.7). Default "mlp" for
+    # checkpoint compat — "piratenet" changes the params tree.
+    arch: str = "mlp"
 
     @nn.compact
     def __call__(
@@ -65,25 +169,99 @@ class FluxPINN(nn.Module):
         Returns:
             Normalized Flux prediction of shape (B, N, 1)
         """
+        dense = (
+            (lambda f: RWFDense(features=f, dtype=jnp.float32))
+            if self.rwf
+            else (lambda f: nn.Dense(features=f, dtype=jnp.float32))
+        )
+
         # Broadcast all inputs to match coordinate shape (B, N)
         target_shape = r.shape
         inputs = [r, z, r0, a, kappa, delta, p0, f_axis, alpha, exponent]
         x = jnp.stack([jnp.broadcast_to(input, target_shape) for input in inputs], axis=-1)
 
-        for dim in self.hidden_dims:
-            x = nn.Dense(features=dim, dtype=jnp.float32)(x)
-            x = nn.swish(x)
+        if self.n_fourier_features > 0:
+            proj_matrix = self.fourier_sigma * jax.random.normal(
+                jax.random.PRNGKey(0), (2, self.n_fourier_features)
+            )
+            proj = 2.0 * jnp.pi * (x[..., :2] @ proj_matrix)
+            x = jnp.concatenate([x, jnp.cos(proj), jnp.sin(proj)], axis=-1)
 
-        psi_hat = nn.Dense(features=1)(x)
+        if self.arch == "piratenet":
+            # PirateNet (arXiv 2402.00326, eq. 4.1-4.7).
+            # Two encoder branches + gated residual blocks with learnable skip weights.
+            # All alpha_l initialise to 0 so every block is a pure linear projection of
+            # the input embedding at init — the paper's core fix for PINN initialisation.
+            width = self.hidden_dims[0]
+            n_blocks = len(self.hidden_dims)
+
+            u = nn.swish(dense(width)(x))  # eq. 4.1
+            v = nn.swish(dense(width)(x))  # eq. 4.2
+            h = dense(width)(x)  # linear projection; no activation (eq. 4.3, dim-match residual)
+
+            for l in range(n_blocks):  # noqa: E741
+                f = nn.swish(dense(width)(h))  # eq. 4.4a
+                z1 = f * u + (1.0 - f) * v  # eq. 4.4b
+                g = nn.swish(dense(width)(z1))  # eq. 4.5a
+                z2 = g * u + (1.0 - g) * v  # eq. 4.5b
+                q = nn.swish(dense(width)(z2))  # eq. 4.6
+                # Scalar skip weight: alpha=0 at init → identity through projected embedding
+                alpha = self.param(f"alpha_{l}", nn.initializers.zeros, ())
+                h = alpha * q + (1.0 - alpha) * h  # eq. 4.7
+
+            psi_hat = dense(1)(h)
+        else:
+            for dim in self.hidden_dims:
+                x = dense(dim)(x)
+                x = nn.swish(x)
+
+            psi_hat = dense(1)(x)
+
         return psi_hat
 
 
 # --- Sampler ---
 BASE_SEED = 42
 RESAMPLING_FREQUENCY = 10  # Resample training set every N epochs
-LOG_FREQUENCY = 10  # Log training metrics every N epochs
-N_VALIDATION_SIZE = 128  # Number of validation plasma configs
-VALIDATION_FREQUENCY = 5 * LOG_FREQUENCY  # Evaluate validation set every N epochs
+N_VALIDATION_SIZE = KPI_EVAL_CONFIGS  # Number of validation plasma configs
+VALIDATION_FREQUENCY = 50  # Evaluate validation set every N epochs
+# Early stopping is always on. If it fires prematurely, the run is misconfigured
+# (LR band too high/low, oversized budget); fix that or adjust the improvement
+# threshold below — do not add a bypass flag.
+EARLY_STOPPING_PATIENCE = 6  # Stop after this many non-improving validation rounds
+EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT = 0.01
+EARLY_STOPPING_ROLLING_WINDOW = 3
+
+
+class _Patience:
+    """Track meaningful improvements in a rolling-average validation metric."""
+
+    def __init__(self, patience: int, min_relative_improvement: float, window: int) -> None:
+        if patience < 1 or window < 1 or min_relative_improvement < 0:
+            raise ValueError(
+                "Early-stopping patience/window must be positive and min delta non-negative"
+            )
+        self.patience = patience
+        self.min_relative_improvement = min_relative_improvement
+        self.values: deque[float] = deque(maxlen=window)
+        self.best_value = float("inf")
+        self.best_epoch: int | None = None
+        self.rounds_without_improvement = 0
+
+    def update(self, epoch: int, value: float) -> tuple[bool, bool]:
+        self.values.append(value)
+        if len(self.values) < self.values.maxlen:
+            return False, False
+
+        rolling_average = sum(self.values) / len(self.values)
+        improved = rolling_average <= self.best_value * (1.0 - self.min_relative_improvement)
+        if improved:
+            self.best_value = rolling_average
+            self.best_epoch = epoch
+            self.rounds_without_improvement = 0
+        else:
+            self.rounds_without_improvement += 1
+        return self.rounds_without_improvement >= self.patience, improved
 
 
 class Sampler:
@@ -251,58 +429,143 @@ class Sampler:
         return FluxInput(R_sample=R_int, Z_sample=Z_int, config=configs)
 
 
-# --- Manager for Training / Inference ---
-class NetworkManager:
-    def __init__(self, config: HyperParams, seed: int = BASE_SEED) -> None:
+# ---------------------------------------------------------------------------
+# FoundationModel — frozen checkpoint used as a constant prior
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class FoundationModel:
+    """A converged FluxPINN bound to a specific frozen checkpoint.
+
+    Its params are a constant prior — never part of the trainable pytree.
+    Used by the multistage corrector: stage-1 is wrapped here so jax.grad
+    differentiates only stage-2 params while R/Z derivatives still flow through
+    the sum (arXiv 2407.17213 / 2507.16636).
+    """
+
+    model: FluxPINN
+    params: any
+
+    @property
+    def apply_fn(self) -> Callable:
+        return self.model.apply
+
+
+# ---------------------------------------------------------------------------
+# _Field — owns the psi-function (single net or composed with a frozen prior)
+# ---------------------------------------------------------------------------
+
+
+class _Field:
+    """Builds and owns the psi-function for a Trainer.
+
+    For a plain network: ``psi_fn(params, R, Z, cfg) = apply_psi_fn(head, params, ...)``.
+    For a corrector: ``psi_fn(params, R, Z, cfg) = psi_stage1(frozen) + scale *
+    psi_stage2(params)``.
+    The prior's params are closed over as constants so jax.grad on the corrector
+    differentiates only stage-2 params.
+    """
+
+    def __init__(
+        self,
+        head_apply_fn: Callable,
+        *,
+        soft_bc: bool,
+        prior: FoundationModel | None = None,
+        scale: float = 1.0,
+    ) -> None:
+        self._head_apply_fn = head_apply_fn
+        self._soft_bc = soft_bc
+        self._prior = prior
+        self._scale = scale
+
+    @property
+    def is_corrector(self) -> bool:
+        return self._prior is not None
+
+    def make_psi_fn(
+        self,
+    ) -> Callable[[any, jnp.ndarray, jnp.ndarray, PlasmaConfig], jnp.ndarray]:
+        """Return a ``(params, R, Z, cfg) -> psi`` callable for this field."""
+        soft_bc = self._soft_bc
+        head_apply_fn = self._head_apply_fn
+        if self._prior is None:
+            return functools.partial(apply_psi_fn, head_apply_fn, soft_bc=soft_bc)
+
+        prior_apply_fn = self._prior.apply_fn
+        prior_params = self._prior.params  # closed over as constant
+        scale = self._scale
+
+        def psi_fn(params: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
+            psi1 = apply_psi_fn(prior_apply_fn, prior_params, R, Z, cfg, soft_bc=soft_bc)
+            psi2 = apply_psi_fn(head_apply_fn, params, R, Z, cfg, soft_bc=soft_bc)
+            return psi1 + scale * psi2
+
+        return psi_fn
+
+
+# ---------------------------------------------------------------------------
+# Trainer — model, sampler, optimizer/JIT state, and the training loop
+# ---------------------------------------------------------------------------
+
+
+class Trainer:
+    """Owns the FluxPINN, Sampler, optimizer/JIT state, and the training loop.
+
+    Reports progress through an optional ``TrainingObserver`` callback instead
+    of touching Rich, Plotext, or the filesystem — those live in
+    ``network_manager.NetworkManager``, which composes a Trainer and subscribes
+    to its events.
+    """
+
+    def __init__(
+        self,
+        config: HyperParams,
+        seed: int = BASE_SEED,
+        n_validation_size: int = N_VALIDATION_SIZE,
+        *,
+        prior: FoundationModel | None = None,
+        scale: float = 1.0,
+    ) -> None:
         self.config = config
         self.seed = seed
+        self.n_validation_size = n_validation_size
         self.model = FluxPINN(
             hidden_dims=config.hidden_dims,
+            n_fourier_features=config.n_fourier_features,
+            fourier_sigma=config.fourier_sigma,
+            rwf=config.rwf,
+            arch=config.arch,
         )
         self.sampler: Sampler = Sampler(config, seed=self.seed)
+        self._validation_kpi_configs: list | None = None
         self.state = self._init_state()
 
-        self._psi_fn_jit = jax.jit(self.make_psi_fn())
+        # _Field owns the psi-function; for a corrector it closes over prior.params as a constant.
+        self._field = _Field(
+            self.model.apply,
+            soft_bc=config.soft_bc,
+            prior=prior,
+            scale=scale,
+        )
+        self._psi_fn = self._field.make_psi_fn()
+        self._psi_fn_jit = jax.jit(self._psi_fn)
+
+        self._prior = prior
+        self._scale = scale
+        self._lbfgs_params: any = None
 
         self.train_set = self.sampler._get_sobol_sample(
             n_samples=self.config.n_train,
             lower_bounds=self.sampler._domain_lower_bounds,
             upper_bounds=self.sampler._domain_upper_bounds,
         )
-        self.training_log: list[dict] = []
 
-    def to_disk(self) -> None:
-        timestamp = datetime.now().strftime("%Y_%m_%d_%H_%M")
-        latest_commit = os.popen("git rev-parse --short HEAD").read().strip() or "no_git"
-
-        output_dir = Path(Filepaths.NETWORKS)
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        artifact_stem = f"pinn_{timestamp}_{latest_commit}"
-        artifact_flax_path = output_dir / f"{artifact_stem}.flax"
-        artifact_json_path = output_dir / f"{artifact_stem}.json"
-        artifact_log_path = output_dir / f"{artifact_stem}.csv"
-
-        artifact_flax_path.write_bytes(flax.serialization.to_bytes(self.state.params))
-        self.config.to_json(path=str(artifact_json_path))
-
-        if self.training_log:
-            with open(artifact_log_path, "w") as f:
-                f.write(
-                    "epoch,lr,moving_avg_loss,val_loss,residual,boundary,grad_norm,epoch_time\n"
-                )
-                for entry in self.training_log:
-                    vl = f"{entry['val_loss']:.6f}" if entry["val_loss"] is not None else ""
-                    f.write(
-                        f"{entry['epoch']},{entry['lr']:.2e},{entry['moving_avg_loss']:.6f},"
-                        f"{vl},{entry['residual']:.6f},{entry['boundary']:.6f},"
-                        f"{entry['grad_norm']:.6f},{entry['epoch_time']:.4f}\n"
-                    )
-
-    def from_disk(self, pinn_path) -> any:  # noqa
-        """Load Flax model parameters from disk."""
-        with open(pinn_path, "rb") as f:
-            return flax.serialization.from_bytes(self.state.params, f.read())
+        # Instance-level jitted train_step — closed over self._psi_fn so both the plain
+        # and composed cases use one kernel.  soft_bc must stay static (pinn_loss_function
+        # declares it static_argnames) so it is declared static here too.
+        self._train_step_jit = jax.jit(self._train_step, static_argnames=("soft_bc",))
 
     def _init_state(self) -> train_state.TrainState:
         """Initialize the training state with dummy data."""
@@ -338,24 +601,27 @@ class NetworkManager:
         """Calculate total epochs."""
         return self.config.warmup_epochs + self.config.decay_epochs
 
+    @property
+    def lbfgs_params(self) -> any:
+        """Polished params from the last ``lbfgs()`` call, or None if not run."""
+        return self._lbfgs_params
+
     @staticmethod
     def compute_loss(
         params: any,
-        apply_fn: Callable,
+        psi_fn: Callable,
         inputs: FluxInput,
         weight_boundary_condition: float,
+        huber_delta: float,
+        weight_flux_scale: float,
+        soft_bc: bool,
     ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-        """Pure function to compute physics loss. Reusable for both training and evaluation."""
+        """Pure function to compute physics loss given an explicit psi_fn.
 
-        # Define psi_fn locally for JIT stability.
-        # Using _make_psi_fn() would create new function objects per step, risking cache misses.
-        def psi_fn(p: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
-            """Adapter converting neural network output to physical psi flux."""
-            inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
-            p_n, r_n, z_n = inp.normalize()
-            psi_n = apply_fn(p, r=r_n, z=z_n, **p_n)
-            return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
-
+        ``psi_fn`` is ``(params, R, Z, cfg) -> psi``.  For a plain network pass
+        ``functools.partial(apply_psi_fn, apply_fn, soft_bc=soft_bc)``; for a
+        corrector pass the composed fn from ``_Field.make_psi_fn()``.
+        """
         total, l_res, l_dir, l_per_cfg = pinn_loss_function(
             psi_fn,
             params,
@@ -363,305 +629,293 @@ class NetworkManager:
             inputs.Z_sample,
             inputs.config,
             weight_boundary_condition=weight_boundary_condition,
+            huber_delta=huber_delta,
+            weight_flux_scale=weight_flux_scale,
+            soft_bc=soft_bc,
         )
         return total, (l_res, l_dir, l_per_cfg)
 
     @staticmethod
-    @jax.jit
+    @partial(jax.jit, static_argnames=("soft_bc",))
     def eval_step(
         state: train_state.TrainState,
         inputs: FluxInput,
         weight_boundary_condition: float,
+        huber_delta: float,
+        weight_flux_scale: float,
+        soft_bc: bool,
     ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """Fast, gradient-free evaluation step returning all loss components."""
-        total, (l_res, l_dir, l_per_cfg) = NetworkManager.compute_loss(
-            state.params, state.apply_fn, inputs, weight_boundary_condition
+        psi_fn = functools.partial(apply_psi_fn, state.apply_fn, soft_bc=soft_bc)
+        total, (l_res, l_dir, l_per_cfg) = Trainer.compute_loss(
+            state.params,
+            psi_fn,
+            inputs,
+            weight_boundary_condition,
+            huber_delta,
+            weight_flux_scale,
+            soft_bc,
         )
         return total, l_res, l_dir, l_per_cfg
 
-    def _create_validation_configs(self) -> np.ndarray:
-        """Create fixed validation plasma configs using Sobol sampling."""
-        lower, upper = DomainBounds.get_bounds()
-        sobol = qmc.Sobol(d=len(lower), scramble=True, seed=BASE_SEED + 123)
-        samples = sobol.random(N_VALIDATION_SIZE)
-        return np.array(qmc.scale(samples, lower, upper), dtype=np.float32)
+    def validation_configs(self) -> list:
+        """The trainer's fixed validation configs: the first n_validation_size of the
+        shared KPI config stream (kpi_benchmark_configs), so training-time tracking,
+        HPO ranking and run.json KPIs all score identical PlasmaConfig objects.
 
-    def _calculate_validation_loss(self, val_configs: np.ndarray) -> float:
-        """Calculate validation loss using gradient-free eval_step."""
-        chunk_size = 128
-        total_loss = 0.0
-        n_chunks = 0
-        weight_bc = self.config.weight_boundary_condition
-        self.sampler.precompute_coordinate_samples()
+        PlasmaConfig construction bakes the building sampler's boundary-theta draw
+        into the Fourier fit, so configs must come from ``self.sampler`` — a
+        separately-seeded sampler yields subtly different boundaries for the same
+        domain vectors.
+        """
+        from src.engine.model_evaluation import kpi_benchmark_configs
 
-        for i in range(0, len(val_configs), chunk_size):
-            end = min(i + chunk_size, len(val_configs))
-            batch = jnp.array(val_configs[i:end], dtype=jnp.float32)
-            inputs = self.sampler.sample_flux_input(plasma_configs=batch)
-            loss, _, _, _ = self.eval_step(self.state, inputs, weight_bc)
-            total_loss += float(loss)
-            n_chunks += 1
+        if self._validation_kpi_configs is None:
+            self._validation_kpi_configs = kpi_benchmark_configs(self, self.n_validation_size)
+        return self._validation_kpi_configs
 
-        return total_loss / n_chunks
+    def _calculate_validation_kpis(self) -> tuple[float, float, float]:
+        """p05/p50/p95 |R_GS| over the fixed validation configuration stream."""
+        from src.engine.model_evaluation import evaluate_plasma_kpis
 
-    @staticmethod
-    @jax.jit
-    def train_step(
+        kpis = evaluate_plasma_kpis(
+            self, self.validation_configs(), sample_size=KPI_POINTS_PER_CONFIG
+        )
+        return kpis["loss_p05"], kpis["loss_median"], kpis["loss_p95"]
+
+    def _train_step(
+        self,
         state: train_state.TrainState,
         inputs: FluxInput,
         weight_boundary_condition: float,
+        huber_delta: float,
+        weight_flux_scale: float,
+        soft_bc: bool,
     ) -> tuple[
-        train_state.TrainState, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray
+        train_state.TrainState,
+        jnp.ndarray,
+        jnp.ndarray,
+        jnp.ndarray,
+        jnp.ndarray,
+        jnp.ndarray,
     ]:
-        """Perform a single training step using physics-informed gradients."""
+        """Single training step; closed over self._psi_fn so plain/corrector share one kernel."""
+        psi_fn = self._psi_fn
 
-        # Rematerializes activations during backprop. Trades compute for memory,
-        # enabling training of larger networks with limited GPU memory.
         @jax.checkpoint
         def loss_wrapper(
             params: any,
         ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-            """Wrap compute loss to enable gradient computation"""
-            return NetworkManager.compute_loss(
-                params, state.apply_fn, inputs, weight_boundary_condition
+            return Trainer.compute_loss(
+                params,
+                psi_fn,
+                inputs,
+                weight_boundary_condition,
+                huber_delta,
+                weight_flux_scale,
+                soft_bc,
             )
 
         (loss, (l_res, l_dir, l_per_cfg)), grads = jax.value_and_grad(loss_wrapper, has_aux=True)(
             state.params
         )
         grad_norm = optax.tree_utils.tree_norm(grads)
-        return state.apply_gradients(grads=grads), loss, l_res, l_dir, l_per_cfg, grad_norm
+        return (
+            state.apply_gradients(grads=grads),
+            loss,
+            l_res,
+            l_dir,
+            l_per_cfg,
+            grad_norm,
+        )
 
     def train_epoch(self, epoch: int) -> tuple[float, float, float, float]:
-        """Run one training epoch.
-
-        Returns:
-            Tuple of (total_loss, residual_loss, boundary_loss, grad_norm).
-        """
-        loss, l_res, l_dir, b_grad_norm = 0.0, 0.0, 0.0, 0.0
+        """Run one training epoch and aggregate every minibatch."""
         self.sampler.precompute_coordinate_samples()
 
-        all_losses = []
+        losses = []
+        residuals = []
+        boundaries = []
+        batch_sizes = []
+        per_config_losses = []
         grad_norms = []
 
         for i in range(0, len(self.train_set), self.config.batch_size):
             train_batch = self.train_set[i : i + self.config.batch_size]
             inputs = self.sampler.sample_flux_input(plasma_configs=train_batch)
-            self.state, loss, l_res, l_dir, per_config_loss, b_grad_norm = self.train_step(
-                state=self.state,
-                inputs=inputs,
-                weight_boundary_condition=self.config.weight_boundary_condition,
+            (
+                self.state,
+                loss,
+                l_res,
+                l_dir,
+                per_config_loss,
+                grad_norm,
+            ) = self._train_step_jit(
+                self.state,
+                inputs,
+                self.config.weight_boundary_condition,
+                self.config.huber_delta,
+                self.config.weight_flux_scale,
+                self.config.soft_bc,
             )
-            all_losses.append(per_config_loss)
-            grad_norms.append(b_grad_norm)
-
-        avg_grad_norm = float(jnp.mean(jnp.array(grad_norms)))
+            losses.append(loss)
+            residuals.append(l_res)
+            boundaries.append(l_dir)
+            batch_sizes.append(len(train_batch))
+            per_config_losses.append(per_config_loss)
+            grad_norms.append(grad_norm)
 
         if epoch % RESAMPLING_FREQUENCY == 0 and epoch > 0:
             self.train_set = self.sampler.resample_train_set(
                 train_set=self.train_set,
                 epoch=epoch,
-                per_config_losses=all_losses,
+                per_config_losses=per_config_losses,
             )
 
-        return float(loss), float(l_res), float(l_dir), avg_grad_norm
+        weights = jnp.asarray(batch_sizes)
 
-    def _init_live_display(self) -> Live:
-        """Set up Rich table, progress bar, and accumulators for live training display."""
-        self._table = Table(title="Training Metrics", show_header=True, header_style="bold cyan")
-        self._table.add_column("Epoch", justify="right", style="cyan")
-        self._table.add_column("LR", justify="right", style="yellow")
-        self._table.add_column("||∇L||", justify="right", style="magenta")
-        self._table.add_column(
-            "Loss = Residual + w*Boundary", justify="right", style="magenta", no_wrap=True
-        )
-        self._table.add_column("Val Loss", justify="right", style="green")
-        self._table.add_column("Time/Ep", justify="right")
+        def weighted_mean(values: list[jnp.ndarray]) -> float:
+            return float(jnp.average(jnp.asarray(values), weights=weights))
 
-        self._progress = Progress(
-            TextColumn("[bold cyan]{task.description}"),
-            BarColumn(style="cyan", complete_style="bold cyan"),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            console=console,
-            transient=False,
-        )
-        self._epoch_task = self._progress.add_task("Training", total=self.epochs)
-
-        self._accumulated_loss = 0.0
-        self._accumulated_residual = 0.0
-        self._accumulated_boundary = 0.0
-        self._accumulated_grad_norm = 0.0
-        self._accumulated_time = 0.0
-
-        return Live(
-            Panel(Group(self._table, self._progress), border_style="cyan"),
-            refresh_per_second=10,
-            console=console,
-            vertical_overflow="visible",
+        return (
+            weighted_mean(losses),
+            weighted_mean(residuals),
+            weighted_mean(boundaries),
+            weighted_mean(grad_norms),
         )
 
-    def _log_metric(
-        self,
-        epoch: int,
-        loss: float,
-        residual: float,
-        boundary: float,
-        val_loss: float | None,
-        lr: float,
-        grad_norm: float,
-        epoch_time: float,
-    ) -> None:
-        self._accumulated_loss += loss
-        self._accumulated_residual += residual
-        self._accumulated_boundary += boundary
-        self._accumulated_grad_norm += grad_norm
-        self._accumulated_time += epoch_time
+    def train(self, observer: TrainingObserver | None = None) -> TrainingResult:
+        """Run the full training loop: epoch budget, validation, early stopping, L-BFGS polish.
 
-        val_loss_str = f"{val_loss:.3f}" if val_loss is not None else "-"
-        lr_str = f"{lr:.2e}"
+        ``observer`` is called once per epoch with an ``EpochMetrics`` event (a
+        ``TrainingObserver``); it is the sole progress-reporting seam so this
+        method never touches Rich, Plotext, or the filesystem.
+        """
+        training_started = time.perf_counter()
+        self._lbfgs_params = None
+        lbfgs_val_kpis = None
+        val_kpis = None
+        stopper = _Patience(
+            EARLY_STOPPING_PATIENCE,
+            EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT,
+            EARLY_STOPPING_ROLLING_WINDOW,
+        )
+        best_model = None
+        trained_epochs = 0
+        stop_reason = "epoch_budget"
 
-        if (epoch + 1) % LOG_FREQUENCY == 0:
-            moving_avg_loss = self._accumulated_loss / LOG_FREQUENCY
-            moving_avg_residual = self._accumulated_residual / LOG_FREQUENCY
-            moving_avg_boundary = self._accumulated_boundary / LOG_FREQUENCY
-            moving_avg_grad_norm = self._accumulated_grad_norm / LOG_FREQUENCY
-            moving_avg_time = self._accumulated_time / LOG_FREQUENCY
+        for epoch in range(self.epochs):
+            start_time = time.perf_counter()
+            loss, residual, boundary, grad_norm = self.train_epoch(epoch)
+            epoch_time = time.perf_counter() - start_time
 
-            self.training_log.append(
-                {
-                    "epoch": epoch + 1,
-                    "lr": lr,
-                    "moving_avg_loss": moving_avg_loss,
-                    "val_loss": val_loss,
-                    "residual": moving_avg_residual,
-                    "boundary": moving_avg_boundary,
-                    "grad_norm": moving_avg_grad_norm,
-                    "epoch_time": moving_avg_time,
-                }
-            )
+            val_kpis = None
+            should_stop = False
+            if (epoch + 1) % VALIDATION_FREQUENCY == 0:
+                val_kpis = self._calculate_validation_kpis()
+                should_stop, improved = stopper.update(epoch + 1, val_kpis[1])
+                if improved:
+                    best_model = self.state.params
+                    best_model_kpis = val_kpis
 
-            w = self.config.weight_boundary_condition
-            loss_str = f"{moving_avg_loss:>9.3f} = {moving_avg_residual:>6.3f} + {w:g}*{moving_avg_boundary:>8.3f}"
-            self._table.add_row(
-                f"{epoch + 1}/{self.epochs}",
-                lr_str,
-                f"{moving_avg_grad_norm:.3f}",
-                loss_str,
-                val_loss_str,
-                f"{moving_avg_time:.2f}s",
-            )
-
-            self._accumulated_loss = 0.0
-            self._accumulated_residual = 0.0
-            self._accumulated_boundary = 0.0
-            self._accumulated_grad_norm = 0.0
-            self._accumulated_time = 0.0
-        else:
-            count = (epoch + 1) % LOG_FREQUENCY
-            self.training_log.append(
-                {
-                    "epoch": epoch + 1,
-                    "lr": lr,
-                    "moving_avg_loss": self._accumulated_loss / count,
-                    "val_loss": val_loss,
-                    "residual": self._accumulated_residual / count,
-                    "boundary": self._accumulated_boundary / count,
-                    "grad_norm": self._accumulated_grad_norm / count,
-                    "epoch_time": self._accumulated_time / count,
-                }
-            )
-
-        self._progress.update(self._epoch_task, advance=1)
-        self._live.update(Panel(Group(self._table, self._progress), border_style="cyan"))
-
-    def train(self, save_to_disk: bool = True) -> None:
-        live = self._init_live_display()
-        val_configs = self._create_validation_configs()
-        with live as self._live:
-            for epoch in range(self.epochs):
-                start_time = time.perf_counter()
-                loss, residual, boundary, grad_norm = self.train_epoch(epoch)
-                epoch_time = time.perf_counter() - start_time
-
-                val_loss = None
-                if (epoch + 1) % VALIDATION_FREQUENCY == 0:
-                    val_loss = self._calculate_validation_loss(val_configs)
-
-                lr = float(self._lr_schedule(self.state.step))
-                self._log_metric(
-                    epoch, loss, residual, boundary, val_loss, lr, grad_norm, epoch_time
+            lr = float(self._lr_schedule(self.state.step))
+            trained_epochs = epoch + 1
+            if observer is not None:
+                observer(
+                    EpochMetrics(
+                        epoch=epoch,
+                        loss=loss,
+                        residual_loss=residual,
+                        boundary_loss=boundary,
+                        gradient_norm=grad_norm,
+                        learning_rate=lr,
+                        duration_seconds=epoch_time,
+                        validation=ValidationMetrics(*val_kpis) if val_kpis is not None else None,
+                        should_stop=should_stop,
+                    )
                 )
+            if should_stop:
+                stop_reason = "early_stopping"
+                logger.info(
+                    f"early stopping at epoch {trained_epochs}: no >= "
+                    f"{EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT:.1%} rolling-average "
+                    f"validation improvement for {EARLY_STOPPING_PATIENCE} rounds"
+                )
+                break
 
-        if save_to_disk:
-            self.to_disk()
+        # Restore best model
+        self.state = self.state.replace(params=best_model)
+        val_kpis = best_model_kpis
+
+        if stop_reason != "early_stopping" and self.config.lbfgs_steps > 0:
+            adamw_params = self.state.params
+            self.lbfgs(self.config.lbfgs_steps)
+            self._lbfgs_params = self.state.params
+            lbfgs_val_kpis = self._calculate_validation_kpis()
+            # Canonical weights stay the AdamW result; polish must never
+            # overwrite them, so the polished set is persisted separately.
+            self.state = self.state.replace(params=adamw_params)
+
+        return TrainingResult(
+            stop_reason=stop_reason,
+            trained_epochs=trained_epochs,
+            planned_epochs=self.epochs,
+            final_validation=ValidationMetrics(*val_kpis),
+            best_epoch=stopper.best_epoch,
+            best_smoothed_validation_p50=(
+                stopper.best_value if stopper.best_epoch is not None else None
+            ),
+            lbfgs_validation=(
+                ValidationMetrics(*lbfgs_val_kpis) if lbfgs_val_kpis is not None else None
+            ),
+            optimizer_updates=int(self.state.step),
+            duration_seconds=time.perf_counter() - training_started,
+        )
+
+    def lbfgs(self, steps: int, learning_rate: float | None = 0.1) -> None:
+        """Polish AdamW-trained params with L-BFGS on one fixed batch."""
+        self.sampler.precompute_coordinate_samples()
+        batch = self.train_set[: self.config.batch_size]
+        inputs = self.sampler.sample_flux_input(plasma_configs=batch)
+        psi_fn = self._psi_fn
+
+        def loss_fn(params: any) -> jnp.ndarray:
+            total, _ = Trainer.compute_loss(
+                params,
+                psi_fn,
+                inputs,
+                self.config.weight_boundary_condition,
+                self.config.huber_delta,
+                self.config.weight_flux_scale,
+                self.config.soft_bc,
+            )
+            return total
+
+        # Damped steps: the polish objective is a single fixed batch, and full
+        # linesearch-sized quasi-Newton steps over-specialize to it at the
+        # expense of full-distribution KPIs.
+        opt = optax.lbfgs(learning_rate=learning_rate)
+
+        @jax.jit
+        def step(params: any, opt_state: any) -> tuple[any, any, jnp.ndarray]:
+            value, grad = optax.value_and_grad_from_state(loss_fn)(params, state=opt_state)
+            updates, opt_state = opt.update(
+                grad, opt_state, params, value=value, grad=grad, value_fn=loss_fn
+            )
+            return optax.apply_updates(params, updates), opt_state, value
+
+        params = self.state.params
+        opt_state = opt.init(params)
+        for i in range(steps):
+            params, opt_state, value = step(params, opt_state)
+            if (i + 1) % 20 == 0 or i == 0:
+                logger.info(f"L-BFGS polish step {i + 1}/{steps}: loss {float(value):.6f}")
+        self.state = self.state.replace(params=params)
 
     def get_psi(self, R: jnp.ndarray, Z: jnp.ndarray, config: PlasmaConfig) -> jnp.ndarray:
-        """Evaluate magnetic flux psi at physical coordinates.
-
-        Convenience method for inference and visualization. Uses pre-compiled
-        psi function from initialization. Handles input normalization and output
-        denormalization internally.
-
-        Args:
-            R: Batch of major radial coordinates [m]
-            Z: Batch of vertical coordinates [m]
-            config: Plasma geometry and state parameters
-
-        Returns:
-            Array of flux values in Weber
-        """
+        """Evaluate magnetic flux psi at physical coordinates."""
         return self._psi_fn_jit(self.state.params, R, Z, config)
 
     def make_psi_fn(self) -> Callable[[any, jnp.ndarray, jnp.ndarray, PlasmaConfig], jnp.ndarray]:
-        """Factory returning a psi function bound to this network instance.
-
-        This pattern is necessary due to JAX's functional paradigm, that requires stateless
-        pure functions. The closure captures network state (apply_fn), providing a
-        stateful callable interface while maintaining JIT compatibility.
-
-        Returns:
-            Callable[(params, R, Z, config) -> psi] for physics calculations.
-        """
-        apply_fn = self.model.apply
-
-        def psi_fn(p: any, R: jnp.ndarray, Z: jnp.ndarray, cfg: PlasmaConfig) -> jnp.ndarray:
-            inp = FluxInput(R_sample=R, Z_sample=Z, config=cfg)
-            p_n, r_n, z_n = inp.normalize()
-            psi_n = apply_fn(p, r=r_n, z=z_n, **p_n)
-            return (psi_n * cfg.State.F_axis * cfg.Geometry.a).squeeze()
-
-        return psi_fn
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train PINN network")
-    parser.add_argument(
-        "--test", action="store_true", help="Run with minimal parameters for rapid iteration"
-    )
-    args = parser.parse_args()
-
-    try:
-        if not args.test:
-            config = HyperParams()
-            manager = NetworkManager(config)
-            manager.train(save_to_disk=True)
-        else:
-            globals()["N_VALIDATION_SIZE"] = 16
-            globals()["VALIDATION_FREQUENCY"] = 20
-            config = HyperParams(
-                hidden_dims=(32, 32),
-                batch_size=8,
-                n_rz_inner_samples=64,
-                n_rz_boundary_samples=16,
-                n_train=64,
-                warmup_epochs=20,
-                decay_epochs=20,
-            )
-            manager = NetworkManager(config)
-            manager.train(save_to_disk=False)
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:
-        logger.error(f"Execution failed with an error: {e}", exc_info=True)
-        raise
+        """Factory returning the psi function for this field (single or composed)."""
+        return self._field.make_psi_fn()

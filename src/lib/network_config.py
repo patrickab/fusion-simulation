@@ -1,5 +1,7 @@
+from dataclasses import dataclass
 import json
 from pathlib import Path
+from typing import Literal, Protocol
 
 from flax import struct
 import jax.numpy as jnp
@@ -13,14 +15,44 @@ class HyperParams(BaseModel):
     """Central configuration for the experiment."""
 
     hidden_dims: tuple[int, ...] = (128, 128, 128, 128)
+    # 0.0 → MSE PDE loss; >0 → optax Huber loss with this delta. Ablation 1
+    # (kinked LUT boundary) had Huber winning clearly; grid 2 (smooth Fourier
+    # boundary envelope) closed the gap — mse core_med 0.388 vs huber 0.420
+    # plain, huber 0.383 vs mse 0.502 with nff=64 — confirming the kinked
+    # boundary, not the loss, was ablation 1's real culprit. Kept as a toggle
+    # since the two losses are now close enough to depend on architecture.
+    huber_delta: float = 1.0
+    # random Fourier features on (r, z); 0 = plain MLP. nff=64 gave the best
+    # core median in grid 2 (2026-07-11) at the cost of a noisier boundary
+    # shell (edge_p95/bnd_leak both ~2-3x higher) — tolerated per the
+    # core-first selection rule, and is the CLI default for new training runs
+    # (src/engine/network.py --fourier-features). Keep the dataclass default at
+    # zero so programmatic HyperParams() remains the plain-MLP baseline.
+    n_fourier_features: int = 0
+    fourier_sigma: float = 2.0
+    # L-BFGS polish steps on a fixed batch after AdamW; 0 = off. Grid 2 showed
+    # no consistent gain (made plain-huber worse: 0.460 vs 0.420) for
+    # 1.5-8min/run extra cost — not worth defaulting on.
+    lbfgs_steps: int = 0
     learning_rate_max: float = 2e-3
     learning_rate_min: float = 5e-5
     weight_decay: float = 1e-7
     weight_boundary_condition: float = 10.0
+    # Collapse-guard hinge: penalizes interior-mean ψ below 0.05·F_axis·a (also
+    # pins the ψ>0-at-axis sign convention); zero loss once above the floor.
+    weight_flux_scale: float = 10.0
+    # Train like legacy bb503b0: raw ψ output + Dirichlet/Neumann penalties (no envelope).
+    soft_bc: bool = False
+    # Random Weight Factorization (Wang et al. arXiv 2210.01274): reparametrize each
+    # dense kernel as W = diag(exp(s)) · V to improve PINN accuracy.
+    rwf: bool = False
+    # Network architecture: "mlp" = plain MLP (default, existing behaviour), "piratenet" =
+    # PirateNet residual blocks (arXiv 2402.00326, eq. 4.1-4.7).
+    arch: str = "mlp"
     sigma_residual_adaptive_sampling: float = 0.05
     batch_size: int = 64
-    n_rz_inner_samples: int = 2048
-    n_rz_boundary_samples: int = 256
+    n_rz_inner_samples: int = 512
+    n_rz_boundary_samples: int = 128
     n_train: int = 1024
     warmup_epochs: int = 100
     decay_epochs: int = 500
@@ -125,3 +157,53 @@ class FluxInput(BaseModel):
         return (jnp.atleast_1d(self.config.State.F_axis) * jnp.atleast_1d(self.config.Geometry.a))[
             :, jnp.newaxis, jnp.newaxis
         ]
+
+
+# --- C. Trainer/NetworkManager seam ---
+# Shared result/event types so network.py's Trainer never has to import Rich,
+# Plotext, or filesystem code (owned by network_manager.py) to report progress.
+
+
+@dataclass(frozen=True)
+class ValidationMetrics:
+    p05: float
+    p50: float
+    p95: float
+
+
+@dataclass(frozen=True)
+class EpochMetrics:
+    """One epoch's training result, emitted to a TrainingObserver.
+
+    ``epoch`` is the 0-indexed loop counter (matches Trainer.train_epoch's
+    ``epoch`` argument); ``validation`` is set only on validation rounds.
+    ``should_stop`` mirrors the patience decision for this epoch so an
+    observer can suppress a final report right before training stops.
+    """
+
+    epoch: int
+    loss: float
+    residual_loss: float
+    boundary_loss: float
+    gradient_norm: float
+    learning_rate: float
+    duration_seconds: float
+    validation: ValidationMetrics | None = None
+    should_stop: bool = False
+
+
+@dataclass(frozen=True)
+class TrainingResult:
+    stop_reason: Literal["epoch_budget", "early_stopping"]
+    trained_epochs: int
+    planned_epochs: int
+    final_validation: ValidationMetrics
+    best_epoch: int | None
+    best_smoothed_validation_p50: float | None
+    lbfgs_validation: ValidationMetrics | None
+    optimizer_updates: int
+    duration_seconds: float
+
+
+class TrainingObserver(Protocol):
+    def __call__(self, event: EpochMetrics) -> None: ...

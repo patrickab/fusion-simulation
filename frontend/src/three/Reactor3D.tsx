@@ -1,19 +1,12 @@
 import { useEffect, useMemo } from 'react'
 import * as THREE from 'three'
-import type { BFieldResponse, SurfaceGrid } from '../api'
+import type { FieldLinesResponse, SurfaceGrid } from '../api'
 import { buildFieldLineSegments } from './fieldlines'
 import { sparseWireframe } from './mesh'
 
 function useDisposable<T extends THREE.BufferGeometry[]>(geometries: T): T {
   useEffect(() => () => geometries.forEach((g) => g.dispose()), [geometries])
   return geometries
-}
-
-// ponytail: fires once per field response via effect, not during render —
-// keeps the |B| range (needed by the legend, which lives outside the canvas)
-// as a plain callback instead of introducing context/state management.
-function useRangeCallback(range: [number, number], onRange?: (r: [number, number]) => void) {
-  useEffect(() => onRange?.(range), [range, onRange])
 }
 
 // WebGL lineWidth is capped at 1px — "thinner" is done via opacity, not width
@@ -47,16 +40,8 @@ export function PlasmaWireframe({
 // depthWrite stays on (the default) so front strands occlude the ones behind
 // them like VTK's tubes do — with it off, strands at a bundled viewing angle
 // stack their alpha and flare bright instead of layering.
-export function FieldLines({
-  field,
-  onRange,
-}: {
-  field: BFieldResponse
-  onRange?: (range: [number, number]) => void
-}) {
-  const { geometry, range } = useMemo(() => buildFieldLineSegments(field), [field])
-  useDisposable(useMemo(() => [geometry], [geometry]))
-  useRangeCallback(range, onRange)
+export function FieldLines({ field }: { field: FieldLinesResponse }) {
+  const [geometry] = useDisposable(useMemo(() => [buildFieldLineSegments(field)], [field]))
   return (
     <lineSegments geometry={geometry}>
       <lineBasicMaterial vertexColors transparent opacity={0.6} />

@@ -1,10 +1,7 @@
-from datetime import datetime
-import json
-
-from src.engine.network import NetworkManager
-from src.lib.config import Filepaths
+from src.engine.network_manager import NetworkManager
 from src.lib.geometry_config import PlasmaConfig
 from src.lib.network_config import HyperParams
+from src.lib.run_artifacts import load_config
 from src.lib.visualization import (
     plot_flux_heatmap,
     plot_gs_residual_heatmap,
@@ -14,6 +11,7 @@ from src.streamlit.network_utils import (
     filter_networks_by_commit,
     get_available_commits,
     get_available_networks,
+    resolve_run_directory,
     to_plasma_config,
 )
 from src.streamlit.utils import reseed_network_visualisation
@@ -25,18 +23,16 @@ PLOT_GRID_RESOLUTION = 80
 
 
 def render_benchmark_row(network_name: str, configs: list[PlasmaConfig], mode: str) -> None:
-    pinn_path = Filepaths.NETWORKS / network_name
-    config_path = pinn_path.with_suffix(".json")
+    run_dir = resolve_run_directory(network_name)
 
-    if not config_path.exists():
+    if not (run_dir / "run.json").exists():
         st.error(f"Missing config for {network_name}")
         return
 
-    network_config = HyperParams.from_json(config_path)
-    with open(config_path) as f:
-        config_dict = json.load(f)
+    config_dict = load_config(run_dir)
+    network_config = HyperParams.from_dict(config_dict)
 
-    display_name = network_name.replace(".flax", "")
+    display_name = network_name
 
     with st.expander(display_name, expanded=True):
         col_meta, col_plots = st.columns([1, 4])
@@ -46,7 +42,7 @@ def render_benchmark_row(network_name: str, configs: list[PlasmaConfig], mode: s
 
         with col_plots:
             manager = NetworkManager(network_config)
-            params = manager.from_disk(pinn_path=pinn_path)
+            params = manager.from_disk(pinn_path=run_dir / "network.flax")
             manager.state = manager.state.replace(params=params)
 
             if mode in ["Flux Prediction", "Both"]:
@@ -59,7 +55,9 @@ def render_benchmark_row(network_name: str, configs: list[PlasmaConfig], mode: s
 
             if mode in ["GS Residual", "Both"]:
                 st.write("**Grad-Shafranov Residual**")
-                fig_res = plot_gs_residual_heatmap(manager, configs, resolution=PLOT_GRID_RESOLUTION)
+                fig_res = plot_gs_residual_heatmap(
+                    manager, configs, resolution=PLOT_GRID_RESOLUTION
+                )
                 apply_grid_layout(fig_res, len(configs))
                 st.plotly_chart(fig_res, width="stretch", key=f"res_{network_name}")
 
@@ -68,9 +66,9 @@ def init_session_state(networks: list[str]) -> None:
     if "manager" not in st.session_state:
         config = HyperParams()
         if networks:
-            config_path = (Filepaths.NETWORKS / networks[0]).with_suffix(".json")
-            if config_path.exists():
-                config = HyperParams.from_json(config_path)
+            run_dir = resolve_run_directory(networks[0])
+            if (run_dir / "run.json").exists():
+                config = HyperParams.from_dict(load_config(run_dir))
         st.session_state.manager = NetworkManager(config)
 
     st.session_state.setdefault("seed", 0)

@@ -13,6 +13,13 @@ from src.lib.geometry_config import (
 )
 
 
+def _fourier_basis(alpha: jnp.ndarray, n_harmonics: int) -> jnp.ndarray:
+    angles = alpha[..., None] * jnp.arange(1, n_harmonics + 1)
+    return jnp.concatenate(
+        [jnp.ones_like(alpha)[..., None], jnp.cos(angles), jnp.sin(angles)], axis=-1
+    )
+
+
 def get_poloidal_points(
     theta: float, plasma_geometry: PlasmaGeometry, scaling_factor: float = 1.0
 ) -> tuple[float, float]:
@@ -59,11 +66,20 @@ def calculate_poloidal_boundary(
     phi_array = jnp.full_like(R, phi)
     coords = CylindricalCoordinates(R=R, phi=phi_array, Z=Z)
 
+    dR = R - plasma_geometry.R0
+    radius = jnp.sqrt(dR**2 + Z**2)
+    alpha = jnp.arctan2(Z, dR)
+    n_harmonics = min(32, R.shape[0] // 4)
+    design = _fourier_basis(alpha, n_harmonics)
+    gram = design.T @ design + 1e-6 * jnp.eye(2 * n_harmonics + 1)
+    radius_fourier_coeffs = jnp.linalg.solve(gram, design.T @ radius)
+
     return PlasmaBoundary(
         coords=coords,
         theta=theta,
         dR_dtheta=dR_dtheta,
         dZ_dtheta=dZ_dtheta,
+        radius_fourier_coeffs=radius_fourier_coeffs,
         R_center=plasma_geometry.R0,
         Z_center=0.0,
     )
@@ -108,20 +124,45 @@ def calculate_fusion_plasma(plasma_boundary: PlasmaBoundary) -> FusionPlasma:
     )
 
 
+def boundary_normalized_radius(
+    R: jnp.ndarray,
+    Z: jnp.ndarray,
+    boundary: PlasmaBoundary,
+) -> jnp.ndarray:
+    """Radius of (R, Z) relative to the boundary curve; ~1.0 on the boundary.
+
+    Represents the boundary radius r(alpha) as a truncated Fourier series
+    fitted to the precomputed boundary points (ridge-regularized least
+    squares). Unlike the previous piecewise-linear angle interpolation, the
+    series is smooth in alpha, so second derivatives of the hard-BC envelope
+    (which enter the GS operator) carry no interpolation-kink noise — that
+    noise dominated the PDE residual near strongly shaped boundary tips.
+
+    The fit is exact only up to truncation error (~1e-4 relative for the
+    worst-case D-shape at 32 harmonics; more harmonics hit float32
+    conditioning), so psi=0 is enforced on the fitted curve; the
+    model_evaluation boundary-leakage KPI tracks the effect.
+
+    The boundary stores the fitted coefficients, so flux evaluations only
+    construct the basis at the query angle.
+    """
+    dR = R - boundary.R_center
+    dZ = Z - boundary.Z_center
+    # epsilon avoids the sqrt gradient singularity exactly at the magnetic axis
+    r_test = jnp.sqrt(dR**2 + dZ**2 + 1e-12)
+    alpha_test = jnp.arctan2(dZ, dR)
+
+    n_harmonics = (boundary.radius_fourier_coeffs.shape[0] - 1) // 2
+    r_boundary = _fourier_basis(alpha_test, n_harmonics) @ boundary.radius_fourier_coeffs
+    return r_test / r_boundary
+
+
 def is_point_in_plasma(
     coords_test: CylindricalCoordinates | CartesianCoordinates,
     plasma: PlasmaBoundary | FusionPlasma,
 ) -> jnp.ndarray:
     """
     Determine whether a point (or array of points) lies inside the plasma volume.
-
-    The algorithm exploits the toroidal symmetry of the Tokamak:
-        1. Project 3D coordinates onto the 2D Poloidal plane (R, Z).
-        2. Transform (R, Z) into local polar coordinates (r, theta) relative to the magnetic axis.
-        3. Interpolate the boundary radius at angle theta.
-        4. Compare test radius vs boundary radius.
-
-    Complexity: O(log N) per point due to binary search interpolation.
 
     Args:
         coords_test: Spatial coordinates of test points.
@@ -134,12 +175,8 @@ def is_point_in_plasma(
     is_inside : jnp.ndarray (bool)
         Boolean mask. True if the point lies strictly inside the boundary.
     """
-    # 1. Resolve Plasma Source
-    # If a full 3D plasma is passed, extract the 2D boundary definition
     boundary = plasma.Boundary if isinstance(plasma, FusionPlasma) else plasma
 
-    # 2. Normalize to 2D Poloidal Coordinates (R, Z)
-    # If Cartesian, project R = sqrt(X^2 + Y^2). If Cylindrical, use R directly.
     if isinstance(coords_test, CartesianCoordinates):
         R_test = jnp.sqrt(coords_test.X**2 + coords_test.Y**2)
         Z_test = coords_test.Z
@@ -147,36 +184,4 @@ def is_point_in_plasma(
         R_test = coords_test.R
         Z_test = coords_test.Z
 
-    # 3. Transform to Local Polar Coordinates (relative to Magnetic Axis)
-    # We shift the origin from the machine center (0,0) to the plasma center (R0, Z0)
-    dR = R_test - boundary.R_center
-    dZ = Z_test - boundary.Z_center
-
-    r_test = jnp.sqrt(dR**2 + dZ**2)
-    alpha_test = jnp.arctan2(dZ, dR)
-
-    # 4. Interpolate Boundary Radius
-    # We find the radius of the boundary at the exact angle of the test point.
-
-    # Compute boundary polar coordinates relative to magnetic axis
-    dR_boundary = boundary.R - boundary.R_center
-    dZ_boundary = boundary.Z - boundary.Z_center
-
-    r_geom = jnp.sqrt(dR_boundary**2 + dZ_boundary**2)
-    alpha_geom = jnp.arctan2(dZ_boundary, dR_boundary)
-
-    # Sort by angle to ensure valid interpolation input
-    sort_indices = jnp.argsort(alpha_geom)
-    alpha_geom = alpha_geom[sort_indices]
-    r_geom = r_geom[sort_indices]
-
-    # period=2pi ensures correct wrapping for angles near -pi/pi.
-    r_boundary = jnp.interp(
-        alpha_test,
-        alpha_geom,
-        r_geom,
-        period=2 * jnp.pi,
-    )
-
-    # 5. Check Containment
-    return r_test < r_boundary
+    return boundary_normalized_radius(R_test, Z_test, boundary) < 1.0
