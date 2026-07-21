@@ -800,7 +800,7 @@ class Trainer:
             EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT,
             EARLY_STOPPING_ROLLING_WINDOW,
         )
-        best_params = None
+        best_model = None
         trained_epochs = 0
         stop_reason = "epoch_budget"
 
@@ -815,7 +815,8 @@ class Trainer:
                 val_kpis = self._calculate_validation_kpis()
                 should_stop, improved = stopper.update(epoch + 1, val_kpis[1])
                 if improved:
-                    best_params = self.state.params
+                    best_model = self.state.params
+                    best_model_kpis = val_kpis
 
             lr = float(self._lr_schedule(self.state.step))
             trained_epochs = epoch + 1
@@ -835,14 +836,16 @@ class Trainer:
                 )
             if should_stop:
                 stop_reason = "early_stopping"
-                if best_params is not None:
-                    self.state = self.state.replace(params=best_params)
                 logger.info(
                     f"early stopping at epoch {trained_epochs}: no >= "
                     f"{EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT:.1%} rolling-average "
                     f"validation improvement for {EARLY_STOPPING_PATIENCE} rounds"
                 )
                 break
+
+        # Restore best model
+        self.state = self.state.replace(params=best_model)
+        val_kpis = best_model_kpis
 
         if stop_reason != "early_stopping" and self.config.lbfgs_steps > 0:
             adamw_params = self.state.params
@@ -852,9 +855,6 @@ class Trainer:
             # Canonical weights stay the AdamW result; polish must never
             # overwrite them, so the polished set is persisted separately.
             self.state = self.state.replace(params=adamw_params)
-
-        if stop_reason == "early_stopping" or val_kpis is None:
-            val_kpis = self._calculate_validation_kpis()
 
         return TrainingResult(
             stop_reason=stop_reason,
