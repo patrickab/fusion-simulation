@@ -1,0 +1,12 @@
+{
+  "formula": "loss_median + score_beta * loss_p95",
+  "score_beta": 0.3,
+  "n_validate": 200,
+  "points_per_config": 8192,
+  "early_stopping": {
+    "patience": 6,
+    "min_relative_improvement": 0.01,
+    "rolling_window": 8
+  },
+  "evaluator_commit": "de1ec7f"
+}
