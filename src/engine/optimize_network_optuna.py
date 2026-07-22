@@ -243,6 +243,19 @@ def _write_objective_metadata(
     path.write_text(json.dumps(metadata, indent=2) + "\n")
 
 
+def _validate_foundation_identity(optuna_study: optuna.Study, foundation_dir: Path | None) -> None:
+    """Reject resuming a study with a different foundation checkpoint."""
+    expected = str(foundation_dir.resolve()) if foundation_dir is not None else None
+    stored = optuna_study.user_attrs.get("foundation_path")
+    if stored is not None and stored != expected:
+        raise ValueError(
+            f"Study {optuna_study.study_name!r} is bound to foundation {stored!r}, "
+            f"but this run requested {expected!r}. Use a new study name."
+        )
+    if stored is None:
+        optuna_study.set_user_attr("foundation_path", expected)
+
+
 def study_dir(study_name: str, commit: str | None = None) -> Path:
     """
     Storage root for one Optuna study under data/hpo/.
@@ -887,6 +900,7 @@ def run_optimization(
 
     try:
         optuna_study = create_study(load_if_exists=not restart)
+        _validate_foundation_identity(optuna_study, foundation_dir)
         # Reap zombie RUNNING trials left by a crashed/interrupted prior run --
         # they'd otherwise block the budget forever (Optuna never auto-stales
         # them for sqlite).
@@ -910,6 +924,7 @@ def run_optimization(
             del optuna_study
             storage_path.unlink()
             optuna_study = create_study(load_if_exists=False)
+            _validate_foundation_identity(optuna_study, foundation_dir)
 
         # Inject warmstart candidates once (dedup by the warmstart user_attr, so
         # a resume of an already-warmstarted study skips re-injecting).
