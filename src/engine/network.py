@@ -231,7 +231,7 @@ VALIDATION_FREQUENCY = 50  # Evaluate validation set every N epochs
 # threshold below — do not add a bypass flag.
 EARLY_STOPPING_PATIENCE = 6  # Stop after this many non-improving validation rounds
 EARLY_STOPPING_MIN_RELATIVE_IMPROVEMENT = 0.01
-EARLY_STOPPING_ROLLING_WINDOW = 3
+EARLY_STOPPING_ROLLING_WINDOW = 8
 
 
 class _Patience:

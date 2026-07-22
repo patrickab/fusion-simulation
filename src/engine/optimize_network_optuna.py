@@ -51,6 +51,7 @@ import sys
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
@@ -331,8 +332,15 @@ def optuna_warmstart(study: StudyConfig) -> optuna.Study | None:
         load_if_exists=True,
         direction="minimize",
     )
+    existing_runs = {
+        trial.user_attrs.get("run")
+        for trial in db.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
+    }
 
     for path, hp in load_configs(study.warmstart_config_paths):
+        run = str(path.parent)
+        if run in existing_runs:
+            continue
         mismatched = study.search_space.budget_mismatch(hp)
 
         if mismatched:
@@ -346,9 +354,10 @@ def optuna_warmstart(study: StudyConfig) -> optuna.Study | None:
         db.add_trial(
             optuna.trial.create_trial(
                 value=loss,
-                user_attrs={"config": hp.to_dict(), "run": str(path.parent)},
+                user_attrs={"config": hp.to_dict(), "run": run},
             )
         )
+        existing_runs.add(run)
     return db
 
 
@@ -363,9 +372,14 @@ def _get_experiment_db_configs(
     if db is None:
         return []
     candidates = []
+    seen_runs = set()
     for t in db.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,)):
         if t.value is None:
             continue
+        if (run := t.user_attrs.get("run")) is not None:
+            if run in seen_runs:
+                continue
+            seen_runs.add(run)
         if db_dir is not None and "run" in t.user_attrs:
             run_dir = db_dir / t.user_attrs["run"]
             hp = HyperParams.from_dict(load_config(run_dir))
@@ -373,7 +387,14 @@ def _get_experiment_db_configs(
             fused = kpis["loss_median"] + score_beta * kpis["loss_p95"]
             candidates.append((hp, fused, kpis["loss_median"], kpis["loss_p95"]))
         elif "config" in t.user_attrs:
-            candidates.append((HyperParams.from_dict(t.user_attrs["config"]), t.value, None, None))
+            hp = HyperParams.from_dict(t.user_attrs["config"])
+            run_dir = Path(t.user_attrs["run"]) if "run" in t.user_attrs else None
+            if run_dir is not None and (run_dir / "run.json").exists():
+                kpis = load_kpis(run_dir)
+                fused = kpis["loss_median"] + score_beta * kpis["loss_p95"]
+                candidates.append((hp, fused, kpis["loss_median"], kpis["loss_p95"]))
+            else:
+                candidates.append((hp, t.value, None, None))
     return candidates
 
 
@@ -462,6 +483,29 @@ def _inject_historical_trials(
         )
 
 
+def _discard_study_artifacts(hpo_dir: Path, foundation_dir: Path | None) -> None:
+    """Remove discarded trial artifacts without touching other studies' warmstarts."""
+    if foundation_dir is not None:
+        shutil.rmtree(
+            foundation_dir / NEURAL_CORRECTOR_DIR / hpo_dir.name,
+            ignore_errors=True,
+        )
+    for run_dir in hpo_dir.glob("pinn_*"):
+        if run_dir.is_dir():
+            shutil.rmtree(run_dir)
+    for artifact in ("trials.csv", "top_trials.json", "benchmark_report.pdf"):
+        (hpo_dir / artifact).unlink(missing_ok=True)
+    shutil.rmtree(hpo_dir / "top_k", ignore_errors=True)
+
+
+def _reset_study(study_name: str, storage_path: Path) -> None:
+    """Delete one study through Optuna's public API, preserving sibling ledgers."""
+    if not storage_path.exists():
+        return
+    with suppress(KeyError):
+        optuna.delete_study(study_name=study_name, storage=f"sqlite:///{storage_path}")
+
+
 def check_capacity(study: StudyConfig, foundation: FoundationModel | None = None) -> None:
     """Verify the search space's most resource-demanding config trains without crashing."""
     search_space = study.search_space
@@ -486,6 +530,7 @@ def objective(
     hpo_benchmark_dir: Path,
     foundation: FoundationModel | None = None,
     foundation_dir: Path | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> float:
     """Train one network and return its fused ranking score (median + beta*p95 of |R_GS|).
 
@@ -529,10 +574,13 @@ def objective(
     display.current_manager = manager
     manager.metrics_row_sink = display.add_metrics_row
     last_epoch = 0
+    completed = False
 
     def report(epoch: int, val_kpi_median: float | None) -> None:
         # val_kpi_median is median |R_GS| at KPI_POINTS_PER_CONFIG from NetworkManager.
         nonlocal last_epoch
+        if cancel_requested is not None and cancel_requested():
+            raise KeyboardInterrupt
         last_epoch = epoch
         display.update_epoch(epoch, val_kpi_median)
         if val_kpi_median is not None:
@@ -572,6 +620,7 @@ def objective(
             median=val_median,
             p95=val_p95,
         )
+        completed = True
         return val_score
     except optuna.TrialPruned:
         trial.set_user_attr("trained_epochs", last_epoch)
@@ -591,8 +640,10 @@ def objective(
             trial.set_user_attr(
                 "run", str(run) if foundation_dir is not None else manager.artifact_stem
             )
-        # Only this trial's own run directory is touched.
-        manager.discard_unsaved_run()
+        if completed:
+            manager.discard_unsaved_run()
+        else:
+            manager.discard_run()
         jax.clear_caches()
 
 
@@ -811,6 +862,7 @@ def run_optimization(
     display: OptunaProgressDisplay,
     restart: bool = False,
     trial_callback: Callable[[optuna.Study, optuna.trial.FrozenTrial], None] | None = None,
+    cancel_requested: Callable[[], bool] | None = None,
 ) -> list[tuple[HyperParams, float]]:
     """Run or resume a study and return its best configurations."""
     if study.foundation_path is not None and (
@@ -822,13 +874,6 @@ def run_optimization(
     # and split the study across two commit dirs.
     commit = current_commit()
     hpo_benchmark_dir = study_dir(study.study_name, commit)
-    if not restart:
-        _write_objective_metadata(
-            hpo_benchmark_dir,
-            score_beta=study.score_beta,
-            n_validate=study.n_validate,
-            points_per_config=KPI_POINTS_PER_CONFIG,
-        )
     foundation = None
     foundation_dir = None
     if study.foundation_path is not None:
@@ -860,18 +905,8 @@ def run_optimization(
 
     storage_path = hpo_benchmark_dir / "study.db"
     if restart:
-        storage_path.unlink(missing_ok=True)
-        if foundation_dir is not None:
-            shutil.rmtree(
-                foundation_dir / NEURAL_CORRECTOR_DIR / hpo_benchmark_dir.name,
-                ignore_errors=True,
-            )
-        for run_dir in hpo_benchmark_dir.glob("pinn_*"):
-            if run_dir.is_dir():
-                shutil.rmtree(run_dir)
-        for artifact in ("trials.csv", "top_trials.json", "benchmark_report.pdf"):
-            (hpo_benchmark_dir / artifact).unlink(missing_ok=True)
-        shutil.rmtree(hpo_benchmark_dir / "top_k", ignore_errors=True)
+        _reset_study(study.study_name, storage_path)
+        _discard_study_artifacts(hpo_benchmark_dir, foundation_dir)
         _write_objective_metadata(
             hpo_benchmark_dir,
             score_beta=study.score_beta,
@@ -898,6 +933,7 @@ def run_optimization(
             ),
         )
 
+    discarded_failed_only_study = False
     try:
         optuna_study = create_study(load_if_exists=not restart)
         _validate_foundation_identity(optuna_study, foundation_dir)
@@ -918,13 +954,23 @@ def run_optimization(
             and not t.user_attrs.get("warmstart", False)
             for t in optuna_study.trials
         )
-        has_warmstart = any(t.user_attrs.get("warmstart", False) for t in optuna_study.trials)
-        if not restart and not has_real_results and not has_warmstart and optuna_study.trials:
+        if not restart and not has_real_results and optuna_study.trials:
             logger.info("Study has no completed trials -- discarding for a fresh start")
             del optuna_study
-            storage_path.unlink()
+            _reset_study(study.study_name, storage_path)
+            _discard_study_artifacts(hpo_benchmark_dir, foundation_dir)
             optuna_study = create_study(load_if_exists=False)
             _validate_foundation_identity(optuna_study, foundation_dir)
+            discarded_failed_only_study = True
+
+        if not restart:
+            _write_objective_metadata(
+                hpo_benchmark_dir,
+                score_beta=study.score_beta,
+                n_validate=study.n_validate,
+                points_per_config=KPI_POINTS_PER_CONFIG,
+                overwrite=discarded_failed_only_study,
+            )
 
         # Inject warmstart candidates once (dedup by the warmstart user_attr, so
         # a resume of an already-warmstarted study skips re-injecting).
@@ -951,9 +997,16 @@ def run_optimization(
         callbacks = [lambda current, _trial: _write_trials_csv(current, hpo_benchmark_dir)]
         if trial_callback is not None:
             callbacks.append(trial_callback)
+
         optuna_study.optimize(
             lambda trial: objective(
-                trial, study, display, hpo_benchmark_dir, foundation, foundation_dir
+                trial,
+                study,
+                display,
+                hpo_benchmark_dir,
+                foundation,
+                foundation_dir,
+                cancel_requested,
             ),
             n_trials=max(0, study.n_trials - prior_trials),
             catch=(Exception,),

@@ -461,6 +461,13 @@ class _FileStorageManager:
         run_dir = self.run_dir()
         if (run_dir / "network.flax").exists():
             return
+        self.discard_run()
+
+    def discard_run(self) -> None:
+        """Delete this run's artifacts, including a checkpoint if present."""
+        if self.artifact_stem is None:
+            return
+        run_dir = self.run_dir()
         shutil.rmtree(run_dir, ignore_errors=True)
         if self.output_dir:
             with suppress(OSError):
@@ -698,6 +705,10 @@ class NetworkManager:
     def discard_unsaved_run(self) -> None:
         """Delete the benchmark run dir unless this run's checkpoint was saved."""
         self._files.discard_unsaved_run()
+
+    def discard_run(self) -> None:
+        """Delete this run's artifacts, including a checkpoint if present."""
+        self._files.discard_run()
 
     # ------------------------------------------------------------------
     # Persistence

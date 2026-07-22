@@ -5,6 +5,7 @@ from datetime import datetime
 import logging
 from pathlib import Path
 import sys
+from threading import Event
 import time
 import traceback
 from typing import TYPE_CHECKING, Any, Callable, ClassVar
@@ -383,7 +384,8 @@ class HpoApp(App):
 
     BINDINGS: ClassVar = [
         Binding("tab", "toggle_view", "overview/detail", priority=True),
-        Binding("q", "quit", "quit"),
+        Binding("q", "cancel", "cancel"),
+        Binding("ctrl+c", "cancel", "cancel", show=False),
     ]
     CSS = """
     #overview-pane { height: 1fr; }
@@ -401,6 +403,7 @@ class HpoApp(App):
         # Textual's truecolor theme.
         self.theme = "ansi-dark"
         self._study, self._restart = study, restart
+        self._cancel_requested = Event()
         self._trial_callback = trial_callback
         self._state = OptunaProgressDisplay(study, live=False, on_change=self._request_refresh)
         handler = _EventLogHandler(self._state.events)
@@ -420,6 +423,7 @@ class HpoApp(App):
         self.crash_traceback: str | None = None
 
     def on_unmount(self) -> None:
+        self._cancel_requested.set()
         for source, handlers in self._original_handlers.items():
             source.handlers = handlers
 
@@ -469,6 +473,11 @@ class HpoApp(App):
         overview, detail = self.query_one("#overview-pane"), self.query_one("#detail")
         overview.display, detail.display = not overview.display, not detail.display
 
+    def action_cancel(self) -> None:
+        self._cancel_requested.set()
+        self._state.events.append("[yellow]Cancellation requested; stopping after this epoch.[/]")
+        self._refresh()
+
     def _run_study(self) -> None:
         # Deferred import: optimize_network_optuna imports HpoApp/OptunaProgressDisplay from
         # this module at module scope, so a top-level import back here would deadlock.
@@ -480,6 +489,7 @@ class HpoApp(App):
                 restart=self._restart,
                 display=self._state,
                 trial_callback=self._trial_callback,
+                cancel_requested=self._cancel_requested.is_set,
             )
         except KeyboardInterrupt:
             # run_optimization already removed the study dir; just exit cleanly.
