@@ -821,18 +821,23 @@ class Trainer:
 
             lr = float(self._lr_schedule(self.state.step))
             trained_epochs = epoch + 1
+            prune_requested = False
             if observer is not None:
-                observer(
-                    EpochMetrics(
-                        epoch=epoch,
-                        loss=loss,
-                        residual_loss=residual,
-                        boundary_loss=boundary,
-                        gradient_norm=grad_norm,
-                        learning_rate=lr,
-                        duration_seconds=epoch_time,
-                        validation=ValidationMetrics(*val_kpis) if val_kpis is not None else None,
-                        should_stop=should_stop,
+                prune_requested = bool(
+                    observer(
+                        EpochMetrics(
+                            epoch=epoch,
+                            loss=loss,
+                            residual_loss=residual,
+                            boundary_loss=boundary,
+                            gradient_norm=grad_norm,
+                            learning_rate=lr,
+                            duration_seconds=epoch_time,
+                            validation=(
+                                ValidationMetrics(*val_kpis) if val_kpis is not None else None
+                            ),
+                            should_stop=should_stop,
+                        )
                     )
                 )
             if should_stop:
@@ -843,6 +848,10 @@ class Trainer:
                     f"validation improvement for {EARLY_STOPPING_PATIENCE} rounds"
                 )
                 break
+            if prune_requested:
+                stop_reason = "pruned"
+                logger.info(f"pruned at epoch {trained_epochs}: study pruner flagged this trial")
+                break
 
         # Restore best model
         if best_model is not None:
@@ -851,7 +860,7 @@ class Trainer:
         elif val_kpis is None:
             val_kpis = self._calculate_validation_kpis()
 
-        if stop_reason != "early_stopping" and self.config.lbfgs_steps > 0:
+        if stop_reason not in ("early_stopping", "pruned") and self.config.lbfgs_steps > 0:
             adamw_params = self.state.params
             self.lbfgs(self.config.lbfgs_steps)
             self._lbfgs_params = self.state.params

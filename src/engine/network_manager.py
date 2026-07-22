@@ -774,7 +774,7 @@ class NetworkManager:
     def train(
         self,
         save_to_disk: bool = True,
-        validation_callback: Callable[[int, float | None], None] | None = None,
+        validation_callback: Callable[[int, float | None, float | None], bool | None] | None = None,
         show_progress: bool = True,
     ) -> float:
         "Orchestration layer for training - actual training happens in network.py"
@@ -808,7 +808,7 @@ class NetworkManager:
             else:
                 live = nullcontext()
 
-            def on_epoch(event: EpochMetrics) -> None:
+            def on_epoch(event: EpochMetrics) -> bool:
                 val_kpis = (
                     (event.validation.p05, event.validation.p50, event.validation.p95)
                     if event.validation is not None
@@ -827,7 +827,10 @@ class NetworkManager:
                 if run_dir is not None and (persisted is not None or val_kpis is not None):
                     self._files.write_metrics(run_dir, self._metrics.rows)
                 if validation_callback is not None and not event.should_stop:
-                    validation_callback(event.epoch + 1, val_kpis[1] if val_kpis else None)
+                    val_median = val_kpis[1] if val_kpis else None
+                    val_p95 = val_kpis[2] if val_kpis else None
+                    return bool(validation_callback(event.epoch + 1, val_median, val_p95))
+                return False
 
             with live as active_live:
                 if show_progress:

@@ -574,19 +574,26 @@ def objective(
     display.current_manager = manager
     manager.metrics_row_sink = display.add_metrics_row
     last_epoch = 0
+    last_val_kpi_median: float | None = None
+    last_val_kpi_p95: float | None = None
     completed = False
 
-    def report(epoch: int, val_kpi_median: float | None) -> None:
-        # val_kpi_median is median |R_GS| at KPI_POINTS_PER_CONFIG from NetworkManager.
-        nonlocal last_epoch
+    def report(epoch: int, val_kpi_median: float | None, val_kpi_p95: float | None) -> bool:
+        # True ends training early as a COMPLETE trial (not PRUNED), so the GP
+        # sampler still gets this region's signal.
+        nonlocal last_epoch, last_val_kpi_median, last_val_kpi_p95
         if cancel_requested is not None and cancel_requested():
             raise KeyboardInterrupt
         last_epoch = epoch
         display.update_epoch(epoch, val_kpi_median)
         if val_kpi_median is not None:
+            last_val_kpi_median = val_kpi_median
+            last_val_kpi_p95 = val_kpi_p95
+            # p95 above is only for scoring; should_prune() still sees median only.
             trial.report(val_kpi_median, epoch)
             if study.prune_trials and trial.should_prune():
-                raise optuna.TrialPruned
+                return True
+        return False
 
     try:
         manager.train(
@@ -595,14 +602,20 @@ def objective(
             show_progress=False,
         )
         summary = manager.training_summary or {}
-        trial.set_user_attr("stop_reason", summary.get("stop_reason", "unknown"))
+        stop_reason = summary.get("stop_reason", "unknown")
+        trial.set_user_attr("stop_reason", stop_reason)
         trial.set_user_attr("trained_epochs", summary.get("trained_epochs", total_epochs))
         trial.set_user_attr("best_validation_epoch", summary.get("best_validation_epoch"))
-        # Ranking metric: fused median + beta*p95 of |R_GS| over validation
-        # configs (see evaluate_validation_loss_stats/score). Median alone ignores
-        # worst-case error; max is a high-variance single-point estimator.
-        # Stats are computed once and shown to the user alongside the fused score.
-        val_median, val_p95 = evaluate_validation_loss_stats(manager)
+        pruned_early = stop_reason == "pruned"
+        if pruned_early:
+            # Reuse the prune-triggering round's stats -- re-evaluating would burn
+            # the compute pruning is meant to save.
+            val_median = last_val_kpi_median
+            val_p95 = last_val_kpi_p95
+        else:
+            # Full trial: fresh eval over the validation configs (median alone
+            # ignores tail risk, hence the beta*p95 term below).
+            val_median, val_p95 = evaluate_validation_loss_stats(manager)
         val_score = val_median + study.score_beta * val_p95
         trial.set_user_attr("loss_median", val_median)
         trial.set_user_attr("loss_p95", val_p95)
@@ -615,18 +628,13 @@ def objective(
             trial.number + 1,
             display_params,
             val_score,
-            "done",
+            "pruned" if pruned_early else "done",
             summary.get("trained_epochs", total_epochs),
             median=val_median,
             p95=val_p95,
         )
         completed = True
         return val_score
-    except optuna.TrialPruned:
-        trial.set_user_attr("trained_epochs", last_epoch)
-        trial.set_user_attr("stop_reason", "pruned")
-        display.update(trial.number + 1, display_params, None, "pruned", last_epoch)
-        raise
     except Exception as exc:
         trial.set_user_attr("trained_epochs", last_epoch)
         trial.set_user_attr("stop_reason", "failed")

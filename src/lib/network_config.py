@@ -188,7 +188,7 @@ class EpochMetrics:
 
 @dataclass(frozen=True)
 class TrainingResult:
-    stop_reason: Literal["epoch_budget", "early_stopping"]
+    stop_reason: Literal["epoch_budget", "early_stopping", "pruned"]
     trained_epochs: int
     planned_epochs: int
     final_validation: ValidationMetrics
@@ -200,4 +200,6 @@ class TrainingResult:
 
 
 class TrainingObserver(Protocol):
-    def __call__(self, event: EpochMetrics) -> None: ...
+    """Return ``True`` to request an early stop for a non-patience reason (e.g. pruning)."""
+
+    def __call__(self, event: EpochMetrics) -> bool | None: ...
