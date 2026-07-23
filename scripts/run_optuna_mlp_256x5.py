@@ -1,4 +1,4 @@
-"""HPO refinement for the 5x256 MLP, warm-started from its capacity probe."""
+"""HPO refinement seeded by the prior study's four best trial configs."""
 
 from pathlib import Path
 import sys
@@ -8,20 +8,21 @@ from src.engine.optimize_network_optuna import (
     SearchSpaceConfig,
     StudyConfig,
     run_optimization,
-    study_dir,
 )
-from src.lib.config import current_commit
 from src.lib.optuna_tui import HpoApp, OptunaProgressDisplay
 
-STUDY_NAME = "mlp_256x5"
-WARMSTART_RUN = Path("data/benchmarks/2026_07_20_10_49_18_mlp_256x5_probe_6d2fd3b")
+STUDY_NAME = "mlp_256x5_refine"
+FULL_EPOCHS = 2400
+WARMUP_EPOCHS = 120
+DECAY_EPOCHS = FULL_EPOCHS - WARMUP_EPOCHS
+WARMSTART_DB = Path("data/hpo/2026_07_22_21_08_15_mlp_256x5_refine_a2b9b73")
 
 
 def main() -> None:
     search_space = SearchSpaceConfig(
         hidden_dims=(256,) * 5,
-        learning_rate_max=Range(1e-3, 6e-3, log=True),
-        learning_rate_min=Range(2e-6, 8e-6, log=True),
+        learning_rate_max=Range(5e-4, 5e-3, log=True),
+        learning_rate_min=Range(5e-7, 5e-6, log=True),
         weight_decay=Range(1e-9, 1e-8, log=True),
         sigma_residual_adaptive_sampling=Range(0.01, 0.1),
         batch_size=32,
@@ -31,15 +32,14 @@ def main() -> None:
         n_rz_inner_samples=512,
         n_rz_boundary_samples=256,
         n_train=1024,
-        warmup_epochs=400,
-        decay_epochs=2000,
+        warmup_epochs=WARMUP_EPOCHS,
+        decay_epochs=DECAY_EPOCHS,
     )
-    path = study_dir(STUDY_NAME, current_commit())
+
     study = StudyConfig(
         search_space=search_space,
         study_name=STUDY_NAME,
-        warmstart_experiment_db=path,
-        warmstart_config_paths=[WARMSTART_RUN / "run.json"],
+        warmstart_experiment_db=WARMSTART_DB,
         min_epochs=800,
     )
     if sys.stdout.isatty():
