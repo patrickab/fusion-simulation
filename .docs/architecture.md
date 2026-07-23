@@ -94,8 +94,9 @@ Used by the Streamlit UI and referenced for fixed heatmap scales by the React fr
 
 ## HPO (`src/engine/optimize_network_optuna.py`, `src/engine/optimize-network-hparams.py`)
 - **Optuna** (primary): thin sampling/pruning adapter over `NetworkManager.train`; `SearchSpaceConfig`
-  owns search bounds and fixed study settings. `build_sampler` picks `GPSampler` (GP regression,
-  logEI acquisition by default) when every suggestable axis is a continuous `Range`, else `TPESampler`. Standard and HPO training share one epoch,
+  owns search bounds and fixed study settings. `build_sampler` uses a BoTorch GP with `qlogEI` by
+  default or GIBBON (the lower-bound MES approximation) when selected, provided every suggestable
+  axis is a continuous `Range`; it uses `TPESampler` otherwise. Standard and HPO training share one epoch,
   validation, patience stopping, L-BFGS, and saving path. Validation scores the fixed `kpi_benchmark_configs`
   stream (config construction only — it never advances training Sobol state). A patience stop is
   a normally completed, rankable Optuna trial (not `FAIL`); its stop metadata is retained in trial

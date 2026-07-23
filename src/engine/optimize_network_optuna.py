@@ -54,14 +54,28 @@ from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field, fields
 from datetime import datetime
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal
 
+from botorch.acquisition import qLogExpectedImprovement, qLowerBoundMaxValueEntropy
+from botorch.fit import fit_gpytorch_mll
+from botorch.models import SingleTaskGP
+from botorch.models.transforms.outcome import Standardize
+from botorch.optim import optimize_acqf
+from botorch.utils.sampling import draw_sobol_samples
+from gpytorch.mlls import ExactMarginalLogLikelihood
 import jax
+import numpy as np
 import optuna
-from optuna.distributions import CategoricalDistribution, FloatDistribution
+from optuna._transform import _SearchSpaceTransform
+from optuna.distributions import BaseDistribution, CategoricalDistribution, FloatDistribution
 from optuna.pruners import HyperbandPruner, NopPruner
-from optuna.samplers import BaseSampler, GPSampler, TPESampler
+from optuna.samplers import BaseSampler, RandomSampler, TPESampler
+from optuna.search_space import IntersectionSearchSpace
+from optuna.study import Study
+from optuna.trial import FrozenTrial, TrialState
+import torch
 
 from src.engine.model_evaluation import evaluate_validation_loss_stats
 from src.engine.network import (
@@ -101,6 +115,13 @@ class Range:
     low: float
     high: float
     log: bool = False
+
+
+class AcquisitionFunction(StrEnum):
+    """Acquisition functions supported by continuous Optuna studies."""
+
+    MaxEntropySearch = "qMaxEntropySearch"
+    qlogEI = "qlogExpectedImprovement"
 
 
 @dataclass
@@ -198,6 +219,7 @@ class StudyConfig:
     prune_trials: bool = True
     checkpoint_policy: Literal["none", "top_k", "all"] = "all"
     score_beta: float = 0.3  # p95 tail weight in ``loss_median + score_beta * loss_p95``
+    acquisition_function: AcquisitionFunction | None = AcquisitionFunction.qlogEI
 
     # Previous experiments can be read back and injected as historical evidence.
     warmstart_experiment_db: Path | None = None
@@ -851,16 +873,137 @@ def _generate_benchmark_report(
         logger.warning(f"Benchmark report generation failed: {e}")
 
 
+def _optimize_botorch_candidate(
+    acquisition_function: AcquisitionFunction,
+    train_x: torch.Tensor,
+    train_obj: torch.Tensor,
+) -> torch.Tensor:
+    """Fit a BoTorch GP and return one unit-cube candidate."""
+    model = SingleTaskGP(
+        train_x,
+        train_obj,
+        outcome_transform=Standardize(m=train_obj.shape[-1]),
+    )
+    mll = ExactMarginalLogLikelihood(model.likelihood, model)
+    fit_gpytorch_mll(mll)
+    bounds = torch.stack(
+        (
+            torch.zeros(train_x.shape[-1], dtype=train_x.dtype, device=train_x.device),
+            torch.ones(train_x.shape[-1], dtype=train_x.dtype, device=train_x.device),
+        )
+    )
+    if acquisition_function is AcquisitionFunction.MaxEntropySearch:
+        candidate_set = draw_sobol_samples(bounds=bounds, n=256, q=1).squeeze(-2)
+        # GIBBON is a cheaper lower-bound approximation that maintains MES local optima
+        # at significantly lower overhead (MES: https://arxiv.org/abs/1703.01968;
+        # GIBBON: https://arxiv.org/abs/2102.03324).
+        acquisition = qLowerBoundMaxValueEntropy(model, candidate_set)
+    else:
+        acquisition = qLogExpectedImprovement(model, best_f=train_obj.max())
+    candidates, _ = optimize_acqf(
+        acq_function=acquisition,
+        bounds=bounds,
+        q=1,
+        num_restarts=10,
+        raw_samples=256,
+    )
+    return candidates
+
+
+class BoTorchSampler(BaseSampler):
+    """Sequential BoTorch sampler for continuous, fixed Optuna search spaces."""
+
+    def __init__(
+        self,
+        acquisition_function: AcquisitionFunction,
+        *,
+        n_startup_trials: int,
+        seed: int,
+    ) -> None:
+        self._acquisition_function = acquisition_function
+        self._n_startup_trials = n_startup_trials
+        self._independent_sampler = RandomSampler(seed=seed)
+        self._intersection_search_space = IntersectionSearchSpace()
+
+    def infer_relative_search_space(
+        self, study: Study, _trial: FrozenTrial
+    ) -> dict[str, BaseDistribution]:
+        return {
+            name: distribution
+            for name, distribution in self._intersection_search_space.calculate(study).items()
+            if isinstance(distribution, FloatDistribution) and not distribution.single()
+        }
+
+    def sample_relative(
+        self,
+        study: Study,
+        _trial: FrozenTrial,
+        search_space: dict[str, BaseDistribution],
+    ) -> dict[str, Any]:
+        if not search_space:
+            return {}
+        completed_trials = [
+            completed_trial
+            for completed_trial in study.get_trials(deepcopy=False, states=(TrialState.COMPLETE,))
+            if search_space.keys() <= completed_trial.params.keys()
+        ]
+        if len(completed_trials) < self._n_startup_trials:
+            return {}
+        transform = _SearchSpaceTransform(search_space, transform_0_1=True)
+        train_x = torch.from_numpy(
+            np.stack(
+                [
+                    transform.transform(completed_trial.params)
+                    for completed_trial in completed_trials
+                ]
+            )
+        ).double()
+        train_obj = torch.tensor(
+            [[-float(completed_trial.value)] for completed_trial in completed_trials],
+            dtype=torch.double,
+            device=train_x.device,
+        )
+        candidate = _optimize_botorch_candidate(
+            self._acquisition_function,
+            train_x,
+            train_obj,
+        )
+        return transform.untransform(candidate.squeeze(0).detach().cpu().numpy())
+
+    def sample_independent(
+        self,
+        study: Study,
+        trial: FrozenTrial,
+        param_name: str,
+        param_distribution: BaseDistribution,
+    ) -> float:
+        return float(
+            self._independent_sampler.sample_independent(
+                study,
+                trial,
+                param_name,
+                param_distribution,
+            )
+        )
+
+    def reseed_rng(self) -> None:
+        self._independent_sampler.reseed_rng()
+
+
 def build_sampler(study: StudyConfig) -> BaseSampler:
-    """GPSampler (GP regression, logEI acquisition by default) when every suggestable
-    axis is a continuous Range; TPE otherwise (categorical axes like hidden_dims)."""
+    """Use the selected BoTorch acquisition for continuous axes; use TPE otherwise."""
     search_space = study.search_space
     axes = list(search_space.get_suggestable_params().values())
     # Corrector studies additionally suggest corrector_scale (see objective()).
     if study.foundation_path is not None and isinstance(search_space.corrector_scale, list | Range):
         axes.append(search_space.corrector_scale)
     if axes and all(isinstance(spec, Range) for spec in axes):
-        return GPSampler(seed=42, n_startup_trials=study.n_startup_trials)
+        acquisition_function = study.acquisition_function or AcquisitionFunction.qlogEI
+        return BoTorchSampler(
+            acquisition_function,
+            n_startup_trials=study.n_startup_trials,
+            seed=42,
+        )
     return TPESampler(seed=42, n_startup_trials=study.n_startup_trials)
 
 
