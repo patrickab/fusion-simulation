@@ -17,7 +17,7 @@ Simulation of magnetic forces in a Tokamak Fusion Reactor using a Physics Inform
 
 ## Next Steps
 - [ ] Integration of [Max-Value Entropy Search](https://arxiv.org/abs/1703.01968) for efficient hyperparameter optimization
-- [ ] Support for Stellerator reactor types 
+- [ ] Support for Stellerator configurations
 
 ---
 
