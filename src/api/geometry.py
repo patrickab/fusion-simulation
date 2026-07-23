@@ -3,6 +3,7 @@
 import numpy as np
 
 from src.engine.plasma import calculate_fusion_plasma
+from src.engine.stellarator import calculate_stellarator_surface, calculate_toroidal_slice
 from src.lib.geometry_config import PlasmaGeometry, ToroidalCoilConfig
 from src.lib.visualization import calculate_2d_geometry
 from src.toroidal_geometry import generate_toroidal_coils_3d
@@ -92,3 +93,31 @@ def build_geometry_response(
         response["coils3d"] = coils_out
 
     return response
+
+
+def build_stellarator_geometry_response(
+    R0: float,
+    a: float,
+    kappa: float,
+    n_field_periods: int,
+    helical_amplitude: float,
+    mesh_stride: int,
+) -> dict:
+    """Build an idealized Fourier stellarator surface for the geometry explorer."""
+    boundary_R, boundary_Z = calculate_toroidal_slice(
+        R0, a, kappa, n_field_periods, helical_amplitude
+    )
+    surface = calculate_stellarator_surface(R0, a, kappa, n_field_periods, helical_amplitude)
+    X = _stride2d(surface.X, mesh_stride)
+    Y = _stride2d(surface.Y, mesh_stride)
+    Z = _stride2d(surface.Z, mesh_stride)
+    return {
+        "boundary2d": {"R": _to_list(boundary_R), "Z": _to_list(boundary_Z)},
+        "plasma3d": {
+            "n_phi": X.shape[0],
+            "n_theta": X.shape[1],
+            "X": _to_list(X.flatten()),
+            "Y": _to_list(Y.flatten()),
+            "Z": _to_list(Z.flatten()),
+        },
+    }

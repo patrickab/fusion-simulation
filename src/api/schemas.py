@@ -1,4 +1,6 @@
-from pydantic import BaseModel, Field
+from typing import Self
+
+from pydantic import BaseModel, Field, model_validator
 
 from src.engine.model_evaluation import EVAL_RESOLUTION
 
@@ -20,6 +22,21 @@ class GeometryRequest(BaseModel):
     show_coils: bool = True
     coil: CoilConfigIn = CoilConfigIn()
     mesh_stride: int = 3  # downsample factor for 3D mesh transmission
+
+
+class StellaratorGeometryRequest(BaseModel):
+    R0: float = Field(gt=0.0)
+    a: float = Field(gt=0.0)
+    kappa: float = Field(ge=0.5, le=3.0)
+    n_field_periods: int = Field(ge=2, le=10)
+    helical_amplitude: float = Field(ge=0.0, le=0.45)
+    mesh_stride: int = Field(default=2, ge=1, le=16)
+
+    @model_validator(mode="after")
+    def surface_stays_clear_of_axis(self) -> Self:
+        if self.a * (1.0 + self.helical_amplitude) >= self.R0:
+            raise ValueError("R0 must exceed the maximum radial boundary excursion")
+        return self
 
 
 class SampleRequest(BaseModel):

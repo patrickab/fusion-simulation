@@ -16,6 +16,10 @@ also contains the new campaign specification (`docs/hpo/hpo-plan-piratenet.md`),
 (`scripts/run_piratenet_foundation_campaign.py`), and local HPO-driver changes; these campaign
 assets are not yet committed.
 
+The Reactor Visualizer also has an exploratory, geometry-only stellarator path: a low-order
+stellarator-symmetric Fourier surface and toroidal slice. It does not yet model equilibrium,
+coils, magnetic fields, or field-line tracing.
+
 The staged campaign is:
 
 1. Completed: batch 32 beat batch 64 at 600 epochs (fused `9.31e-3` vs `3.74e-2`) and is frozen.

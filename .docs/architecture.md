@@ -33,7 +33,8 @@ Thin HTTP wrapper exposing the `src/engine` + `src/lib` core to the React fronte
    - `GET  /api/network/{name}/{config|models|kpis}` — HyperParams JSON, foundation/corrector metadata, or stored `run.json` KPIs (never recomputed at request time)
   - `POST /api/network/{name}/{archive|rename|sample|flux|residual|fieldlines}`
   - `DELETE /api/network/{name}`
-  - `POST /api/geometry` — 2D boundary + 3D plasma/coil meshes (downsampled via `mesh_stride`)
+   - `POST /api/geometry` — 2D tokamak boundary + 3D plasma/coil meshes (downsampled via `mesh_stride`)
+   - `POST /api/stellarator/geometry` — idealized Fourier stellarator slice + 3D surface mesh
   - `POST /api/benchmark` — `StreamingResponse` (SSE) emitting one row event per checkpoint
   - `GET  /api/config` — frontend-facing constants (`eval_config_count`, `eval_resolution`) from `model_evaluation.py`
   - `GET  /api/benchmarks` — saved benchmark tree `{commit: {run: [files]}}`; artifacts served statically under `/api/benchmarks/files/` (mount of `data/benchmarks/`)
@@ -45,7 +46,7 @@ Thin HTTP wrapper exposing the `src/engine` + `src/lib` core to the React fronte
 
 ## React Frontend (`frontend/`) — TypeScript + Vite
 Single-page app, three views mirroring the Streamlit pages:
-1. **reactor** (`ReactorView.tsx`) — geometry sliders → 2D Plotly cross-section + 3D `PlasmaWireframe`.
+1. **reactor** (`ReactorView.tsx`) — tokamak/stellarator geometry selector and sliders → 2D Plotly cross-section + 3D `PlasmaWireframe`.
 2. **network** (`NetworkView.tsx`) — checkpoint picker; foundation/corrector identity, stored KPIs, flux/residual heatmaps (Plotly), sample scatter, 3D field lines + plasma wireframe (Three.js), and Shiki-highlighted config JSON.
 3. **benchmark** (`BenchmarkView.tsx`) — SSE-streamed multi-checkpoint comparison; per-network grid cards; saved-run browser over `GET /api/benchmarks` gated behind a selectbox — exactly one `StoredRun` mounts at a time, since mounting fires a backend residual eval.
 
@@ -82,6 +83,7 @@ Vite dev server proxies `/api` → `127.0.0.1:8010` (matches `run-webapp.sh`). B
 - 3D torus: poloidal cross-section revolved via `jnp.outer`, result is (n_phi=256, n_theta=256) structured mesh.
 - Coils: normal-offset from plasma boundary, swept toroidally; inner/outer/caps per coil.
 - Point-in-plasma and the hard-BC envelope use the cached smooth Fourier boundary-radius fit.
+- `src/engine/stellarator.py` is a geometry-only, stellarator-symmetric Fourier surface model. The explorer exposes `(0,0)`, `(1,0)`, and helical `(1,1)` modes through R₀, a, κ, NFP, and h/a; it is not an equilibrium or magnetic-field solver.
 
 ## Visualization (`src/lib/visualization.py`)
 Used by the Streamlit UI and referenced for fixed heatmap scales by the React frontend (zmin/zmax constants).

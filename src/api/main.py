@@ -16,6 +16,7 @@ from src.api.schemas import (
     GridRequest,
     RenameRequest,
     SampleRequest,
+    StellaratorGeometryRequest,
 )
 from src.engine.residual_correction import corrector_foundation_dir
 from src.lib.config import NEURAL_CORRECTOR_DIR, Filepaths
@@ -259,6 +260,18 @@ def reactor_geometry(body: GeometryRequest) -> dict:
         delta=body.delta,
         show_coils=body.show_coils,
         coil_cfg=coil_cfg,
+        mesh_stride=body.mesh_stride,
+    )
+
+
+@app.post("/api/stellarator/geometry")
+def stellarator_geometry(body: StellaratorGeometryRequest) -> dict:
+    return geometry.build_stellarator_geometry_response(
+        R0=body.R0,
+        a=body.a,
+        kappa=body.kappa,
+        n_field_periods=body.n_field_periods,
+        helical_amplitude=body.helical_amplitude,
         mesh_stride=body.mesh_stride,
     )
 

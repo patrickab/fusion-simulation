@@ -16,6 +16,7 @@ src/
 │   ├── residual_correction.py  # Corrector CLI + shared plain/nested/HPO checkpoint loading → composed NetworkManager. No parallel manager classes.
 │   ├── physics.py              # GS operator, loss functions, B-field computation via AD
 │   ├── plasma.py               # Parametric boundary → 3D FusionPlasma; point-in-plasma test
+│   ├── stellarator.py          # Geometry-only stellarator-symmetric Fourier surface + toroidal slice
 │   ├── model_evaluation.py     # Shared grids, Sobol residual KPIs, configurable Matplotlib montages
 │   ├── benchmark_report.py    # Ranked LaTeX benchmark report rendered directly with pdflatex
 │   ├── optimize_network_optuna.py  # Optuna HPO (primary, with validation-based pruning)
@@ -61,7 +62,7 @@ frontend/                       # React + Three.js SPA (active UI)
 │   │   ├── mesh.ts             # sparseWireframe for (n_phi×n_theta) structured grids
 │   │   └── colormap.ts         # matplotlib "plasma" colormap + CSS gradient
 │   └── views/
-│       ├── ReactorView.tsx     # Geometry builder view
+│       ├── ReactorView.tsx     # Tokamak/stellarator geometry builder view
 │       ├── NetworkView.tsx     # PINN inspector view
 │       └── BenchmarkView.tsx  # SSE benchmark comparison view
 ├── package.json                # React 19, three, @react-three/fiber+drei, plotly, zustand, shiki, vite 8

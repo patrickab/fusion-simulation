@@ -20,12 +20,16 @@ export function sparseWireframe(
       push(i, j)
       push(i, j + 1)
     }
+    push(i, nTheta - 1)
+    push(i, 0)
   }
   for (let j = 0; j < nTheta; j += stride) {
     for (let i = 0; i < nPhi - 1; i++) {
       push(i, j)
       push(i + 1, j)
     }
+    push(nPhi - 1, j)
+    push(0, j)
   }
   const geometry = new THREE.BufferGeometry()
   geometry.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pts), 3))

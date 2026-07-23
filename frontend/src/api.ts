@@ -68,6 +68,15 @@ export interface GeometryRequest extends Geom3D {
   mesh_stride?: number
 }
 
+export interface StellaratorGeometryRequest {
+  R0: number
+  a: number
+  kappa: number
+  n_field_periods: number
+  helical_amplitude: number
+  mesh_stride?: number
+}
+
 /** Server-traced (VTK RK45) field lines: concatenated polylines + |B| per vertex. */
 export interface FieldLinesResponse {
   points: number[] // flat xyz
@@ -128,6 +137,8 @@ export const api = {
   fieldlines: (name: string, seed: number, sampleSize: number, nLines: number) =>
     post<FieldLinesResponse>(`/api/network/${enc(name)}/fieldlines`, { seed, sample_size: sampleSize, n_lines: nLines }),
   geometry: (body: GeometryRequest) => post<GeometryResponse>('/api/geometry', body),
+  stellaratorGeometry: (body: StellaratorGeometryRequest) =>
+    post<GeometryResponse>('/api/stellarator/geometry', body),
   // Flattened data/benchmarks tree grouped by the commit embedded in each slug.
   benchmarks: () => fetch('/api/benchmarks').then((r) => toJson<Record<string, Record<string, string[]>>>(r)),
 }
