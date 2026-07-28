@@ -191,9 +191,8 @@ def _grad_shafranov_residual_from_operator(
 
     rhs = -(MU_0 * R**2 * dp_dpsi) - (F_val * dF_dpsi)
 
-    # Normalize by magnetic pressure scale (B_toroidal^2)
-    # This handles high-field/low-beta regimes robustly
-    scale = (config.State.F_axis / config.Geometry.R0) ** 2 + 1.0
+    # Normalize by the dominant RHS term: F·F' ~ F_axis/a.
+    scale = config.State.F_axis / config.Geometry.a
     return (delta_star - rhs) / scale
 
 
