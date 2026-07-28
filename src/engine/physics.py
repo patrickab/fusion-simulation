@@ -135,8 +135,6 @@ def _second_derivative(
     return jax.jvp(d_fn, (x,), (jnp.ones_like(x),))[1]
 
 
-# Rematerialize the high-order PDE graph while retaining its primal flux for profile losses.
-@partial(jax.checkpoint, static_argnums=0)
 def shafranov_operator_and_psi(
     psi_fn: Callable,
     params: any,

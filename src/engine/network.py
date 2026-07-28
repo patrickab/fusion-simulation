@@ -703,7 +703,6 @@ class Trainer:
         """Single training step; closed over self._psi_fn so plain/corrector share one kernel."""
         psi_fn = self._psi_fn
 
-        @jax.checkpoint
         def loss_wrapper(
             params: any,
         ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
