@@ -42,6 +42,9 @@ batch 32 when stable and within 10% of batch 64.
 
 - Objective: `loss_median + 0.3 * loss_p95`, minimized.
 - Protocol: fixed 200 plasma configurations x 8,192 area-uniform Sobol points.
+- The GS residual normalizer is `F_axis / a` (was `(F_axis/R0)**2 + 1`). Every figure under
+  Evidence predates that change and is roughly 4x smaller than the same model scores now;
+  do not compare across it.
 - Common training/evaluation seed: 42 for screens and HPO; do not change it casually because
   common random numbers are load-bearing for close rankings.
 - Admit only current-protocol, 600-epoch observations matching the frozen architecture, batch,

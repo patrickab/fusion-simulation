@@ -202,7 +202,7 @@ class StudyConfig:
     # Previous experiments can be read back and injected as historical evidence.
     warmstart_experiment_db: Path | None = None
     warmstart_config_paths: list[Path] = field(default_factory=list)
-    retrain: bool = False  # retrain budget-mismatched warmstart configs
+    retrain: bool = False  # retrain warmstart configs instead of trusting their stored KPIs
 
     foundation_path: str | Path | None = None  # frozen foundation for corrector studies
 
@@ -305,23 +305,52 @@ def load_experiment_db(db_dir: Path | None) -> optuna.Study | None:
     return optuna.load_study(study_name=chosen.study_name, storage=storage)
 
 
-def _reevaluate_config(path: Path, hp: HyperParams, budget: dict[str, Any]) -> HyperParams:
+def _display_params(hp: HyperParams) -> dict[str, Any]:
+    """The trials table's parameter columns."""
+    return {
+        "depth": len(hp.hidden_dims),
+        "width": hp.hidden_dims[0],
+        "lr_max": hp.learning_rate_max,
+        "lr_min": hp.learning_rate_min,
+        "wd": hp.weight_decay,
+        "sig": hp.sigma_residual_adaptive_sampling,
+    }
+
+
+def _reevaluate_config(
+    path: Path,
+    hp: HyperParams,
+    budget: dict[str, Any],
+    display: OptunaProgressDisplay,
+    label: str,
+    n_validate: int,
+) -> HyperParams:
     """Retrain config at the study's current budget, destructively replacing its run artifacts."""
     corrected = HyperParams(**{**hp.to_dict(), **budget})
-    stale = sorted(budget)
-    logger.warning(f"{path.parent}: stale budget vs. current search space ({stale}) -- retraining")
-    manager = NetworkManager(corrected)
-    manager.train(save_to_disk=True)
+    correction = f" (budget corrected: {sorted(budget)})" if budget else ""
+    logger.warning(f"{path.parent}: retraining at this study's budget{correction}")
+    total_epochs = corrected.warmup_epochs + corrected.decay_epochs
+    manager = NetworkManager(corrected, n_validation_size=n_validate)
+
+    def report(epoch: int, val_kpi_median: float | None, _val_kpi_p95: float | None) -> bool:
+        display.update_epoch(epoch, val_kpi_median)
+        return False
+
+    display.start_trial(label, _display_params(corrected), total_epochs)
+    display.current_manager = manager
+    manager.metrics_row_sink = display.add_metrics_row
+    manager.train(save_to_disk=True, validation_callback=report, show_progress=False)
     shutil.rmtree(path.parent)
     shutil.move(str(manager.run_dir()), str(path.parent))
     return corrected
 
 
-def optuna_warmstart(study: StudyConfig) -> optuna.Study | None:
+def optuna_warmstart(study: StudyConfig, display: OptunaProgressDisplay) -> optuna.Study | None:
     """Populate the legacy ``warmstart_experiments`` ledger from configured paths.
 
     No-op returning None if the list is empty or no benchmark db is configured.
-    Budget-mismatched entries are retrained or skipped depending on ``study.retrain``.
+    With ``study.retrain`` every entry is retrained at this study's budget; otherwise
+    budget-mismatched entries are skipped.
     """
     if study.warmstart_experiment_db is None or not study.warmstart_config_paths:
         return None
@@ -337,16 +366,15 @@ def optuna_warmstart(study: StudyConfig) -> optuna.Study | None:
         for trial in db.get_trials(deepcopy=False, states=(optuna.trial.TrialState.COMPLETE,))
     }
 
-    for path, hp in load_configs(study.warmstart_config_paths):
+    for index, (path, hp) in enumerate(load_configs(study.warmstart_config_paths)):
         run = str(path.parent)
         if run in existing_runs:
             continue
         mismatched = study.search_space.budget_mismatch(hp)
-
-        if mismatched:
-            if not study.retrain:
-                continue  # skip: never enters the ledger, never informs TPE
-            hp = _reevaluate_config(path, hp, mismatched)
+        if study.retrain:
+            hp = _reevaluate_config(path, hp, mismatched, display, f"ws{index}", study.n_validate)
+        elif mismatched:
+            continue  # skip: never enters the ledger, never informs TPE
 
         kpis = load_kpis(path.parent)
         loss = kpis["loss_median"] + study.score_beta * kpis["loss_p95"]
@@ -551,12 +579,7 @@ def objective(
         )
         trial.set_user_attr("corrector_scale", corrector_scale)
     display_params = {
-        "depth": len(hp.hidden_dims),
-        "width": hp.hidden_dims[0],
-        "lr_max": hp.learning_rate_max,
-        "lr_min": hp.learning_rate_min,
-        "wd": hp.weight_decay,
-        "sig": hp.sigma_residual_adaptive_sampling,
+        **_display_params(hp),
         "eps": corrector_scale if foundation is not None else None,
     }
     manager = NetworkManager(
@@ -906,7 +929,7 @@ def run_optimization(
     candidates = _get_experiment_db_configs(
         benchmark_study, study.warmstart_experiment_db, study.score_beta
     )
-    legacy_ledger = optuna_warmstart(study)
+    legacy_ledger = optuna_warmstart(study, display)
     candidates += _get_experiment_db_configs(legacy_ledger, None, study.score_beta)
     check_capacity(study, foundation)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -1052,33 +1075,24 @@ def run_optimization(
 
 
 def resolve_retrain_choice(study: StudyConfig) -> bool:
-    """Whether to retrain budget-mismatched warmstart configs.
+    """Whether to retrain the configured warmstart configs at this study's budget.
 
-    Returns False immediately if no configured paths have a mismatched budget.
-    Raises on non-tty when mismatches exist -- the destructive choice cannot be silently guessed.
+    Returns False when that ledger is off. Raises on non-tty otherwise -- retraining
+    replaces run artifacts in place, so the choice cannot be silently guessed.
     """
-    # Retrain only applies to the legacy configured-path ledger (the
-    # benchmark-db path injects already-trained trials as-is). Nothing to
-    # reconcile if that path is off -- return before touching the fail-fast
-    # load_configs, whose paths need not exist then.
+    # Retrain only applies to the legacy configured-path ledger; the benchmark-db
+    # path injects already-trained trials as-is.
     if study.warmstart_experiment_db is None or not study.warmstart_config_paths:
         return False
-    mismatched = [
-        path
-        for path, hp in load_configs(study.warmstart_config_paths)
-        if study.search_space.budget_mismatch(hp)
-    ]
-    if not mismatched:
-        return False
+    paths = [path.parent for path, _hp in load_configs(study.warmstart_config_paths)]
     if not sys.stdin.isatty():
         raise RuntimeError(
-            "Warmstart configs with a mismatched training budget were found: "
-            f"{[str(p.parent) for p in mismatched]}. Pass --retrain or --no-retrain "
-            "explicitly -- non-interactive launches can't be prompted."
+            f"Warmstart configs are configured: {[str(p) for p in paths]}. Pass --retrain "
+            "or --no-retrain explicitly -- non-interactive launches can't be prompted."
         )
-    print("\nWarmstart configs with a mismatched training budget were found:")
-    for path in mismatched:
-        print(f"  {path.parent}")
+    print("\nWarmstart configs found:")
+    for path in paths:
+        print(f"  {path}")
     return input("Retrain them at this study's budget? (y/n): ").strip().lower().startswith("y")
 
 
@@ -1099,12 +1113,12 @@ def main() -> None:
     retrain_group.add_argument(
         "--retrain",
         action="store_true",
-        help="Retrain warmstart configs whose training budget mismatches this study",
+        help="Retrain warmstart configs at this study's budget, replacing their run artifacts",
     )
     retrain_group.add_argument(
         "--no-retrain",
         action="store_true",
-        help="Skip (don't inject) warmstart configs whose training budget mismatches this study",
+        help="Trust warmstart configs' stored KPIs; skip (don't inject) budget-mismatched ones",
     )
     parser.add_argument("--test", action="store_true")
     parser.add_argument("--full-trials", action="store_true")
@@ -1164,7 +1178,7 @@ def main() -> None:
     elif args.no_retrain:
         study.retrain = False
     else:
-        # neither flag -> prompt, but only if a warmstart config's budget actually mismatches
+        # neither flag -> prompt, but only if the configured-path ledger is in use
         study.retrain = resolve_retrain_choice(study)
 
     # TUI whenever a terminal exists; piped/nohup output gets the plain Live dashboard,

@@ -242,7 +242,7 @@ class OptunaProgressDisplay:
             border_style="cyan",
         )
 
-    def start_trial(self, trial_num: int, params: dict[str, Any], total_epochs: int) -> None:
+    def start_trial(self, trial_num: int | str, params: dict[str, Any], total_epochs: int) -> None:
         self._current_trial_info = {
             "trial": trial_num,
             "params": params,
@@ -253,7 +253,7 @@ class OptunaProgressDisplay:
         self._epoch_task = self._progress.add_task(
             "[magenta]Epochs:  ", total=total_epochs, visible=True
         )
-        if trial_num > 1:
+        if self.events:
             self.events.append("")
             self.events.append("")
         self.events.append(f"[bold cyan]── trial {trial_num} ──[/]")
