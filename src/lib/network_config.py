@@ -37,9 +37,9 @@ class HyperParams(BaseModel):
 
     # Training budget
     n_train: int = 1024
-    warmup_epochs: int = 100
-    decay_epochs: int = 500
-    n_rz_inner_samples: int = 512
+    warmup_epochs: int = 200
+    decay_epochs: int = 1000
+    n_rz_inner_samples: int = 1024
     n_rz_boundary_samples: int = 128
     lbfgs_steps: int = 0
 
