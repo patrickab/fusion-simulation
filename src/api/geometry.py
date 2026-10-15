@@ -2,7 +2,6 @@
 
 import numpy as np
 
-from src.engine.plasma import calculate_fusion_plasma
 from src.lib.geometry_config import PlasmaGeometry, ToroidalCoilConfig
 from src.lib.visualization import calculate_2d_geometry
 from src.toroidal_geometry import generate_toroidal_coils_3d
@@ -37,7 +36,6 @@ def build_geometry_response(
             "Z": _to_list(plasma_boundary.Z),
         },
         "coil2d": None,
-        "plasma3d": None,
         "coils3d": None,
     }
 
@@ -50,18 +48,6 @@ def build_geometry_response(
             "R_center": _to_list(toroidal_coil_2d.R_center),
             "Z_center": _to_list(toroidal_coil_2d.Z_center),
         }
-
-    fusion_plasma = calculate_fusion_plasma(plasma_boundary=plasma_boundary)
-    X = _stride2d(fusion_plasma.X, mesh_stride)
-    Y = _stride2d(fusion_plasma.Y, mesh_stride)
-    Z = _stride2d(fusion_plasma.Z, mesh_stride)
-    response["plasma3d"] = {
-        "n_phi": X.shape[0],
-        "n_theta": X.shape[1],
-        "X": _to_list(X.flatten()),
-        "Y": _to_list(Y.flatten()),
-        "Z": _to_list(Z.flatten()),
-    }
 
     if show_coils:
         toroidal_coils_3d = generate_toroidal_coils_3d(

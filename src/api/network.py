@@ -1,22 +1,34 @@
 """Checkpoint sampling, flux/residual grids, and B-field grids for the Network view."""
 
+import base64
+
+import jax
 import jax.numpy as jnp
 import numpy as np
-import pyvista as pv
 from scipy.stats import qmc
 
 from src.engine.model_evaluation import (
     GridQuantity,
     PlasmaGridBatch,
     evaluate_plasma_grids,
+    shared_psi_fn,
 )
 from src.engine.network import Sampler
 from src.engine.network_manager import NetworkManager
-from src.engine.physics import get_b_field_cartesian
-from src.engine.plasma import boundary_normalized_radius
-from src.lib.geometry_config import PlasmaGeometry, PlasmaState
+from src.engine.physics import get_b_field, trace_field_lines
+from src.engine.plasma import get_poloidal_points
+from src.lib.geometry_config import PlasmaGeometry, PlasmaState, RotationalAngles
 from src.lib.network_config import DomainBounds
 from src.streamlit.network_utils import to_plasma_config
+
+# Field-line tracing. Seeds pad to MAX_FIELD_LINES so the tracer compiles once
+# per process; lines run FIELD_LINE_TURNS toroidal transits per direction.
+MAX_FIELD_LINES = 64
+FIELD_GRID_NODES = 64  # (R, Z) B-grid nodes per axis
+FIELD_LINE_TURNS = 12
+VERTICES_PER_TURN = 48
+
+_b_field = jax.jit(get_b_field, static_argnums=(0,))
 
 
 def _split_row(row: jnp.ndarray) -> tuple[PlasmaGeometry, PlasmaState]:
@@ -173,106 +185,77 @@ def build_residual_grids(
     return build_plasma_grids(manager, seed, sample_size, resolution, ("residual",))["residual"]
 
 
+def _f32_base64(arr: np.ndarray) -> str:
+    """Little-endian float32 bytes as base64: decodes straight into a Float32Array."""
+    return base64.b64encode(np.ascontiguousarray(arr, dtype="<f4").tobytes()).decode("ascii")
+
+
 def build_field_lines(
     manager: NetworkManager, seed: int, sample_size: int, n_lines: int = 24
 ) -> dict:
-    """Trace field lines server-side (VTK RK45, the legacy PyVista path) and
-    ship finished polylines — the client only fills a BufferGeometry."""
+    """Trace field lines server-side and ship finished polylines plus the
+    poloidal boundary; the client only fills buffers and revolves the boundary
+    into the plasma wireframe."""
     _, geom_3d, state_3d = _seeded_configs(manager, seed, sample_size)
     config = to_plasma_config(geom_3d, state_3d)
-
     R0, a, kappa = float(geom_3d.R0), float(geom_3d.a), float(geom_3d.kappa)
-    # Tight box: field lines live inside the plasma, so padding is wasted resolution.
-    extent = R0 + a + 0.5
-    z_extent = (a * kappa) + 0.5
 
-    # 48³ keeps the tracer's psi-drift (trilinear interpolation error, O(h²))
-    # at the few-percent level; 30³ drifted ~10% of the axis flux per line.
-    n = 48
-    grid = pv.ImageData(
-        dimensions=(n, n, n),
-        spacing=(2 * extent / (n - 1), 2 * extent / (n - 1), 2 * z_extent / (n - 1)),
-        origin=(-extent, -extent, -z_extent),
-    )
-    pts = grid.points
-
-    vectors = get_b_field_cartesian(
-        manager.make_psi_fn(),
+    # Axisymmetric field: B depends on (R, Z) only, so a 2D grid over the
+    # plasma's bounding box (margin keeps boundary cells' outer nodes) is exact
+    # in phi. 64^2 network evaluations instead of a 48^3 Cartesian grid.
+    margin = 0.05 * a
+    origin = np.array([R0 - a - margin, -(kappa * a + margin)])
+    spacing = 2 * np.array([a + margin, kappa * a + margin]) / (FIELD_GRID_NODES - 1)
+    R_nodes = origin[0] + spacing[0] * np.arange(FIELD_GRID_NODES)
+    Z_nodes = origin[1] + spacing[1] * np.arange(FIELD_GRID_NODES)
+    R_mesh, Z_mesh = np.meshgrid(R_nodes, Z_nodes, indexing="ij")
+    B = _b_field(
+        shared_psi_fn(manager),
         manager.state.params,
-        jnp.array(pts[:, 0]),
-        jnp.array(pts[:, 1]),
-        jnp.array(pts[:, 2]),
+        jnp.asarray(R_mesh.ravel(), dtype=jnp.float32),
+        jnp.asarray(Z_mesh.ravel(), dtype=jnp.float32),
         config,
     )
-    vectors = np.array(vectors)  # copy: asarray on a jax array is read-only
+    B_grid = B.T.reshape(3, FIELD_GRID_NODES, FIELD_GRID_NODES)
 
-    # Outside the boundary psi is meaningless extrapolation, and the hard-BC
-    # envelope makes |B| spike ~7x there, bleeding into edge cells through
-    # trilinear interpolation. Zeroing it keeps edge cells clean and terminates
-    # streamlines at the plasma edge (terminal_speed stops the integrator).
-    # 1.05 margin so boundary-straddling cells keep their inside nodes.
-    rho = boundary_normalized_radius(
-        jnp.array(np.hypot(pts[:, 0], pts[:, 1])), jnp.array(pts[:, 2]), config.Boundary
+    # Midplane seeds across the plasma, as in the legacy Streamlit render.
+    R_seed = np.linspace(R0 - 0.9 * a, R0 + 0.9 * a, n_lines)
+    R_seed = np.pad(R_seed, (0, MAX_FIELD_LINES - n_lines), mode="edge")
+    # Arc length per vertex = one RK4 step; drift is set by the B grid, not the step.
+    vertex_spacing = 2 * np.pi * R0 / VERTICES_PER_TURN
+    xyz, b_mag, n_valid = trace_field_lines(
+        B_grid,
+        jnp.asarray(origin, dtype=jnp.float32),
+        jnp.asarray(spacing, dtype=jnp.float32),
+        jnp.asarray(R_seed, dtype=jnp.float32),
+        jnp.zeros(MAX_FIELD_LINES, dtype=jnp.float32),
+        config.Boundary,
+        vertex_spacing,
+        n_vertices=FIELD_LINE_TURNS * VERTICES_PER_TURN + 1,
     )
-    vectors[np.asarray(rho) > 1.05] = 0.0
-    grid["B"] = vectors
-    grid.set_active_vectors("B")
+    xyz, b_mag, n_valid = np.asarray(xyz), np.asarray(b_mag), np.asarray(n_valid)
 
-    # Midplane seed line, same params as the legacy Streamlit render
-    # (src/lib/visualization.py); resolution=k yields k+1 seed points.
-    seed_line = pv.Line(
-        pointa=(R0 - a * 0.9, 0, 0), pointb=(R0 + a * 0.9, 0, 0), resolution=n_lines - 1
-    )
-    streamlines = grid.streamlines_from_source(
-        seed_line,
-        integration_direction="both",
-        max_length=1000.0,
-        max_steps=2000,
-        integrator_type=45,
-        compute_vorticity=False,
-    )
-
-    line_points = np.asarray(streamlines.points)
-    speeds_all = (
-        np.linalg.norm(np.asarray(streamlines["B"]), axis=1)
-        if streamlines.n_points
-        else np.empty(0)
-    )
-
-    # VTK cell array: [n, id0..id{n-1}, m, ...] — gather per line, drop stubs.
-    # Vertices are decimated for transport only (integration stays exact):
-    # RK45 steps ~0.05 m here, 4x that is still finer than the retired JS
-    # tracer's 0.8 m max step, and ~4x less JSON.
-    stride = 4
-    conn = np.asarray(streamlines.lines)
-    chunks: list[np.ndarray] = []
+    # One polyline per seed: backward branch reversed, then forward (seed shared).
+    point_chunks: list[np.ndarray] = []
+    speed_chunks: list[np.ndarray] = []
     lengths: list[int] = []
-    i = 0
-    while i < len(conn):
-        n_pts = int(conn[i])
-        ids = conn[i + 1 : i + 1 + n_pts]
-        i += 1 + n_pts
-        if n_pts < 8:  # stubs from seeds in near-zero field
+    for i in range(n_lines):
+        n_fwd, n_bwd = int(n_valid[0, i]), int(n_valid[1, i])
+        if n_fwd + n_bwd < 3:  # seed outside the plasma, or both branches exit at once
             continue
-        keep = ids[::stride]
-        if (n_pts - 1) % stride:  # always keep the true endpoint
-            keep = np.append(keep, ids[-1])
-        chunks.append(keep)
-        lengths.append(len(keep))
+        point_chunks.append(np.concatenate([xyz[1, i, :n_bwd][::-1], xyz[0, i, 1:n_fwd]]))
+        speed_chunks.append(np.concatenate([b_mag[1, i, :n_bwd][::-1], b_mag[0, i, 1:n_fwd]]))
+        lengths.append(n_fwd + n_bwd - 1)
 
-    if chunks:
-        ids = np.concatenate(chunks)
-        points = line_points[ids]
-        speeds = speeds_all[ids]
-        b_range = [float(speeds.min()), float(speeds.max())]
-    else:
-        points = np.empty((0, 3))
-        speeds = np.empty(0)
-        b_range = [0.0, 1.0]
+    points = np.concatenate(point_chunks) if point_chunks else np.empty((0, 3))
+    speeds = np.concatenate(speed_chunks) if speed_chunks else np.empty(0)
+    b_range = [float(speeds.min()), float(speeds.max())] if speeds.size else [0.0, 1.0]
+    boundary_R, boundary_Z = get_poloidal_points(RotationalAngles.THETA, geom_3d)
 
     return {
-        "points": _to_list(points.flatten()),
-        "speeds": _to_list(speeds),
+        "points": _f32_base64(points),
+        "speeds": _f32_base64(speeds),
         "line_lengths": lengths,
         "b_range": b_range,
+        "boundary": {"R": _to_list(boundary_R), "Z": _to_list(boundary_Z)},
     }

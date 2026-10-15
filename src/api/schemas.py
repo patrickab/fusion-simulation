@@ -1,5 +1,6 @@
 from pydantic import BaseModel, Field
 
+from src.api.network import MAX_FIELD_LINES
 from src.engine.model_evaluation import EVAL_RESOLUTION
 
 
@@ -19,7 +20,7 @@ class GeometryRequest(BaseModel):
     view_mode: str = "Both"  # "2D Geometry" | "3D Geometry" | "Both"
     show_coils: bool = True
     coil: CoilConfigIn = CoilConfigIn()
-    mesh_stride: int = 3  # downsample factor for 3D mesh transmission
+    mesh_stride: int = 3  # downsample factor for 3D coil mesh transmission
 
 
 class SampleRequest(BaseModel):
@@ -30,7 +31,7 @@ class SampleRequest(BaseModel):
 class FieldLinesRequest(BaseModel):
     seed: int = 0
     sample_size: int = 4
-    n_lines: int = 24
+    n_lines: int = Field(default=24, ge=1, le=MAX_FIELD_LINES)
 
 
 class GridRequest(BaseModel):

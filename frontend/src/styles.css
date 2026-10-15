@@ -156,6 +156,31 @@ input[type="range"]::-moz-range-progress { background: rgba(255, 255, 255, 0.55)
 .stat .label { font-size: 10px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--faint); }
 .stat .mono { font-size: 13px; }
 
+/* KPI table: metric rows × statistic columns in a <details> collapsed by default; `.overlay` floats it over a canvas */
+.kpis { width: fit-content; padding: 14px 20px 2px; flex: none; }
+.kpis summary {
+  display: flex; align-items: center; gap: 6px; list-style: none; cursor: pointer; user-select: none;
+  font-size: 10px; font-weight: 600; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted);
+}
+.kpis summary::-webkit-details-marker { display: none; }
+.kpis summary:hover { color: var(--text); }
+.kpis summary .chev { color: var(--faint); transition: transform 0.15s; }
+.kpis[open] summary { margin-bottom: 6px; }
+.kpis[open] summary .chev { transform: rotate(180deg); }
+.kpis.overlay {
+  position: absolute; top: 12px; left: 16px; z-index: 5; padding: 8px 12px 6px;
+  background: rgba(10, 10, 11, 0.72); border: 1px solid var(--line); border-radius: 10px;
+  backdrop-filter: blur(4px);
+}
+.kpi-table { border-collapse: collapse; }
+.kpi-table th, .kpi-table td { padding: 3px 0 3px 18px; white-space: nowrap; }
+.kpi-table tr > :first-child { padding-left: 0; }
+.kpi-table th { font-size: 10px; font-weight: 400; text-transform: uppercase; letter-spacing: 0.1em; color: var(--faint); text-align: left; }
+.kpi-table thead th { text-align: right; border-bottom: 1px solid var(--line); }
+.kpi-table tbody th { color: var(--muted); }
+.kpi-table td { font-family: var(--mono); font-size: 12px; text-align: right; color: var(--text); }
+.kpi-extra { margin-top: 6px; padding-top: 8px; border-top: 1px solid var(--line); }
+
 .grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; padding: 16px 20px; }
 .card { background: var(--bg1); border: 1px solid var(--line); border-radius: 12px; padding: 10px; min-width: 0; }
 .card .caption { font-family: var(--mono); font-size: 10.5px; color: var(--muted); padding: 2px 4px 6px; }

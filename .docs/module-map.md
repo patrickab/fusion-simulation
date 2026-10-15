@@ -57,8 +57,8 @@ frontend/                       # React + Three.js SPA (active UI)
 │   ├── three/
 │   │   ├── Scene.tsx           # r3f Canvas + OrbitControls (Z-up→Y-up group)
 │   │   ├── Reactor3D.tsx       # PlasmaWireframe + FieldLines components
-│   │   ├── fieldlines.ts       # Assembles server-traced polylines into one LineSegments buffer
-│   │   ├── mesh.ts             # sparseWireframe for (n_phi×n_theta) structured grids
+│   │   ├── fieldlines.ts       # Decodes server-traced float32 polylines into one indexed LineSegments buffer
+│   │   ├── mesh.ts             # revolvedWireframe: revolves a 2D poloidal boundary into the 3D torus
 │   │   └── colormap.ts         # matplotlib "plasma" colormap + CSS gradient
 │   └── views/
 │       ├── ReactorView.tsx     # Geometry builder view
@@ -79,7 +79,7 @@ docs/
 
 AGENTS.md                       # Dev basics: uv-only, module entry points + --test smoke tests
                                 # (HPO/tmux/benchmark conventions live in the vibe-hpo skill)
-run-webapp.sh                   # Launches uvicorn (8010) + vite dev (5173) together
+run-webapp.sh                   # Launches uvicorn (8010) + vite dev (5172) together
 scripts/                        # KPI calibration/re-eval, legacy N6 preset, resumable PirateNet campaign
 tests/                          # unittest coverage for patience stopping + numerical refactor fixture
 ```

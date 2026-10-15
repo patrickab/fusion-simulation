@@ -138,7 +138,7 @@ def compute_gs_residual_on_points(
 _PSI_FN_CACHE: weakref.WeakKeyDictionary[NetworkManager, PsiFn] = weakref.WeakKeyDictionary()
 
 
-def _shared_psi_fn(manager: NetworkManager) -> PsiFn:
+def shared_psi_fn(manager: NetworkManager) -> PsiFn:
     psi_fn = _PSI_FN_CACHE.get(manager)
     if psi_fn is None:
         psi_fn = manager.make_psi_fn()
@@ -243,7 +243,7 @@ def evaluate_residual_samples(
     if not configs:
         raise ValueError("At least one plasma config is required")
     theta, rho = _kpi_sample_points(sample_size, seed)
-    psi_fn = _shared_psi_fn(manager)
+    psi_fn = shared_psi_fn(manager)
     params = manager.state.params
 
     config_chunk = max(1, KPI_EVAL_POINT_BUDGET // min(sample_size, GRID_EVAL_CHUNK))
@@ -289,7 +289,7 @@ def evaluate_plasma_kpis(
         batch = configs[start : start + config_chunk]
         batched_config = jax.tree_util.tree_map(lambda *xs: jnp.stack(xs), *batch)
         chunk_result = _boundary_leak_core(
-            _shared_psi_fn(manager),
+            shared_psi_fn(manager),
             manager.state.params,
             batched_config,
             theta,

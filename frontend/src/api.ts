@@ -9,11 +9,27 @@ export const kpiEntries = (kpis: Kpis): [string, number][] =>
   Object.entries(kpis).filter(
     (e): e is [string, number] =>
       typeof e[1] === 'number' &&
-      (e[0].startsWith('loss_') ||
-        e[0].startsWith('core_') ||
-        e[0] === 'edge_loss_p95' ||
-        e[0] === 'boundary_leak_max'),
+      (e[0].startsWith('loss_') || e[0].startsWith('core_') || e[0] === 'edge_loss_p95'),
   )
+
+const KPI_STAT = /^(.+)_(mean|median|p\d+)$/
+// Column order: mean, median, percentiles ascending.
+const statRank = (stat: string) => (stat === 'mean' ? -2 : stat === 'median' ? -1 : Number(stat.slice(1)))
+
+/** Pivots `<metric>_<stat>` KPI keys into metric rows × statistic columns. */
+export const pivotKpis = (kpis: Kpis) => {
+  const rows = new Map<string, Record<string, number>>()
+  for (const [key, value] of kpiEntries(kpis)) {
+    const match = KPI_STAT.exec(key)
+    if (!match) continue
+    const [, metric, stat] = match
+    let row = rows.get(metric)
+    if (!row) rows.set(metric, (row = {}))
+    row[stat] = value
+  }
+  const stats = [...new Set([...rows.values()].flatMap(Object.keys))].sort((a, b) => statRank(a) - statRank(b))
+  return { stats, rows: [...rows].map(([metric, values]) => ({ metric, values })) }
+}
 
 export interface Sample {
   R0: number
@@ -56,24 +72,25 @@ export interface Grid2D {
   boundary_Z: number[]
 }
 
-export interface SurfaceGrid { n_phi: number; n_theta: number; X: number[]; Y: number[]; Z: number[] }
+/** Closed poloidal cross-section (R, Z); the client revolves it into the 3D wireframe. */
+export interface Boundary2D { R: number[]; Z: number[] }
 
 export interface GeometryResponse {
-  boundary2d: { R: number[]; Z: number[] }
-  plasma3d: SurfaceGrid
+  boundary2d: Boundary2D
 }
 
 export interface GeometryRequest extends Geom3D {
   show_coils: boolean
-  mesh_stride?: number
 }
 
-/** Server-traced (VTK RK45) field lines: concatenated polylines + |B| per vertex. */
+/** Server-traced field lines: concatenated polylines + |B| per vertex, both as
+ *  base64 little-endian float32, plus the traced config's poloidal boundary. */
 export interface FieldLinesResponse {
-  points: number[] // flat xyz
-  speeds: number[]
+  points: string // flat xyz
+  speeds: string
   line_lengths: number[]
   b_range: [number, number]
+  boundary: Boundary2D
 }
 
 export type BenchmarkEvent =

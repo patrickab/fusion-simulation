@@ -2,12 +2,11 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   api,
   invalidate,
-  kpiEntries,
   parseArtifactSlug,
+  pivotKpis,
   useApi,
   useDebounced,
   type FieldLinesResponse,
-  type GeometryResponse,
   type Grid2D,
   type HpoStudies,
   type NetworkModels,
@@ -326,16 +325,44 @@ function SamplingTab({ sample }: { sample: ReturnType<typeof useApi<SampleRespon
   )
 }
 
-/** Post-training KPIs from the run.json result; nothing recomputed. */
-function KpiStats({ network }: { network: string }) {
+/** Post-training KPIs from the run.json result, collapsed by default: |R_GS| as metric rows × statistic
+ *  columns, plus the boundary-leak BC check (max |ψ| on the boundary / flux depth) kept separate. */
+function KpiTable({ network, overlay = false }: { network: string; overlay?: boolean }) {
   const kpis = useApi(`kpis:${network}`, () => api.kpis(network))
   if (!kpis.data) return null
+  const { stats, rows } = pivotKpis(kpis.data)
+  const leak = kpis.data.boundary_leak_max
   return (
-    <div className="stats">
-      {kpiEntries(kpis.data).map(([key, value]) => (
-        <Stat key={key} label={key.replaceAll('_', ' ')} value={value.toExponential(2)} />
-      ))}
-    </div>
+    <details className={overlay ? 'kpis overlay' : 'kpis'}>
+      <summary>
+        Metrics <span className="chev">▾</span>
+      </summary>
+      <table className="kpi-table">
+        <thead>
+          <tr>
+            <th />
+            {stats.map((stat) => (
+              <th key={stat} scope="col">{stat}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(({ metric, values }) => (
+            <tr key={metric}>
+              <th scope="row">{metric.replaceAll('_', ' ')}</th>
+              {stats.map((stat) => (
+                <td key={stat}>{values[stat]?.toExponential(2)}</td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {typeof leak === 'number' && (
+        <div className="kpi-extra">
+          <Stat label="boundary leak max" value={leak.toExponential(2)} />
+        </div>
+      )}
+    </details>
   )
 }
 
@@ -366,7 +393,7 @@ function GridTab({
   return (
     <div className="scroll" style={{ position: 'relative' }}>
       {grids.error && <div className="error">{grids.error}</div>}
-      <KpiStats network={network} />
+      <KpiTable network={network} />
       <div className="grid">
         {grids.loading
           ? Array.from({ length: sampleSize }, (_, i) => (
@@ -416,20 +443,17 @@ function TopologyTab({
     api.fieldlines(network, seed, sampleSize, nLines),
   )
   const geom = sample.data?.geom3d
-  const geo = useApi<GeometryResponse>(geom ? `geo3d:${JSON.stringify(geom)}` : null, () =>
-    api.geometry({ ...geom!, show_coils: false, mesh_stride: 2 }),
-  )
 
-  const loading = field.loading || geo.loading || sample.loading
-  const error = field.error ?? geo.error ?? sample.error
+  const loading = field.loading || sample.loading
+  const error = field.error ?? sample.error
   return (
     <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
-      <KpiStats network={network} />
+      {error && <div className="error">{error}</div>}
       <div className="canvas-wrap">
         {loading && <Spinner />}
-        {error && <div className="error">{error}</div>}
+        <KpiTable network={network} overlay />
         <Scene radius={geom ? (geom.R0 + geom.a) * 2.4 : 22}>
-          {geo.data && <PlasmaWireframe surf={geo.data.plasma3d} opacity={0.3} />}
+          {field.data && <PlasmaWireframe boundary={field.data.boundary} opacity={0.3} />}
           {field.data && <FieldLines field={field.data} />}
         </Scene>
       </div>

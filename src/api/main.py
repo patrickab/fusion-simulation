@@ -39,7 +39,7 @@ app = FastAPI(title="fusion-simulation API")
 app.add_middleware(GZipMiddleware, minimum_size=1024)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5172"],
     allow_methods=["*"],
     allow_headers=["*"],
 )

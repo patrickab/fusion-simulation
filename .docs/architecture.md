@@ -33,25 +33,25 @@ Thin HTTP wrapper exposing the `src/engine` + `src/lib` core to the React fronte
    - `GET  /api/network/{name}/{config|models|kpis}` — HyperParams JSON, foundation/corrector metadata, or stored `run.json` KPIs (never recomputed at request time)
   - `POST /api/network/{name}/{archive|rename|sample|flux|residual|fieldlines}`
   - `DELETE /api/network/{name}`
-  - `POST /api/geometry` — 2D boundary + 3D plasma/coil meshes (downsampled via `mesh_stride`)
+  - `POST /api/geometry` — 2D plasma boundary (client revolves it into the 3D wireframe) + optional coil meshes (downsampled via `mesh_stride`)
   - `POST /api/benchmark` — `StreamingResponse` (SSE) emitting one row event per checkpoint
   - `GET  /api/config` — frontend-facing constants (`eval_config_count`, `eval_resolution`) from `model_evaluation.py`
   - `GET  /api/benchmarks` — saved benchmark tree `{commit: {run: [files]}}`; artifacts served statically under `/api/benchmarks/files/` (mount of `data/benchmarks/`)
 - `state.py` — in-process `dict[str, NetworkManager]` cache (replaces `st.session_state`); avoids JAX/JIT re-tracing per request.
-- `network.py` — sample/flux/residual/fieldlines builders; serializes the shared plasma-aligned grids from `model_evaluation.py`. Field lines are traced **server-side** (`build_field_lines`): B on a 48³ `pv.ImageData` grid (vectors zeroed outside ρ̃>1.05), then VTK RK45 `streamlines_from_source`; response ships polylines decimated 4× for transport, integration exact. Grid/fieldline endpoints derive seeded configs via a bare domain Sobol stream + `fast_forward` (`_seeded_configs`) instead of a Sampler; only `/sample` builds the full Sampler (interior collocation points).
-- `geometry.py` — 2D boundary + 3D `FusionPlasma`/`ToroidalCoil3D` meshes, strided for transport.
+- `network.py` — sample/flux/residual/fieldlines builders; serializes the shared plasma-aligned grids from `model_evaluation.py`. Field lines are traced **server-side** (`build_field_lines`): the field is axisymmetric, so B is evaluated once on a 64² (R, Z) grid over the plasma bounding box (jitted `get_b_field`, one `value_and_grad` pass, memoized `shared_psi_fn`), then `physics.trace_field_lines` integrates both directions per midplane seed with fixed-step RK4 in (R, Z, φ) (bilinear field, lines freeze at ρ̃>1). Seeds pad to `MAX_FIELD_LINES` so the tracer compiles once per process. Response: one polyline per seed as base64 float32 `points`/`speeds`, plus the traced config's poloidal `boundary` for the wireframe. Grid/fieldline endpoints derive seeded configs via a bare domain Sobol stream + `fast_forward` (`_seeded_configs`) instead of a Sampler; only `/sample` builds the full Sampler (interior collocation points).
+- `geometry.py` — 2D plasma boundary + `ToroidalCoil3D` meshes, strided for transport.
 - `benchmark.py` — SSE row generator (`_sse_event`), filters networks by git commit.
 - `schemas.py` — Pydantic request models (`GeometryRequest`, `SampleRequest`, `GridRequest`, `FieldLinesRequest`, `RenameRequest`, `BenchmarkRequest`, `CoilConfigIn`).
 
 ## React Frontend (`frontend/`) — TypeScript + Vite
 Single-page app, three views mirroring the Streamlit pages:
 1. **reactor** (`ReactorView.tsx`) — geometry sliders → 2D Plotly cross-section + 3D `PlasmaWireframe`.
-2. **network** (`NetworkView.tsx`) — checkpoint picker; foundation/corrector identity, stored KPIs, flux/residual heatmaps (Plotly), sample scatter, 3D field lines + plasma wireframe (Three.js), and Shiki-highlighted config JSON.
+2. **network** (`NetworkView.tsx`) — checkpoint picker; foundation/corrector identity, stored KPIs (metric × statistic table, overlaid on the 3D view), flux/residual heatmaps (Plotly), sample scatter, 3D field lines + plasma wireframe (Three.js), and Shiki-highlighted config JSON.
 3. **benchmark** (`BenchmarkView.tsx`) — SSE-streamed multi-checkpoint comparison; per-network grid cards; saved-run browser over `GET /api/benchmarks` gated behind a selectbox — exactly one `StoredRun` mounts at a time, since mounting fires a backend residual eval.
 
 Key modules:
 - `api.ts` — typed fetch client; module-level `Map` cache (`invalidate()` clears by prefix); `useApi`/`useDebounced` hooks; `benchmarkStream` SSE consumer.
-- `three/` — `Reactor3D.tsx` (`PlasmaWireframe`, `FieldLines`), `Scene.tsx` (r3f `Canvas` + `OrbitControls`), `fieldlines.ts` (assembles server-traced polylines into one merged `LineSegments` buffer, |B| vertex colors), `mesh.ts` (sparse wireframe), `colormap.ts` (matplotlib `plasma`).
+- `three/` — `Reactor3D.tsx` (`PlasmaWireframe`, `FieldLines`), `Scene.tsx` (r3f `Canvas` + `OrbitControls`), `fieldlines.ts` (decodes the base64 float32 polylines into one indexed `LineSegments` buffer, |B| vertex colors), `mesh.ts` (`revolvedWireframe`: revolves the shipped 2D boundary), `colormap.ts` (matplotlib `plasma`).
 - `plots.tsx` — Plotly `GridHeatmap`, `SampleScatter`, `CrossSection`; boundary points reordered by poloidal angle.
 - `ui.tsx` — design-system primitives (`Panel`, `Section`, `Slider`, `Segmented`, `Toggle`, `Stat`, `Colorbar`, `Popover`, `Spinner`, `JsonBlock`).
 - `store.ts` — Zustand store (`view`, `network`, `sidebar`).

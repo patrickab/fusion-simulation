@@ -60,7 +60,8 @@
 ## Frontend Patterns
 - `useApi(key, fn)` cached fetch keyed by request signature; `invalidate(prefix)` clears stale entries
 - 3D scene is dark, unlit, Z-up→Y-up group; `OrbitControls` with damped idle drift
-- Field-line tracing done server-side (VTK RK45 via PyVista over the 48³ B-grid); client only assembles shipped polylines into a `LineSegments` buffer
+- Field-line tracing done server-side (JAX RK4 over the axisymmetric 64² (R, Z) B-grid); client only decodes the shipped float32 polylines into an indexed `LineSegments` buffer
+- 3D plasma surfaces are never shipped as meshes: endpoints return the 2D poloidal boundary and `revolvedWireframe` builds the torus client-side
 - Residual heatmap color scales are fixed across checkpoints; flux ranges remain data-driven
 - Dark-only UI: neutral palette, cyan reserved for data/wireframes
 

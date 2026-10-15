@@ -1,8 +1,8 @@
 import { useEffect, useMemo } from 'react'
 import * as THREE from 'three'
-import type { FieldLinesResponse, SurfaceGrid } from '../api'
+import type { Boundary2D, FieldLinesResponse } from '../api'
 import { buildFieldLineSegments } from './fieldlines'
-import { sparseWireframe } from './mesh'
+import { revolvedWireframe } from './mesh'
 
 function useDisposable<T extends THREE.BufferGeometry[]>(geometries: T): T {
   useEffect(() => () => geometries.forEach((g) => g.dispose()), [geometries])
@@ -11,17 +11,15 @@ function useDisposable<T extends THREE.BufferGeometry[]>(geometries: T): T {
 
 // WebGL lineWidth is capped at 1px — "thinner" is done via opacity, not width
 export function PlasmaWireframe({
-  surf,
+  boundary,
   color = '#2be2cf',
   opacity = 0.45,
 }: {
-  surf: SurfaceGrid
+  boundary: Boundary2D
   color?: string
   opacity?: number
 }) {
-  const [wire] = useDisposable(
-    useMemo(() => [sparseWireframe(surf.X, surf.Y, surf.Z, surf.n_phi, surf.n_theta, 4)], [surf]),
-  )
+  const [wire] = useDisposable(useMemo(() => [revolvedWireframe(boundary)], [boundary]))
   // ponytail: opacity baked into a dimmed solid color instead of alpha
   // blending. Transparent lines stack brightness wherever they overlap on
   // screen (worse the more strands bunch up, e.g. at grazing view angles —
@@ -36,7 +34,7 @@ export function PlasmaWireframe({
   )
 }
 
-// Matches the legacy PyVista render: thin unlit lines, |B| vertex colors.
+// Thin unlit lines, |B| vertex colors (matches the legacy PyVista render).
 // depthWrite stays on (the default) so front strands occlude the ones behind
 // them like VTK's tubes do — with it off, strands at a bundled viewing angle
 // stack their alpha and flare bright instead of layering.

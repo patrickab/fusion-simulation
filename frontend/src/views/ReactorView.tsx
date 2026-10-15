@@ -11,7 +11,7 @@ export function ReactorView() {
   const [kappa, setKappa] = useState(1.7)
   const [delta, setDelta] = useState(0.33)
 
-  const body = useDebounced(JSON.stringify({ R0, a, kappa, delta, show_coils: false, mesh_stride: 2 }), 250)
+  const body = useDebounced(JSON.stringify({ R0, a, kappa, delta, show_coils: false }), 250)
   const { data, error, loading } = useApi<GeometryResponse>(`geometry:${body}`, () => api.geometry(JSON.parse(body)))
 
   const f1 = (v: number) => v.toFixed(1)
@@ -32,7 +32,7 @@ export function ReactorView() {
         {loading && <Spinner />}
         {error && <div className="error">{error}</div>}
         <div className="canvas-wrap">
-          <Scene radius={(R0 + a) * 2.4}>{data && <PlasmaWireframe surf={data.plasma3d} />}</Scene>
+          <Scene radius={(R0 + a) * 2.4}>{data && <PlasmaWireframe boundary={data.boundary2d} />}</Scene>
         </div>
       </div>
     </div>

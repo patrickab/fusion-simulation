@@ -21,6 +21,8 @@ dependencies = [
   "optuna>=4.0.0",
   "textual>=8.2.8",
   "plotext>=5.3.2",
+  "fastapi>=0.142.2",
+  "uvicorn[standard]>=0.54.0",
 ]
 
 [build-system]

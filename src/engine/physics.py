@@ -5,7 +5,8 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from src.lib.geometry_config import PlasmaConfig
+from src.engine.plasma import boundary_normalized_radius
+from src.lib.geometry_config import PlasmaBoundary, PlasmaConfig
 
 # TF32 matmuls (Ampere f32 default) put a ~1e-2 starburst noise floor in |R_GS|:
 # the GS operator's second derivatives amplify boundary-Fourier-fit harmonic m
@@ -343,13 +344,14 @@ def get_b_field(
         zn = jnp.asarray(z)
         return psi_fn(params, rn, zn, config).squeeze()
 
-    grad_psi_fn = jax.vmap(jax.grad(scalar_psi, argnums=(0, 1)))
-    dpsi_dR, dpsi_dZ = grad_psi_fn(R_arr, Z_arr)
+    # One network pass yields psi and its gradient together.
+    psi_vals, (dpsi_dR, dpsi_dZ) = jax.vmap(jax.value_and_grad(scalar_psi, argnums=(0, 1)))(
+        R_arr, Z_arr
+    )
 
     BR = -dpsi_dZ / R_arr
     BZ = dpsi_dR / R_arr
 
-    psi_vals = jax.vmap(scalar_psi)(R_arr, Z_arr)
     psi_axis = scalar_psi(config.Geometry.R0, 0.0)
 
     flux_scale = config.State.F_axis * config.Geometry.a
@@ -399,3 +401,110 @@ def get_b_field_cartesian(
     BY = BR * jnp.sin(phi) + Bphi * jnp.cos(phi)
 
     return jnp.column_stack([BX, BY, BZ_cyl])
+
+
+def _bilinear(
+    grid: jnp.ndarray, origin: jnp.ndarray, spacing: jnp.ndarray, R: jnp.ndarray, Z: jnp.ndarray
+) -> jnp.ndarray:
+    """Sample a (C, n_R, n_Z) node grid at (R, Z); positions clamp to the grid edge."""
+    n_R, n_Z = grid.shape[1:]
+    u = jnp.clip((R - origin[0]) / spacing[0], 0.0, n_R - 1.0)
+    v = jnp.clip((Z - origin[1]) / spacing[1], 0.0, n_Z - 1.0)
+    i = jnp.minimum(u.astype(jnp.int32), n_R - 2)
+    j = jnp.minimum(v.astype(jnp.int32), n_Z - 2)
+    fu, fv = u - i, v - j
+    return (
+        grid[:, i, j] * (1 - fu) * (1 - fv)
+        + grid[:, i + 1, j] * fu * (1 - fv)
+        + grid[:, i, j + 1] * (1 - fu) * fv
+        + grid[:, i + 1, j + 1] * fu * fv
+    )
+
+
+@partial(jax.jit, static_argnames=("n_vertices",))
+def trace_field_lines(
+    B_grid: jnp.ndarray,
+    origin: jnp.ndarray,
+    spacing: jnp.ndarray,
+    R_seed: jnp.ndarray,
+    Z_seed: jnp.ndarray,
+    boundary: PlasmaBoundary,
+    step: float,
+    n_vertices: int,
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+    """Trace field lines forward and backward along B from each seed (φ = 0).
+
+    Axisymmetry makes B a function of (R, Z) only, so lines integrate
+    dx/ds = B/|B| in cylindrical (R, Z, φ) over a 2D node grid: one fixed RK4
+    step per output vertex, bilinear field. A line freezes once it leaves the
+    plasma (normalized radius rho > 1, sampled from the same grid).
+
+    Args:
+        B_grid: (3, n_R, n_Z) cylindrical (B_R, B_Z, B_φ) at grid nodes [T].
+        origin: (R, Z) of node (0, 0) [m].
+        spacing: (ΔR, ΔZ) node spacing [m].
+        R_seed: (n,) seed major radii [m].
+        Z_seed: (n,) seed heights [m].
+        boundary: Plasma boundary that terminates lines.
+        step: Arc length between consecutive vertices [m].
+        n_vertices: Output vertices per direction, seed included.
+
+    Returns:
+        xyz: (2, n, n_vertices, 3) Cartesian vertices; [0] along B, [1] against B.
+        b_mag: (2, n, n_vertices) |B| at each vertex [T].
+        n_valid: (2, n) leading vertices inside the plasma.
+    """
+    direction = jnp.array([[1.0], [-1.0]])
+    n_R, n_Z = B_grid.shape[1:]
+    # The Fourier boundary fit costs ~65 trig terms per point; evaluating it
+    # once per node and interpolating keeps the per-vertex check to one gather.
+    rho_grid = boundary_normalized_radius(
+        origin[0] + spacing[0] * jnp.arange(n_R)[:, None],
+        origin[1] + spacing[1] * jnp.arange(n_Z)[None, :],
+        boundary,
+    )[None]
+
+    def rhs(y: jnp.ndarray) -> jnp.ndarray:
+        B_R, B_Z, B_phi = _bilinear(B_grid, origin, spacing, y[0], y[1])
+        scale = direction / jnp.maximum(jnp.sqrt(B_R**2 + B_Z**2 + B_phi**2), 1e-12)
+        return jnp.stack([B_R * scale, B_Z * scale, B_phi * scale / y[0]])
+
+    def rk4(y: jnp.ndarray) -> jnp.ndarray:
+        k1 = rhs(y)
+        k2 = rhs(y + 0.5 * step * k1)
+        k3 = rhs(y + 0.5 * step * k2)
+        k4 = rhs(y + step * k3)
+        return y + step / 6.0 * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
+
+    def inside(y: jnp.ndarray) -> jnp.ndarray:
+        return _bilinear(rho_grid, origin, spacing, y[0], y[1])[0] <= 1.0
+
+    def vertex(y: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        xyz = jnp.stack([y[0] * jnp.cos(y[2]), y[0] * jnp.sin(y[2]), y[1]], axis=-1)
+        b_mag = jnp.linalg.norm(_bilinear(B_grid, origin, spacing, y[0], y[1]), axis=0)
+        return xyz, b_mag
+
+    def advance(
+        carry: tuple[jnp.ndarray, jnp.ndarray], _: None
+    ) -> tuple[tuple[jnp.ndarray, jnp.ndarray], tuple[jnp.ndarray, ...]]:
+        y, alive = carry
+        y_next = rk4(y)
+        alive = alive & inside(y_next)
+        y = jnp.where(alive, y_next, y)
+        return (y, alive), (*vertex(y), alive)
+
+    # State (R, Z, φ) per (direction, seed).
+    y0 = jnp.stack(
+        [
+            jnp.broadcast_to(R_seed, (2, R_seed.shape[0])),
+            jnp.broadcast_to(Z_seed, (2, Z_seed.shape[0])),
+            jnp.zeros((2, R_seed.shape[0])),
+        ]
+    )
+    alive0 = inside(y0)
+    _, (xyz, b_mag, alive) = jax.lax.scan(advance, (y0, alive0), None, length=n_vertices - 1)
+    xyz0, b_mag0 = vertex(y0)
+    xyz = jnp.concatenate([xyz0[None], xyz])
+    b_mag = jnp.concatenate([b_mag0[None], b_mag])
+    n_valid = alive0.astype(jnp.int32) + jnp.sum(alive, axis=0)
+    return jnp.moveaxis(xyz, 0, 2), jnp.moveaxis(b_mag, 0, 2), n_valid

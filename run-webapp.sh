@@ -3,7 +3,7 @@
 # Ports must match frontend/vite.config.ts's `server.proxy['/api']` target.
 HOST="127.0.0.1"
 PORT="8010"
-FE_PORT="5173"
+FE_PORT="5172"
 
 export PATH="$(pwd)/.venv/bin:$PATH"
 
